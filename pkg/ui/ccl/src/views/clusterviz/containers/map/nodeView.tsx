@@ -1,8 +1,8 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Cockroach Community Licence (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed as a CockroachDB Enterprise file under the Cockroach Community
+// License (the "License"); you may not use this file except in compliance with
+// the License. You may obtain a copy of the License at
 //
 //     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
 
@@ -10,7 +10,7 @@ import React from "react";
 import moment from "moment";
 import { Link } from "react-router";
 
-import { NodeStatus$Properties } from "src/util/proto";
+import { INodeStatus } from "src/util/proto";
 import { nodeCapacityStats, livenessNomenclature } from "src/redux/nodes";
 import { trustIcon } from "src/util/trust";
 import liveIcon from "!!raw-loader!assets/livenessIcons/live.svg";
@@ -24,12 +24,12 @@ import { LongToMoment } from "src/util/convert";
 import { cockroach } from "src/js/protos";
 
 import NodeLivenessStatus = cockroach.storage.NodeLivenessStatus;
-type Liveness$Properties = cockroach.storage.Liveness$Properties;
+type ILiveness = cockroach.storage.ILiveness;
 
 interface NodeViewProps {
-  node: NodeStatus$Properties;
+  node: INodeStatus;
   livenessStatus: NodeLivenessStatus;
-  liveness: Liveness$Properties;
+  liveness: ILiveness;
 }
 
 const SCALE_FACTOR = 0.8;

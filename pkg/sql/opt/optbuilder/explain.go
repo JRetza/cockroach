@@ -1,54 +1,84 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package optbuilder
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 )
 
 func (b *Builder) buildExplain(explain *tree.Explain, inScope *scope) (outScope *scope) {
 	opts, err := explain.ParseOptions()
 	if err != nil {
-		panic(builderError{err})
+		panic(err)
 	}
 
 	// We don't allow the statement under Explain to reference outer columns, so we
 	// pass a "blank" scope rather than inScope.
-	stmtScope := b.buildStmt(explain.Statement, &scope{builder: b})
-	// Calculate the presentation, since we will store it in the Explain op.
-	stmtScope.setPresentation()
-
+	stmtScope := b.buildStmt(explain.Statement, nil /* desiredTypes */, &scope{builder: b})
 	outScope = inScope.push()
 
-	if opts.Mode != tree.ExplainPlan {
-		panic(errorf("only PLAN is supported for EXPLAIN"))
-	}
+	var cols sqlbase.ResultColumns
+	switch opts.Mode {
+	case tree.ExplainPlan:
+		telemetry.Inc(sqltelemetry.ExplainPlanUseCounter)
+		if opts.Flags.Contains(tree.ExplainFlagVerbose) || opts.Flags.Contains(tree.ExplainFlagTypes) {
+			cols = sqlbase.ExplainPlanVerboseColumns
+		} else {
+			cols = sqlbase.ExplainPlanColumns
+		}
 
-	cols := sqlbase.ExplainPlanColumns
-	if opts.Flags.Contains(tree.ExplainFlagVerbose) || opts.Flags.Contains(tree.ExplainFlagTypes) {
-		cols = sqlbase.ExplainPlanVerboseColumns
+	case tree.ExplainDistSQL:
+		analyze := opts.Flags.Contains(tree.ExplainFlagAnalyze)
+		if analyze {
+			telemetry.Inc(sqltelemetry.ExplainAnalyzeUseCounter)
+		} else {
+			telemetry.Inc(sqltelemetry.ExplainDistSQLUseCounter)
+		}
+		if analyze && tree.IsStmtParallelized(explain.Statement) {
+			panic(pgerror.Newf(pgcode.FeatureNotSupported,
+				"EXPLAIN ANALYZE does not support RETURNING NOTHING statements"))
+		}
+		cols = sqlbase.ExplainDistSQLColumns
+
+	case tree.ExplainOpt:
+		if opts.Flags.Contains(tree.ExplainFlagVerbose) {
+			telemetry.Inc(sqltelemetry.ExplainOptVerboseUseCounter)
+		} else {
+			telemetry.Inc(sqltelemetry.ExplainOptUseCounter)
+		}
+		cols = sqlbase.ExplainOptColumns
+
+	case tree.ExplainVec:
+		telemetry.Inc(sqltelemetry.ExplainVecUseCounter)
+		cols = sqlbase.ExplainVecColumns
+
+	default:
+		panic(pgerror.Newf(pgcode.FeatureNotSupported,
+			"EXPLAIN ANALYZE does not support RETURNING NOTHING statements"))
 	}
 	b.synthesizeResultColumns(outScope, cols)
 
-	def := memo.ExplainOpDef{
-		Options: opts,
-		ColList: colsToColList(outScope.cols),
-		Props:   stmtScope.physicalProps,
+	input := stmtScope.expr.(memo.RelExpr)
+	private := memo.ExplainPrivate{
+		Options:  opts,
+		ColList:  colsToColList(outScope.cols),
+		Props:    stmtScope.makePhysicalProps(),
+		StmtType: explain.Statement.StatementType(),
 	}
-	outScope.group = b.factory.ConstructExplain(stmtScope.group, b.factory.InternExplainOpDef(&def))
+	outScope.expr = b.factory.ConstructExplain(input, &private)
 	return outScope
 }

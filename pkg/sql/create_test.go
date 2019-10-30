@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql_test
 
@@ -18,19 +14,21 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
-	"net"
-	"strconv"
+	"net/url"
 	"sync"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/sqlmigrations"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/jackc/pgx"
@@ -54,7 +52,7 @@ func TestDatabaseDescriptor(t *testing.T) {
 	}
 
 	// Database name.
-	nameKey := sqlbase.MakeNameMetadataKey(keys.RootNamespaceID, "test")
+	nameKey := sqlbase.NewDatabaseKey("test").Key()
 	if gr, err := kvDB.Get(ctx, nameKey); err != nil {
 		t.Fatal(err)
 	} else if gr.Exists() {
@@ -92,10 +90,10 @@ func TestDatabaseDescriptor(t *testing.T) {
 	}
 
 	start := roachpb.Key(keys.MakeTablePrefix(uint32(keys.NamespaceTableID)))
-	if kvs, err := kvDB.Scan(ctx, start, start.PrefixEnd(), 0); err != nil {
+	if kvs, err := kvDB.Scan(ctx, start, start.PrefixEnd(), 0 /* maxRows */); err != nil {
 		t.Fatal(err)
 	} else {
-		descriptorIDs, err := sqlmigrations.ExpectedDescriptorIDs(ctx, kvDB)
+		descriptorIDs, err := sqlmigrations.ExpectedDescriptorIDs(ctx, kvDB, &s.(*server.TestServer).Cfg.DefaultZoneConfig, &s.(*server.TestServer).Cfg.DefaultSystemZoneConfig)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -194,7 +192,10 @@ func createTestTable(
 
 	for {
 		if _, err := db.Exec(tableSQL); err != nil {
-			if testutils.IsSQLRetryableError(err) {
+			// Scenario where an ambiguous commit error happens is described in more
+			// detail in
+			// https://reviewable.io/reviews/cockroachdb/cockroach/10251#-KVGGLbjhbPdlR6EFlfL
+			if testutils.IsError(err, "result is ambiguous") {
 				continue
 			}
 			t.Errorf("table %d: could not be created: %s", id, err)
@@ -435,31 +436,17 @@ SELECT * FROM t.kv%d
 
 func TestCreateStatementType(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
-		// Make the connections' results buffers really small so that it overflows
-		// when we produce a few results.
-		ConnResultsBufferBytes: 10,
-		// Andrei is too lazy to figure out the incantation for telling pgx about
-		// our test certs.
-		Insecure: true,
-	})
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	ctx := context.TODO()
 	defer s.Stopper().Stop(ctx)
 
-	host, ports, err := net.SplitHostPort(s.ServingAddr())
+	pgURL, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
+	defer cleanup()
+	pgxConfig, err := pgx.ParseConnectionString(pgURL.String())
 	if err != nil {
 		t.Fatal(err)
 	}
-	port, err := strconv.Atoi(ports)
-	if err != nil {
-		t.Fatal(err)
-	}
-	conn, err := pgx.Connect(pgx.ConnConfig{
-		Host:     host,
-		Port:     uint16(port),
-		User:     "root",
-		Database: "system",
-	})
+	conn, err := pgx.Connect(pgxConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -484,8 +471,8 @@ func TestCreateStatementType(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cmdTag != "SELECT 10" {
-		t.Fatal("expected SELECT 10, got", cmdTag)
+	if cmdTag != "CREATE TABLE AS" {
+		t.Fatal("expected CREATE TABLE AS, got", cmdTag)
 	}
 }
 

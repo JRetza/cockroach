@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package server
 
@@ -18,25 +14,20 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
-	"math"
 	"net"
-	"runtime"
-	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
 
-	"github.com/dustin/go-humanize"
-	"github.com/elastic/gosigar"
-	"github.com/pkg/errors"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip/resolver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/ts"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
@@ -44,25 +35,29 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/pebble"
+	"github.com/elastic/gosigar"
+	"github.com/pkg/errors"
 )
 
 // Context defaults.
 const (
-	defaultCGroupMemPath = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
-	// DefaultCacheSize is the default size of the RocksDB cache. We default the
-	// cache size and SQL memory pool size to 128 MiB. Larger values might
-	// provide significantly better performance, but we're not sure what type of
-	// system we're running on (development or production or some shared
+	// DefaultCacheSize is the default size of the RocksDB and Pebble caches. We
+	// default the cache size and SQL memory pool size to 128 MiB. Larger values
+	// might provide significantly better performance, but we're not sure what
+	// type of system we're running on (development or production or some shared
 	// environment). Production users should almost certainly override these
 	// settings and we'll warn in the logs about doing so.
 	DefaultCacheSize         = 128 << 20 // 128 MB
 	defaultSQLMemoryPoolSize = 128 << 20 // 128 MB
 	defaultScanInterval      = 10 * time.Minute
-	defaultScanMaxIdleTime   = 200 * time.Millisecond
+	defaultScanMinIdleTime   = 10 * time.Millisecond
+	defaultScanMaxIdleTime   = 1 * time.Second
 	// NB: this can't easily become a variable as the UI hard-codes it to 10s.
 	// See https://github.com/cockroachdb/cockroach/issues/20310.
-	DefaultMetricsSampleInterval = 10 * time.Second
-	defaultStorePath             = "cockroach-data"
+	DefaultMetricsSampleInterval   = 10 * time.Second
+	DefaultHistogramWindowInterval = 6 * DefaultMetricsSampleInterval
+	defaultStorePath               = "cockroach-data"
 	// TempDirPrefix is the filename prefix of any temporary subdirectory
 	// created.
 	TempDirPrefix = "cockroach-temp"
@@ -76,9 +71,10 @@ const (
 	minimumNetworkFileDescriptors     = 256
 	recommendedNetworkFileDescriptors = 5000
 
-	defaultConnResultsBufferBytes = 16 << 10 // 16 KiB
-
 	defaultSQLTableStatCacheSize = 256
+
+	// This comes out to 1024 cache entries.
+	defaultSQLQueryCacheSize = 8 * 1024 * 1024
 )
 
 var productionSettingsWebpage = fmt.Sprintf(
@@ -137,6 +133,10 @@ type Config struct {
 	// Stores is specified to enable durable key-value storage.
 	Stores base.StoreSpecList
 
+	// StorageEngine specifies the engine type (eg. rocksdb, pebble) to use to
+	// instantiate stores.
+	StorageEngine enginepb.EngineType
+
 	// TempStorageConfig is used to configure temp storage, which stores
 	// ephemeral data when processing large queries.
 	TempStorageConfig base.TempStorageConfig
@@ -147,8 +147,7 @@ type Config struct {
 	Attrs string
 
 	// JoinList is a list of node addresses that act as bootstrap hosts for
-	// connecting to the gossip network. Each item in the list can actually be
-	// multiple comma-separated addresses, kept for backward-compatibility.
+	// connecting to the gossip network.
 	JoinList base.JoinListType
 
 	// RetryOptions controls the retry behavior of the server.
@@ -172,6 +171,17 @@ type Config struct {
 	// SQLTableStatCacheSize is the size (number of tables) of the table
 	// statistics cache.
 	SQLTableStatCacheSize int
+
+	// SQLQueryCacheSize is the memory size (in bytes) of the query plan cache.
+	SQLQueryCacheSize int64
+
+	// GoroutineDumpDirName is the directory name for goroutine dumps using
+	// goroutinedumper.
+	GoroutineDumpDirName string
+
+	// HeapProfileDirName is the directory name for heap profiles using
+	// heapprofiler. If empty, no heap profiles will be collected.
+	HeapProfileDirName string
 
 	// Parsed values.
 
@@ -208,6 +218,12 @@ type Config struct {
 	// Environment Variable: COCKROACH_SCAN_INTERVAL
 	ScanInterval time.Duration
 
+	// ScanMinIdleTime is the minimum time the scanner will be idle between ranges.
+	// If enabled (> 0), the scanner may complete in more than ScanInterval for large
+	// stores.
+	// Environment Variable: COCKROACH_SCAN_MIN_IDLE_TIME
+	ScanMinIdleTime time.Duration
+
 	// ScanMaxIdleTime is the maximum time the scanner will be idle between ranges.
 	// If enabled (> 0), the scanner may complete in less than ScanInterval for small
 	// stores.
@@ -220,8 +236,21 @@ type Config struct {
 	// AmbientCtx is used to annotate contexts used inside the server.
 	AmbientCtx log.AmbientContext
 
+	// DefaultZoneConfig is used to set the default zone config inside the server.
+	// It can be overridden during tests by setting the DefaultZoneConfigOverride
+	// server testing knob.
+	DefaultZoneConfig config.ZoneConfig
+	// DefaultSystemZoneConfig is used to set the default system zone config
+	// inside the server. It can be overridden during tests by setting the
+	// DefaultSystemZoneConfigOverride server testing knob.
+	DefaultSystemZoneConfig config.ZoneConfig
+
 	// Locality is a description of the topography of the server.
 	Locality roachpb.Locality
+
+	// LocalityAddresses contains private IP addresses the can only be accessed
+	// in the corresponding locality.
+	LocalityAddresses []roachpb.LocalityAddress
 
 	// EventLogEnabled is a switch which enables recording into cockroach's SQL
 	// event log tables. These tables record transactional events about changes
@@ -229,22 +258,21 @@ type Config struct {
 	// actions.
 	EventLogEnabled bool
 
-	// ListeningURLFile indicates the file to which the server writes
-	// its listening URL when it is ready.
-	ListeningURLFile string
+	// ReadyFn is called when the server has started listening on its
+	// sockets.
+	// The argument waitForInit indicates (iff true) that the
+	// server is not bootstrapped yet, will not bootstrap itself and
+	// will be waiting for an `init` command or accept bootstrapping
+	// from a joined node.
+	ReadyFn func(waitForInit bool)
 
-	// PIDFile indicates the file to which the server writes its PID when
-	// it is ready.
-	PIDFile string
+	// DelayedBootstrapFn is called if the boostrap process does not complete
+	// in a timely fashion, typically 30s after the server starts listening.
+	DelayedBootstrapFn func()
 
 	// EnableWebSessionAuthentication enables session-based authentication for
 	// the Admin API's HTTP endpoints.
 	EnableWebSessionAuthentication bool
-
-	// ConnResultsBufferBytes is the size of the buffer in which each connection
-	// accumulates results set. Results are flushed to the network when this
-	// buffer overflows.
-	ConnResultsBufferBytes int
 
 	enginesCreated bool
 }
@@ -264,7 +292,7 @@ type Config struct {
 // metrics. For more information on the issues underlying our histogram system
 // and the proposed fixes, please see issue #7896.
 func (cfg Config) HistogramWindowInterval() time.Duration {
-	hwi := DefaultMetricsSampleInterval * 6
+	hwi := DefaultHistogramWindowInterval
 
 	// Rudimentary overflow detection; this can result if
 	// DefaultMetricsSampleInterval is set to an extremely large number, likely
@@ -274,63 +302,6 @@ func (cfg Config) HistogramWindowInterval() time.Duration {
 		return DefaultMetricsSampleInterval
 	}
 	return hwi
-}
-
-// GetTotalMemory returns either the total system memory or if possible the
-// cgroups available memory.
-func GetTotalMemory(ctx context.Context) (int64, error) {
-	totalMem, err := func() (int64, error) {
-		mem := gosigar.Mem{}
-		if err := mem.Get(); err != nil {
-			return 0, err
-		}
-		if mem.Total > math.MaxInt64 {
-			return 0, fmt.Errorf("inferred memory size %s exceeds maximum supported memory size %s",
-				humanize.IBytes(mem.Total), humanize.Bytes(math.MaxInt64))
-		}
-		return int64(mem.Total), nil
-	}()
-	if err != nil {
-		return 0, err
-	}
-	checkTotal := func(x int64) (int64, error) {
-		if x <= 0 {
-			// https://github.com/elastic/gosigar/issues/72
-			return 0, fmt.Errorf("inferred memory size %d is suspicious, considering invalid", x)
-		}
-		return x, nil
-	}
-	if runtime.GOOS != "linux" {
-		return checkTotal(totalMem)
-	}
-
-	var buf []byte
-	if buf, err = ioutil.ReadFile(defaultCGroupMemPath); err != nil {
-		log.Infof(ctx, "can't read available memory from cgroups (%s), using system memory %s instead", err,
-			humanizeutil.IBytes(totalMem))
-		return checkTotal(totalMem)
-	}
-
-	cgAvlMem, err := strconv.ParseUint(strings.TrimSpace(string(buf)), 10, 64)
-	if err != nil {
-		log.Infof(ctx, "can't parse available memory from cgroups (%s), using system memory %s instead", err,
-			humanizeutil.IBytes(totalMem))
-		return checkTotal(totalMem)
-	}
-
-	if cgAvlMem == 0 || cgAvlMem > math.MaxInt64 {
-		log.Infof(ctx, "available memory from cgroups (%s) is unsupported, using system memory %s instead",
-			humanize.IBytes(cgAvlMem), humanizeutil.IBytes(totalMem))
-		return checkTotal(totalMem)
-	}
-
-	if totalMem > 0 && int64(cgAvlMem) > totalMem {
-		log.Infof(ctx, "available memory from cgroups (%s) exceeds system memory %s, using system memory",
-			humanize.IBytes(cgAvlMem), humanizeutil.IBytes(totalMem))
-		return checkTotal(totalMem)
-	}
-
-	return checkTotal(int64(cgAvlMem))
 }
 
 // setOpenFileLimit sets the soft limit for open file descriptors to the hard
@@ -368,25 +339,28 @@ func MakeConfig(ctx context.Context, st *cluster.Settings) Config {
 		panic(err)
 	}
 
-	requireWebLogin := envutil.EnvOrDefaultBool("COCKROACH_EXPERIMENTAL_REQUIRE_WEB_LOGIN", false)
+	disableWebLogin := envutil.EnvOrDefaultBool("COCKROACH_DISABLE_WEB_LOGIN", false)
 
 	cfg := Config{
 		Config:                         new(base.Config),
+		DefaultZoneConfig:              config.DefaultZoneConfig(),
+		DefaultSystemZoneConfig:        config.DefaultSystemZoneConfig(),
 		MaxOffset:                      MaxOffsetType(base.DefaultMaxClockOffset),
 		Settings:                       st,
 		CacheSize:                      DefaultCacheSize,
 		SQLMemoryPoolSize:              defaultSQLMemoryPoolSize,
 		SQLTableStatCacheSize:          defaultSQLTableStatCacheSize,
+		SQLQueryCacheSize:              defaultSQLQueryCacheSize,
 		ScanInterval:                   defaultScanInterval,
+		ScanMinIdleTime:                defaultScanMinIdleTime,
 		ScanMaxIdleTime:                defaultScanMaxIdleTime,
 		EventLogEnabled:                defaultEventLogEnabled,
-		EnableWebSessionAuthentication: requireWebLogin,
+		EnableWebSessionAuthentication: !disableWebLogin,
 		Stores: base.StoreSpecList{
 			Specs: []base.StoreSpec{storeSpec},
 		},
 		TempStorageConfig: base.TempStorageConfigFromEnv(
 			ctx, st, storeSpec, "" /* parentDir */, base.DefaultTempStorageMaxSizeBytes, 0),
-		ConnResultsBufferBytes: defaultConnResultsBufferBytes,
 	}
 	cfg.AmbientCtx.Tracer = st.Tracer
 
@@ -406,16 +380,11 @@ func (cfg *Config) String() string {
 	fmt.Fprintln(w, "cache size\t", humanizeutil.IBytes(cfg.CacheSize))
 	fmt.Fprintln(w, "SQL memory pool size\t", humanizeutil.IBytes(cfg.SQLMemoryPoolSize))
 	fmt.Fprintln(w, "scan interval\t", cfg.ScanInterval)
+	fmt.Fprintln(w, "scan min idle time\t", cfg.ScanMinIdleTime)
 	fmt.Fprintln(w, "scan max idle time\t", cfg.ScanMaxIdleTime)
 	fmt.Fprintln(w, "event log enabled\t", cfg.EventLogEnabled)
 	if cfg.Linearizable {
 		fmt.Fprintln(w, "linearizable\t", cfg.Linearizable)
-	}
-	if cfg.ListeningURLFile != "" {
-		fmt.Fprintln(w, "listening URL file\t", cfg.ListeningURLFile)
-	}
-	if cfg.PIDFile != "" {
-		fmt.Fprintln(w, "PID file\t", cfg.PIDFile)
 	}
 	_ = w.Flush()
 
@@ -425,7 +394,7 @@ func (cfg *Config) String() string {
 // Report logs an overview of the server configuration parameters via
 // the given context.
 func (cfg *Config) Report(ctx context.Context) {
-	if memSize, err := GetTotalMemory(ctx); err != nil {
+	if memSize, err := status.GetTotalMemory(ctx); err != nil {
 		log.Infof(ctx, "unable to retrieve system total memory: %v", err)
 	} else {
 		log.Infof(ctx, "system total memory: %s", humanizeutil.IBytes(memSize))
@@ -464,9 +433,16 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 
 	var details []string
 
-	details = append(details, fmt.Sprintf("RocksDB cache size: %s", humanizeutil.IBytes(cfg.CacheSize)))
-	cache := engine.NewRocksDBCache(cfg.CacheSize)
-	defer cache.Release()
+	var cache engine.RocksDBCache
+	var pebbleCache *pebble.Cache
+	if cfg.StorageEngine == enginepb.EngineTypePebble {
+		details = append(details, fmt.Sprintf("Pebble cache size: %s", humanizeutil.IBytes(cfg.CacheSize)))
+		pebbleCache = pebble.NewCache(cfg.CacheSize)
+	} else {
+		details = append(details, fmt.Sprintf("RocksDB cache size: %s", humanizeutil.IBytes(cfg.CacheSize)))
+		cache = engine.NewRocksDBCache(cfg.CacheSize)
+		defer cache.Release()
+	}
 
 	var physicalStores int
 	for _, spec := range cfg.Stores.Specs {
@@ -488,7 +464,7 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 		var sizeInBytes = spec.Size.InBytes
 		if spec.InMemory {
 			if spec.Size.Percent > 0 {
-				sysMem, err := GetTotalMemory(ctx)
+				sysMem, err := status.GetTotalMemory(ctx)
 				if err != nil {
 					return Engines{}, errors.Errorf("could not retrieve system memory")
 				}
@@ -516,19 +492,37 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 
 			details = append(details, fmt.Sprintf("store %d: RocksDB, max size %s, max open file limit %d",
 				i, humanizeutil.IBytes(sizeInBytes), openFileLimitPerStore))
-			rocksDBConfig := engine.RocksDBConfig{
-				Attrs:                   spec.Attributes,
-				Dir:                     spec.Path,
-				MaxSizeBytes:            sizeInBytes,
-				MaxOpenFiles:            openFileLimitPerStore,
-				WarnLargeBatchThreshold: 500 * time.Millisecond,
-				Settings:                cfg.Settings,
-				UseFileRegistry:         spec.UseFileRegistry,
-				RocksDBOptions:          spec.RocksDBOptions,
-				ExtraOptions:            spec.ExtraOptions,
-			}
 
-			eng, err := engine.NewRocksDB(rocksDBConfig, cache)
+			var eng engine.Engine
+			var err error
+			storageConfig := base.StorageConfig{
+				Attrs:           spec.Attributes,
+				Dir:             spec.Path,
+				MaxSize:         sizeInBytes,
+				Settings:        cfg.Settings,
+				UseFileRegistry: spec.UseFileRegistry,
+				ExtraOptions:    spec.ExtraOptions,
+			}
+			if cfg.StorageEngine == enginepb.EngineTypePebble {
+				// TODO(itsbilal): Tune these options, and allow them to be overridden
+				// in the spec (similar to the existing spec.RocksDBOptions and others).
+				pebbleConfig := engine.PebbleConfig{
+					StorageConfig: storageConfig,
+					Opts:          engine.DefaultPebbleOptions(),
+				}
+				pebbleConfig.Opts.Cache = pebbleCache
+				pebbleConfig.Opts.MaxOpenFiles = int(openFileLimitPerStore)
+				eng, err = engine.NewPebble(pebbleConfig)
+			} else {
+				rocksDBConfig := engine.RocksDBConfig{
+					StorageConfig:           storageConfig,
+					MaxOpenFiles:            openFileLimitPerStore,
+					WarnLargeBatchThreshold: 500 * time.Millisecond,
+					RocksDBOptions:          spec.RocksDBOptions,
+				}
+
+				eng, err = engine.NewRocksDB(rocksDBConfig, cache)
+			}
 			if err != nil {
 				return Engines{}, err
 			}
@@ -605,24 +599,19 @@ func (cfg *Config) RequireWebSession() bool {
 func (cfg *Config) readEnvironmentVariables() {
 	cfg.Linearizable = envutil.EnvOrDefaultBool("COCKROACH_EXPERIMENTAL_LINEARIZABLE", cfg.Linearizable)
 	cfg.ScanInterval = envutil.EnvOrDefaultDuration("COCKROACH_SCAN_INTERVAL", cfg.ScanInterval)
+	cfg.ScanMinIdleTime = envutil.EnvOrDefaultDuration("COCKROACH_SCAN_MIN_IDLE_TIME", cfg.ScanMinIdleTime)
 	cfg.ScanMaxIdleTime = envutil.EnvOrDefaultDuration("COCKROACH_SCAN_MAX_IDLE_TIME", cfg.ScanMaxIdleTime)
 }
 
 // parseGossipBootstrapResolvers parses list of gossip bootstrap resolvers.
 func (cfg *Config) parseGossipBootstrapResolvers() ([]resolver.Resolver, error) {
 	var bootstrapResolvers []resolver.Resolver
-	for _, commaSeparatedAddresses := range cfg.JoinList {
-		addresses := strings.Split(commaSeparatedAddresses, ",")
-		for _, address := range addresses {
-			if len(address) == 0 {
-				continue
-			}
-			resolver, err := resolver.NewResolver(address)
-			if err != nil {
-				return nil, err
-			}
-			bootstrapResolvers = append(bootstrapResolvers, resolver)
+	for _, address := range cfg.JoinList {
+		resolver, err := resolver.NewResolver(address)
+		if err != nil {
+			return nil, err
 		}
+		bootstrapResolvers = append(bootstrapResolvers, resolver)
 	}
 
 	return bootstrapResolvers, nil

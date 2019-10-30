@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import classNames from "classnames";
 import _ from "lodash";
 import Long from "long";
@@ -23,9 +33,9 @@ interface NodesOwnProps {
 
 interface NodesTableRowParams {
   title: string;
-  extract: (ns: protos.cockroach.server.status.NodeStatus$Properties) => React.ReactNode;
-  equality?: (ns: protos.cockroach.server.status.NodeStatus$Properties) => string;
-  cellTitle?: (ns: protos.cockroach.server.status.NodeStatus$Properties) => string;
+  extract: (ns: protos.cockroach.server.status.statuspb.INodeStatus) => React.ReactNode;
+  equality?: (ns: protos.cockroach.server.status.statuspb.INodeStatus) => string;
+  cellTitle?: (ns: protos.cockroach.server.status.statuspb.INodeStatus) => string;
 }
 
 type NodesProps = NodesOwnProps & RouterState;
@@ -50,30 +60,30 @@ function NodeTableCell(props: { value: React.ReactNode, title: string }) {
 
 // Functions starting with "print" return a single string representation which
 // can be used for title, the main content or even equality comparisons.
-function printNodeID(status: protos.cockroach.server.status.NodeStatus$Properties) {
+function printNodeID(status: protos.cockroach.server.status.statuspb.INodeStatus) {
   return `n${status.desc.node_id}`;
 }
 
 function printSingleValue(value: string) {
-  return function (status: protos.cockroach.server.status.NodeStatus$Properties) {
+  return function (status: protos.cockroach.server.status.statuspb.INodeStatus) {
     return _.get(status, value, null);
   };
 }
 
 function printSingleValueWithFunction(value: string, fn: (item: any) => string) {
-  return function (status: protos.cockroach.server.status.NodeStatus$Properties) {
+  return function (status: protos.cockroach.server.status.statuspb.INodeStatus) {
     return fn(_.get(status, value, null));
   };
 }
 
 function printMultiValue(value: string) {
-  return function (status: protos.cockroach.server.status.NodeStatus$Properties) {
+  return function (status: protos.cockroach.server.status.statuspb.INodeStatus) {
     return _.join(_.get(status, value, []), "\n");
   };
 }
 
 function printDateValue(value: string, inputDateFormat: string) {
-  return function (status: protos.cockroach.server.status.NodeStatus$Properties) {
+  return function (status: protos.cockroach.server.status.statuspb.INodeStatus) {
     if (!_.has(status, value)) {
       return null;
     }
@@ -82,7 +92,7 @@ function printDateValue(value: string, inputDateFormat: string) {
 }
 
 function printTimestampValue(value: string) {
-  return function (status: protos.cockroach.server.status.NodeStatus$Properties) {
+  return function (status: protos.cockroach.server.status.statuspb.INodeStatus) {
     if (!_.has(status, value)) {
       return null;
     }
@@ -93,7 +103,7 @@ function printTimestampValue(value: string) {
 // Functions starting with "title" are used exclusively to print the cell
 // titles. They always return a single string.
 function titleDateValue(value: string, inputDateFormat: string) {
-  return function (status: protos.cockroach.server.status.NodeStatus$Properties) {
+  return function (status: protos.cockroach.server.status.statuspb.INodeStatus) {
     if (!_.has(status, value)) {
       return null;
     }
@@ -103,7 +113,7 @@ function titleDateValue(value: string, inputDateFormat: string) {
 }
 
 function titleTimestampValue(value: string) {
-  return function (status: protos.cockroach.server.status.NodeStatus$Properties) {
+  return function (status: protos.cockroach.server.status.statuspb.INodeStatus) {
     if (!_.has(status, value)) {
       return null;
     }
@@ -115,7 +125,7 @@ function titleTimestampValue(value: string) {
 // Functions starting with "extract" are used exclusively for for extracting
 // the main content of a cell.
 function extractMultiValue(value: string) {
-  return function (status: protos.cockroach.server.status.NodeStatus$Properties) {
+  return function (status: protos.cockroach.server.status.statuspb.INodeStatus) {
     const items = _.map(_.get(status, value, []), item => item.toString());
     return (
       <ul className="nodes-entries-list">
@@ -131,7 +141,7 @@ function extractMultiValue(value: string) {
   };
 }
 
-function extractCertificateLink(status: protos.cockroach.server.status.NodeStatus$Properties) {
+function extractCertificateLink(status: protos.cockroach.server.status.statuspb.INodeStatus) {
   const nodeID = status.desc.node_id;
   return (
     <a className="debug-link" href={`#/reports/certificates/${nodeID}`}>
@@ -258,9 +268,9 @@ class Nodes extends React.Component<NodesProps, {}> {
     orderedNodeIDs: string[],
     key: number,
     title: string,
-    extract: (ns: protos.cockroach.server.status.NodeStatus$Properties) => React.ReactNode,
-    equality?: (ns: protos.cockroach.server.status.NodeStatus$Properties) => string,
-    cellTitle?: (ns: protos.cockroach.server.status.NodeStatus$Properties) => string,
+    extract: (ns: protos.cockroach.server.status.statuspb.INodeStatus) => React.ReactNode,
+    equality?: (ns: protos.cockroach.server.status.statuspb.INodeStatus) => string,
+    cellTitle?: (ns: protos.cockroach.server.status.statuspb.INodeStatus) => string,
   ) {
     const inconsistent = !_.isNil(equality) && _.chain(orderedNodeIDs)
       .map(nodeID => this.props.nodesSummary.nodeStatusByID[nodeID])

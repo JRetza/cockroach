@@ -1,31 +1,25 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package batcheval
 
 import (
 	"context"
-	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/spanset"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/pkg/errors"
@@ -36,9 +30,9 @@ func init() {
 }
 
 func declareKeysTruncateLog(
-	_ roachpb.RangeDescriptor, header roachpb.Header, req roachpb.Request, spans *spanset.SpanSet,
+	_ *roachpb.RangeDescriptor, header roachpb.Header, req roachpb.Request, spans *spanset.SpanSet,
 ) {
-	spans.Add(spanset.SpanReadWrite, roachpb.Span{Key: keys.RaftTruncatedStateKey(header.RangeID)})
+	spans.Add(spanset.SpanReadWrite, roachpb.Span{Key: keys.RaftTruncatedStateLegacyKey(header.RangeID)})
 	prefix := keys.RaftLogPrefix(header.RangeID)
 	spans.Add(spanset.SpanReadWrite, roachpb.Span{Key: prefix, EndKey: prefix.PrefixEnd()})
 }
@@ -54,18 +48,40 @@ func TruncateLog(
 	// After a merge, it's possible that this request was sent to the wrong
 	// range based on the start key. This will cancel the request if this is not
 	// the range specified in the request body.
-	if cArgs.EvalCtx.GetRangeID() != args.RangeID {
+	rangeID := cArgs.EvalCtx.GetRangeID()
+	if rangeID != args.RangeID {
 		log.Infof(ctx, "attempting to truncate raft logs for another range: r%d. Normally this is due to a merge and can be ignored.",
 			args.RangeID)
 		return result.Result{}, nil
 	}
 
-	// Have we already truncated this log? If so, just return without an error.
-	firstIndex, err := cArgs.EvalCtx.GetFirstIndex()
+	var legacyTruncatedState roachpb.RaftTruncatedState
+	legacyKeyFound, err := engine.MVCCGetProto(
+		ctx, batch, keys.RaftTruncatedStateLegacyKey(cArgs.EvalCtx.GetRangeID()),
+		hlc.Timestamp{}, &legacyTruncatedState, engine.MVCCGetOptions{},
+	)
 	if err != nil {
 		return result.Result{}, err
 	}
 
+	// See the comment on the cluster version for all the moving parts involved
+	// in migrating into this cluster version. Note that if the legacy key is
+	// missing, the cluster version has been bumped (though we may not know it
+	// yet) and we keep using the unreplicated key.
+	useNewUnreplicatedTruncatedStateKey := cArgs.EvalCtx.ClusterSettings().Version.IsActive(cluster.VersionUnreplicatedRaftTruncatedState) || !legacyKeyFound
+
+	firstIndex, err := cArgs.EvalCtx.GetFirstIndex()
+	if err != nil {
+		return result.Result{}, errors.Wrap(err, "getting first index")
+	}
+	// Have we already truncated this log? If so, just return without an error.
+	// Note that there may in principle be followers whose Raft log is longer
+	// than this node's, but to issue a truncation we also need the *term* for
+	// the new truncated state, which we can't obtain if we don't have the log
+	// entry ourselves.
+	//
+	// TODO(tbg): think about synthesizing a valid term. Can we use the next
+	// existing entry's term?
 	if firstIndex >= args.Index {
 		if log.V(3) {
 			log.Infof(ctx, "attempting to truncate previously truncated raft log. FirstIndex:%d, TruncateFrom:%d",
@@ -77,41 +93,38 @@ func TruncateLog(
 	// args.Index is the first index to keep.
 	term, err := cArgs.EvalCtx.GetTerm(args.Index - 1)
 	if err != nil {
-		return result.Result{}, err
+		return result.Result{}, errors.Wrap(err, "getting term")
 	}
 
-	// We start at index zero because it's always possible that a previous
-	// truncation did not clean up entries made obsolete by the previous
-	// truncation.
-	start := engine.MakeMVCCMetadataKey(keys.RaftLogKey(cArgs.EvalCtx.GetRangeID(), 0))
-	end := engine.MakeMVCCMetadataKey(keys.RaftLogKey(cArgs.EvalCtx.GetRangeID(), args.Index))
+	// Compute the number of bytes freed by this truncation. Note that this will
+	// only make sense for the leaseholder as we base this off its own first
+	// index (other replicas may have other first indexes assuming we're not
+	// still using the legacy truncated state key). In principle, this could be
+	// off either way, though in practice we don't expect followers to have
+	// a first index smaller than the leaseholder's (see #34287), and most of
+	// the time everyone's first index should be the same.
+	start := keys.RaftLogKey(rangeID, firstIndex)
+	end := keys.RaftLogKey(rangeID, args.Index)
 
-	var ms enginepb.MVCCStats
-	if cArgs.EvalCtx.ClusterSettings().Version.IsActive(cluster.VersionRaftLogTruncationBelowRaft) {
-		// Compute the stats delta that were to occur should the log entries be
-		// purged. We do this as a side effect of seeing a new TruncatedState,
-		// downstream of Raft. A follower may not run the side effect in the event
-		// of an ill-timed crash, but that's OK since the next truncation will get
-		// everything.
-		//
-		// Note that any sideloaded payloads that may be removed by this truncation
-		// don't matter; they're not tracked in the raft log delta.
-		iter := batch.NewIterator(engine.IterOptions{})
-		defer iter.Close()
-		// We can pass zero as nowNanos because we're only interested in SysBytes.
-		var err error
-		ms, err = iter.ComputeStats(start, end, 0 /* nowNanos */)
-		if err != nil {
-			return result.Result{}, errors.Wrap(err, "while computing stats of Raft log freed by truncation")
-		}
-		ms.SysBytes = -ms.SysBytes // simulate the deletion
-
-	} else {
-		if _, _, _, err := engine.MVCCDeleteRange(ctx, batch, &ms, start.Key, end.Key, math.MaxInt64, /* max */
-			hlc.Timestamp{}, nil /* txn */, false /* returnKeys */); err != nil {
-			return result.Result{}, err
-		}
+	// Compute the stats delta that were to occur should the log entries be
+	// purged. We do this as a side effect of seeing a new TruncatedState,
+	// downstream of Raft.
+	//
+	// Note that any sideloaded payloads that may be removed by this truncation
+	// don't matter; they're not tracked in the raft log delta.
+	//
+	// TODO(tbg): it's difficult to prove that this computation doesn't have
+	// bugs that let it diverge. It might be easier to compute the stats
+	// from scratch, stopping when 4mb (defaultRaftLogTruncationThreshold)
+	// is reached as at that point we'll truncate aggressively anyway.
+	iter := batch.NewIterator(engine.IterOptions{UpperBound: end})
+	defer iter.Close()
+	// We can pass zero as nowNanos because we're only interested in SysBytes.
+	ms, err := iter.ComputeStats(start, end, 0 /* nowNanos */)
+	if err != nil {
+		return result.Result{}, errors.Wrap(err, "while computing stats of Raft log freed by truncation")
 	}
+	ms.SysBytes = -ms.SysBytes // simulate the deletion
 
 	tState := &roachpb.RaftTruncatedState{
 		Index: args.Index - 1,
@@ -119,10 +132,26 @@ func TruncateLog(
 	}
 
 	var pd result.Result
-	pd.Replicated.State = &storagebase.ReplicaState{
+	pd.Replicated.State = &storagepb.ReplicaState{
 		TruncatedState: tState,
 	}
+
 	pd.Replicated.RaftLogDelta = ms.SysBytes
 
-	return pd, MakeStateLoader(cArgs.EvalCtx).SetTruncatedState(ctx, batch, cArgs.Stats, tState)
+	if !useNewUnreplicatedTruncatedStateKey {
+		return pd, MakeStateLoader(cArgs.EvalCtx).SetLegacyRaftTruncatedState(ctx, batch, cArgs.Stats, tState)
+	}
+	if legacyKeyFound {
+		// Time to migrate by deleting the legacy key. The downstream-of-Raft
+		// code will atomically rewrite the truncated state (supplied via the
+		// side effect) into the new unreplicated key.
+		if err := engine.MVCCDelete(
+			ctx, batch, cArgs.Stats, keys.RaftTruncatedStateLegacyKey(cArgs.EvalCtx.GetRangeID()),
+			hlc.Timestamp{}, nil, /* txn */
+		); err != nil {
+			return result.Result{}, err
+		}
+	}
+
+	return pd, nil
 }

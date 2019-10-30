@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package debug
 
@@ -23,20 +19,18 @@ import (
 	"net/http/pprof"
 	"strings"
 
-	// Register the net/trace endpoint with http.DefaultServeMux.
-
+	"github.com/cockroachdb/cockroach/pkg/server/debug/goroutineui"
 	"github.com/cockroachdb/cockroach/pkg/server/debug/pprofui"
-	"golang.org/x/net/trace"
-	"google.golang.org/grpc/metadata"
-
-	"github.com/pkg/errors"
-	"github.com/rcrowley/go-metrics"
-	"github.com/rcrowley/go-metrics/exp"
-
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/pkg/errors"
+	"github.com/rcrowley/go-metrics"
+	"github.com/rcrowley/go-metrics/exp"
+	"golang.org/x/net/trace"
+	"google.golang.org/grpc/metadata"
 )
 
 func init() {
@@ -122,8 +116,36 @@ func NewServer(st *cluster.Settings) *Server {
 	}
 	mux.HandleFunc("/debug/logspy", spy.handleDebugLogSpy)
 
-	ps := pprofui.NewServer(pprofui.NewMemStorage(1, 0))
+	ps := pprofui.NewServer(pprofui.NewMemStorage(1, 0), func(profile string, labels bool, do func()) {
+		tBegin := timeutil.Now()
+
+		extra := ""
+		if profile == "profile" && labels {
+			extra = " (enabling profiler labels)"
+			st.SetCPUProfiling(true)
+			defer st.SetCPUProfiling(false)
+		}
+		log.Infof(context.Background(), "pprofui: recording %s%s", profile, extra)
+
+		do()
+
+		log.Infof(context.Background(), "pprofui: recorded %s in %.2fs", profile, timeutil.Since(tBegin).Seconds())
+	})
 	mux.Handle("/debug/pprof/ui/", http.StripPrefix("/debug/pprof/ui", ps))
+
+	mux.HandleFunc("/debug/pprof/goroutineui/", func(w http.ResponseWriter, req *http.Request) {
+		dump := goroutineui.NewDump(timeutil.Now())
+
+		_ = req.ParseForm()
+		switch req.Form.Get("sort") {
+		case "count":
+			dump.SortCountDesc()
+		case "wait":
+			dump.SortWaitDesc()
+		default:
+		}
+		_ = dump.HTML(w)
+	})
 
 	return &Server{
 		st:  st,

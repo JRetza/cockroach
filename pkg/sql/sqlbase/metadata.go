@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sqlbase
 
@@ -19,6 +15,7 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -54,6 +51,8 @@ type DescriptorProto interface {
 func WrapDescriptor(descriptor DescriptorProto) *Descriptor {
 	desc := &Descriptor{}
 	switch t := descriptor.(type) {
+	case *MutableTableDescriptor:
+		desc.Union = &Descriptor_Table{Table: &t.TableDescriptor}
 	case *TableDescriptor:
 		desc.Union = &Descriptor_Table{Table: t}
 	case *DatabaseDescriptor:
@@ -69,9 +68,9 @@ func WrapDescriptor(descriptor DescriptorProto) *Descriptor {
 // installed on the underlying persistent storage before a cockroach store can
 // start running correctly, thus requiring this special initialization.
 type MetadataSchema struct {
-	descs   []metadataDescriptor
-	configs int
-	otherKV []roachpb.KeyValue
+	descs         []metadataDescriptor
+	otherSplitIDs []uint32
+	otherKV       []roachpb.KeyValue
 }
 
 type metadataDescriptor struct {
@@ -81,9 +80,11 @@ type metadataDescriptor struct {
 
 // MakeMetadataSchema constructs a new MetadataSchema value which constructs
 // the "system" database.
-func MakeMetadataSchema() MetadataSchema {
+func MakeMetadataSchema(
+	defaultZoneConfig *config.ZoneConfig, defaultSystemZoneConfig *config.ZoneConfig,
+) MetadataSchema {
 	ms := MetadataSchema{}
-	addSystemDatabaseToSchema(&ms)
+	addSystemDatabaseToSchema(&ms, defaultZoneConfig, defaultSystemZoneConfig)
 	return ms
 }
 
@@ -101,11 +102,13 @@ func (ms *MetadataSchema) AddDescriptor(parentID ID, desc DescriptorProto) {
 	ms.descs = append(ms.descs, metadataDescriptor{parentID, desc})
 }
 
-// AddConfigDescriptor adds a new descriptor to the system schema. Used only for
-// SystemConfig tables and databases.
-func (ms *MetadataSchema) AddConfigDescriptor(parentID ID, desc DescriptorProto) {
-	ms.AddDescriptor(parentID, desc)
-	ms.configs++
+// AddSplitIDs adds some "table ids" to the MetadataSchema such that
+// corresponding keys are returned as split points by GetInitialValues().
+// AddDescriptor() has the same effect for the table descriptors that are passed
+// to it, but we also have a couple of "fake tables" that don't have descriptors
+// but need splits just the same.
+func (ms *MetadataSchema) AddSplitIDs(id ...uint32) {
+	ms.otherSplitIDs = append(ms.otherSplitIDs, id...)
 }
 
 // SystemDescriptorCount returns the number of descriptors that will be created by
@@ -115,10 +118,12 @@ func (ms MetadataSchema) SystemDescriptorCount() int {
 }
 
 // GetInitialValues returns the set of initial K/V values which should be added to
-// a bootstrapping CockroachDB cluster in order to create the tables contained
-// in the schema.
-func (ms MetadataSchema) GetInitialValues() []roachpb.KeyValue {
+// a bootstrapping cluster in order to create the tables contained
+// in the schema. Also returns a list of split points (a split for each SQL
+// table descriptor part of the initial values). Both returned sets are sorted.
+func (ms MetadataSchema) GetInitialValues() ([]roachpb.KeyValue, []roachpb.RKey) {
 	var ret []roachpb.KeyValue
+	var splits []roachpb.RKey
 
 	// Save the ID generator value, which will generate descriptor IDs for user
 	// objects.
@@ -136,7 +141,7 @@ func (ms MetadataSchema) GetInitialValues() []roachpb.KeyValue {
 		value := roachpb.Value{}
 		value.SetInt(int64(desc.GetID()))
 		ret = append(ret, roachpb.KeyValue{
-			Key:   MakeNameMetadataKey(parentID, desc.GetName()),
+			Key:   NewTableKey(parentID, desc.GetName()).Key(),
 			Value: value,
 		})
 
@@ -150,12 +155,19 @@ func (ms MetadataSchema) GetInitialValues() []roachpb.KeyValue {
 			Key:   MakeDescMetadataKey(desc.GetID()),
 			Value: value,
 		})
+		if desc.GetID() > keys.MaxSystemConfigDescID {
+			splits = append(splits, roachpb.RKey(keys.MakeTablePrefix(uint32(desc.GetID()))))
+		}
 	}
 
 	// Generate initial values for system databases and tables, which have
 	// static descriptors that were generated elsewhere.
 	for _, sysObj := range ms.descs {
 		addDescriptor(sysObj.parentID, sysObj.desc)
+	}
+
+	for _, id := range ms.otherSplitIDs {
+		splits = append(splits, roachpb.RKey(keys.MakeTablePrefix(id)))
 	}
 
 	// Other key/value generation that doesn't fit into databases and
@@ -165,7 +177,11 @@ func (ms MetadataSchema) GetInitialValues() []roachpb.KeyValue {
 	// Sort returned key values; this is valuable because it matches the way the
 	// objects would be sorted if read from the engine.
 	sort.Sort(roachpb.KeyValueByKey(ret))
-	return ret
+	sort.Slice(splits, func(i, j int) bool {
+		return splits[i].Less(splits[j])
+	})
+
+	return ret, splits
 }
 
 // DescriptorIDs returns the descriptor IDs present in the metadata schema in
@@ -177,4 +193,37 @@ func (ms MetadataSchema) DescriptorIDs() IDs {
 	}
 	sort.Sort(descriptorIDs)
 	return descriptorIDs
+}
+
+// systemTableIDCache is used to accelerate name lookups
+// on table descriptors. It relies on the fact that
+// table IDs under MaxReservedDescID are fixed.
+var systemTableIDCache = func() map[string]ID {
+	cache := make(map[string]ID)
+
+	ms := MetadataSchema{}
+	addSystemDescriptorsToSchema(&ms)
+	for _, d := range ms.descs {
+		t, ok := d.desc.(*TableDescriptor)
+		if !ok || t.ParentID != SystemDB.ID || t.ID > keys.MaxReservedDescID {
+			// We only cache table descriptors under 'system' with a reserved table ID.
+			continue
+		}
+		cache[t.Name] = t.ID
+	}
+
+	return cache
+}()
+
+// LookupSystemTableDescriptorID uses the lookup cache above
+// to bypass a KV lookup when resolving the name of system tables.
+func LookupSystemTableDescriptorID(dbID ID, tableName string) ID {
+	if dbID != SystemDB.ID {
+		return InvalidID
+	}
+	dbID, ok := systemTableIDCache[tableName]
+	if !ok {
+		return InvalidID
+	}
+	return dbID
 }

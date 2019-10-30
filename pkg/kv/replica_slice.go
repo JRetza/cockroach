@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package kv
 
@@ -46,12 +42,12 @@ type ReplicaSlice []ReplicaInfo
 // NewReplicaSlice creates a ReplicaSlice from the replicas listed in the range
 // descriptor and using gossip to lookup node descriptors. Replicas on nodes
 // that are not gossiped are omitted from the result.
-func NewReplicaSlice(gossip *gossip.Gossip, desc *roachpb.RangeDescriptor) ReplicaSlice {
+func NewReplicaSlice(gossip *gossip.Gossip, replicas []roachpb.ReplicaDescriptor) ReplicaSlice {
 	if gossip == nil {
 		return nil
 	}
-	replicas := make(ReplicaSlice, 0, len(desc.Replicas))
-	for _, r := range desc.Replicas {
+	rs := make(ReplicaSlice, 0, len(replicas))
+	for _, r := range replicas {
 		nd, err := gossip.GetNodeDescriptor(r.NodeID)
 		if err != nil {
 			if log.V(1) {
@@ -59,12 +55,12 @@ func NewReplicaSlice(gossip *gossip.Gossip, desc *roachpb.RangeDescriptor) Repli
 			}
 			continue
 		}
-		replicas = append(replicas, ReplicaInfo{
+		rs = append(rs, ReplicaInfo{
 			ReplicaDescriptor: r,
 			NodeDesc:          nd,
 		})
 	}
-	return replicas
+	return rs
 }
 
 // ReplicaSlice implements shuffle.Interface.

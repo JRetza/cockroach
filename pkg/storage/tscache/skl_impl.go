@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tscache
 
@@ -49,11 +45,11 @@ type sklImpl struct {
 var _ Cache = &sklImpl{}
 
 // newSklImpl returns a new treeImpl with the supplied hybrid clock.
-func newSklImpl(clock *hlc.Clock, pageSize uint32, metrics Metrics) *sklImpl {
+func newSklImpl(clock *hlc.Clock, pageSize uint32) *sklImpl {
 	if pageSize == 0 {
 		pageSize = defaultSklPageSize
 	}
-	tc := sklImpl{clock: clock, pageSize: pageSize, metrics: metrics}
+	tc := sklImpl{clock: clock, pageSize: pageSize, metrics: makeMetrics()}
 	tc.clear(clock.Now())
 	return &tc
 }
@@ -145,6 +141,11 @@ func (tc *sklImpl) boundKeyLengths(start, end roachpb.Key) (roachpb.Key, roachpb
 			"losing precision in timestamp cache", l, maxKeySize)
 	}
 	return start, end
+}
+
+// Metrics implements the Cache interface.
+func (tc *sklImpl) Metrics() Metrics {
+	return tc.metrics
 }
 
 // intervalSkl doesn't handle nil keys the same way as empty keys. Cockroach's

@@ -17,11 +17,11 @@ import (
 	"math/rand"
 	"strings"
 
-	"github.com/spf13/pflag"
-
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
+	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
+	"github.com/spf13/pflag"
 )
 
 // These need to be kept in sync with the zones used when --geo is passed
@@ -61,7 +61,7 @@ const (
 	defaultUsers  = 10000
 	defaultOrders = 100000
 
-	zoneLocationsStmt = `INSERT INTO system.locations VALUES
+	zoneLocationsStmt = `UPSERT INTO system.locations VALUES
 		('zone', 'us-east1-b', 33.0641249, -80.0433347),
 		('zone', 'us-west1-b', 45.6319052, -121.2010282),
 		('zone', 'europe-west2-b', 51.509865, 0)
@@ -139,9 +139,19 @@ func (m *roachmart) Hooks() workload.Hooks {
 				return nil
 			}
 			for _, z := range zones {
-				_, err := db.Exec(fmt.Sprintf(
-					"ALTER PARTITION %[1]q OF TABLE users EXPERIMENTAL CONFIGURE ZONE 'constraints: [+zone=%[1]s]'",
-					z))
+				// We are removing the EXPERIMENTAL keyword in 2.1. For compatibility
+				// with 2.0 clusters we still need to try with it if the
+				// syntax without EXPERIMENTAL fails.
+				// TODO(knz): Remove this in 2.2.
+				makeStmt := func(s string) string {
+					return fmt.Sprintf(s, fmt.Sprintf("%q", z), fmt.Sprintf("'constraints: [+zone=%s]'", z))
+				}
+				stmt := makeStmt("ALTER PARTITION %[1]s OF TABLE users CONFIGURE ZONE = %[2]s")
+				_, err := db.Exec(stmt)
+				if err != nil && strings.Contains(err.Error(), "syntax error") {
+					stmt = makeStmt("ALTER PARTITION %[1]s OF TABLE users EXPERIMENTAL CONFIGURE ZONE %[2]s")
+					_, err = db.Exec(stmt)
+				}
 				if err != nil {
 					return err
 				}
@@ -175,12 +185,12 @@ func (m *roachmart) Tables() []workload.Table {
 		InitialRows: workload.Tuples(
 			m.orders,
 			func(rowIdx int) []interface{} {
-				user := users.InitialRows.Batch(rowIdx % m.users)[0]
+				user := users.InitialRows.BatchRows(rowIdx % m.users)[0]
 				zone, email := user[0], user[1]
 				return []interface{}{
-					zone,   // user_zone
-					email,  // user_email
-					rowIdx, // id
+					zone,                         // user_zone
+					email,                        // user_email
+					rowIdx,                       // id
 					[]string{`f`, `t`}[rowIdx%2], // fulfilled
 				}
 			},
@@ -190,9 +200,7 @@ func (m *roachmart) Tables() []workload.Table {
 }
 
 // Ops implements the Opser interface.
-func (m *roachmart) Ops(
-	urls []string, reg *workload.HistogramRegistry,
-) (workload.QueryLoad, error) {
+func (m *roachmart) Ops(urls []string, reg *histogram.Registry) (workload.QueryLoad, error) {
 	sqlDatabase, err := workload.SanitizeUrls(m, m.connFlags.DBOverride, urls)
 	if err != nil {
 		return workload.QueryLoad{}, err
@@ -219,7 +227,7 @@ func (m *roachmart) Ops(
 			// our locality requirements.
 			var zone, email interface{}
 			for i := rng.Int(); ; i++ {
-				user := usersTable.InitialRows.Batch(i % m.users)[0]
+				user := usersTable.InitialRows.BatchRows(i % m.users)[0]
 				zone, email = user[0], user[1]
 				userLocal := zone == m.localZone
 				if userLocal == wantLocal {

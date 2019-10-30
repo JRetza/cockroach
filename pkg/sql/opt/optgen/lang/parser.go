@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package lang
 
@@ -18,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -202,12 +199,19 @@ func (p *Parser) parseDefine(comments CommentsExpr, tags TagsExpr, src SourceLoc
 	}
 
 	for {
+		// Remember any comments scanned by p.scan by initializing p.comments.
+		p.comments = make(CommentsExpr, 0)
+
 		if p.scan() == RBRACE {
 			return define
 		}
-
 		p.unscan()
-		defineField := p.parseDefineField()
+
+		// Get any comments that have accumulated.
+		comments := p.comments
+		p.comments = nil
+
+		defineField := p.parseDefineField(comments)
 		if defineField == nil {
 			return nil
 		}
@@ -217,7 +221,7 @@ func (p *Parser) parseDefine(comments CommentsExpr, tags TagsExpr, src SourceLoc
 }
 
 // define-field = field-name field-type
-func (p *Parser) parseDefineField() *DefineFieldExpr {
+func (p *Parser) parseDefineField(comments CommentsExpr) *DefineFieldExpr {
 	if !p.scanToken(IDENT, "define field name") {
 		return nil
 	}
@@ -231,7 +235,12 @@ func (p *Parser) parseDefineField() *DefineFieldExpr {
 
 	typ := p.s.Literal()
 
-	return &DefineFieldExpr{Src: &src, Name: StringExpr(name), Type: StringExpr(typ)}
+	return &DefineFieldExpr{
+		Src:      &src,
+		Name:     StringExpr(name),
+		Comments: comments,
+		Type:     StringExpr(typ),
+	}
 }
 
 // rule = match '=>' replace
@@ -255,41 +264,84 @@ func (p *Parser) parseRule(comments CommentsExpr, tags TagsExpr, src SourceLoc) 
 		Name:     StringExpr(tags[0]),
 		Comments: comments,
 		Tags:     tags[1:],
-		Match:    match.(*MatchExpr),
+		Match:    match.(*FuncExpr),
 		Replace:  replace,
 	}
 }
 
-// match = '(' match-names match-child* ')'
+// match = func
 func (p *Parser) parseMatch() Expr {
 	if !p.scanToken(LPAREN, "match pattern") {
 		return nil
 	}
+	p.unscan()
+	return p.parseFunc()
+}
 
-	src := p.src
-	names := p.parseMatchNames()
-	if names == nil {
-		return nil
-	}
-
-	match := &MatchExpr{Src: &src, Names: names}
-	for {
-		if p.scan() == RPAREN {
-			return match
-		}
-
+// replace = func | ref
+func (p *Parser) parseReplace() Expr {
+	switch p.scan() {
+	case LPAREN:
 		p.unscan()
-		matchChild := p.parseMatchChild()
-		if matchChild == nil {
-			return nil
-		}
+		return p.parseFunc()
 
-		match.Args = append(match.Args, matchChild)
+	case DOLLAR:
+		p.unscan()
+		return p.parseRef()
+
+	default:
+		p.addExpectedTokenErr("replace pattern")
+		return nil
 	}
 }
 
-// match-names = name ('|' name)*
-func (p *Parser) parseMatchNames() NamesExpr {
+// func = '(' func-name arg* ')'
+func (p *Parser) parseFunc() Expr {
+	if p.scan() != LPAREN {
+		panic("caller should have checked for left parenthesis")
+	}
+
+	src := p.src
+	name := p.parseFuncName()
+	if name == nil {
+		return nil
+	}
+
+	fn := &FuncExpr{Src: &src, Name: name}
+	for {
+		if p.scan() == RPAREN {
+			return fn
+		}
+
+		p.unscan()
+		arg := p.parseArg()
+		if arg == nil {
+			return nil
+		}
+
+		fn.Args = append(fn.Args, arg)
+	}
+}
+
+// func-name = names | func
+func (p *Parser) parseFuncName() Expr {
+	switch p.scan() {
+	case IDENT:
+		p.unscan()
+		return p.parseNames()
+
+	case LPAREN:
+		// Constructed name.
+		p.unscan()
+		return p.parseFunc()
+	}
+
+	p.addExpectedTokenErr("name")
+	return nil
+}
+
+// names = name ('|' name)*
+func (p *Parser) parseNames() Expr {
 	var names NamesExpr
 	for {
 		if !p.scanToken(IDENT, "name") {
@@ -300,13 +352,13 @@ func (p *Parser) parseMatchNames() NamesExpr {
 
 		if p.scan() != PIPE {
 			p.unscan()
-			return names
+			return &names
 		}
 	}
 }
 
 // match-child = bind | ref | match-and
-func (p *Parser) parseMatchChild() Expr {
+func (p *Parser) parseArg() Expr {
 	tok := p.scan()
 	p.unscan()
 
@@ -314,10 +366,10 @@ func (p *Parser) parseMatchChild() Expr {
 		return p.parseBindOrRef()
 	}
 
-	return p.parseMatchAnd()
+	return p.parseAnd()
 }
 
-// bind = '$' label ':' match-and
+// bind = '$' label ':' and
 // ref  = '$' label
 func (p *Parser) parseBindOrRef() Expr {
 	if p.scan() != DOLLAR {
@@ -337,18 +389,18 @@ func (p *Parser) parseBindOrRef() Expr {
 		return &RefExpr{Src: &src, Label: label}
 	}
 
-	target := p.parseMatchAnd()
+	target := p.parseAnd()
 	if target == nil {
 		return nil
 	}
 	return &BindExpr{Src: &src, Label: label, Target: target}
 }
 
-// match-and = match-item ('&' match-and)
-func (p *Parser) parseMatchAnd() Expr {
+// and = expr ('&' and)
+func (p *Parser) parseAnd() Expr {
 	src := p.peekNextSource()
 
-	left := p.parseMatchItem()
+	left := p.parseExpr()
 	if left == nil {
 		return nil
 	}
@@ -358,30 +410,31 @@ func (p *Parser) parseMatchAnd() Expr {
 		return left
 	}
 
-	right := p.parseMatchAnd()
+	right := p.parseAnd()
 	if right == nil {
 		return nil
 	}
-	return &MatchAndExpr{Src: src, Left: left, Right: right}
+	return &AndExpr{Src: src, Left: left, Right: right}
 }
 
-// match-item = match | match-not | match-list | match-any | name | STRING
-func (p *Parser) parseMatchItem() Expr {
+// expr = func | not | list | any | name | STRING | NUMBER
+func (p *Parser) parseExpr() Expr {
 	switch p.scan() {
 	case LPAREN:
 		p.unscan()
-		return p.parseMatch()
+		return p.parseFunc()
 
 	case CARET:
 		p.unscan()
-		return p.parseMatchNot()
+		return p.parseNot()
 
 	case LBRACKET:
 		p.unscan()
-		return p.parseMatchList()
+		return p.parseList()
 
 	case ASTERISK:
-		return &MatchAnyExpr{}
+		src := p.src
+		return &AnyExpr{Src: &src}
 
 	case IDENT:
 		name := NameExpr(p.s.Literal())
@@ -391,158 +444,47 @@ func (p *Parser) parseMatchItem() Expr {
 		p.unscan()
 		return p.parseString()
 
+	case NUMBER:
+		p.unscan()
+		return p.parseNumber()
+
 	default:
-		p.addExpectedTokenErr("match pattern")
+		p.addExpectedTokenErr("expression")
 		return nil
 	}
 }
 
-// match-not = '^' match-item
-func (p *Parser) parseMatchNot() Expr {
+// not = '^' expr
+func (p *Parser) parseNot() Expr {
 	if p.scan() != CARET {
 		panic("caller should have checked for caret")
 	}
 
 	src := p.src
 
-	input := p.parseMatchItem()
+	input := p.parseExpr()
 	if input == nil {
 		return nil
 	}
-	return &MatchNotExpr{Src: &src, Input: input}
+	return &NotExpr{Src: &src, Input: input}
 }
 
-// match-list        = match-list-any | match-list-first | match-list-last |
-//                     match-list-single | match-list-empty
-// match-list-any    = '[' '...' match-child '...' ']'
-// match-list-first  = '[' match-child '...' ']'
-// match-list-last   = '[' '...' match-child ']'
-// match-list-single = '[' match-child ']'
-// match-list-empty  = '[' ']'
-func (p *Parser) parseMatchList() Expr {
+// list = '[' list-child* ']'
+func (p *Parser) parseList() Expr {
 	if p.scan() != LBRACKET {
 		panic("caller should have checked for left bracket")
 	}
 
 	src := p.src
 
-	var hasStartEllipses, hasEndEllipses bool
-
-	switch p.scan() {
-	case ELLIPSES:
-		hasStartEllipses = true
-
-	case RBRACKET:
-		// Empty list case.
-		return &MatchListEmptyExpr{}
-
-	default:
-		p.unscan()
-	}
-
-	matchItem := p.parseMatchChild()
-	if matchItem == nil {
-		return nil
-	}
-
-	switch p.scan() {
-	case ELLIPSES:
-		hasEndEllipses = true
-
-	default:
-		p.unscan()
-	}
-
-	if !p.scanToken(RBRACKET, "']'") {
-		return nil
-	}
-
-	// Handle various combinations of start and end ellipses.
-	if hasStartEllipses {
-		if hasEndEllipses {
-			return &MatchListAnyExpr{Src: &src, MatchItem: matchItem}
-		}
-		return &MatchListLastExpr{Src: &src, MatchItem: matchItem}
-	} else if hasEndEllipses {
-		return &MatchListFirstExpr{Src: &src, MatchItem: matchItem}
-	}
-	return &MatchListSingleExpr{Src: &src, MatchItem: matchItem}
-}
-
-// replace = construct | construct-list | ref | name | STRING
-func (p *Parser) parseReplace() Expr {
-	switch p.scan() {
-	case LPAREN:
-		p.unscan()
-		return p.parseConstruct()
-
-	case LBRACKET:
-		p.unscan()
-		return p.parseConstructList()
-
-	case DOLLAR:
-		p.unscan()
-		return p.parseRef()
-
-	case IDENT:
-		name := NameExpr(p.s.Literal())
-		return &name
-
-	case STRING:
-		p.unscan()
-		return p.parseString()
-
-	default:
-		p.addExpectedTokenErr("replace pattern")
-		return nil
-	}
-}
-
-// construct = '(' construct-name replace* ')'
-func (p *Parser) parseConstruct() Expr {
-	if p.scan() != LPAREN {
-		panic("caller should have checked for left paren")
-	}
-
-	src := p.src
-
-	name := p.parseConstructName()
-	if name == nil {
-		return nil
-	}
-
-	construct := &ConstructExpr{Src: &src, Name: name}
-	for {
-		if p.scan() == RPAREN {
-			return construct
-		}
-
-		p.unscan()
-		arg := p.parseReplace()
-		if arg == nil {
-			return nil
-		}
-
-		construct.Args = append(construct.Args, arg)
-	}
-}
-
-// construct-list = '[' replace* ']'
-func (p *Parser) parseConstructList() Expr {
-	if p.scan() != LBRACKET {
-		panic("caller should have checked for left bracket")
-	}
-
-	src := p.src
-
-	list := &ConstructListExpr{Src: &src}
+	list := &ListExpr{Src: &src}
 	for {
 		if p.scan() == RBRACKET {
 			return list
 		}
 
 		p.unscan()
-		item := p.parseReplace()
+		item := p.parseListChild()
 		if item == nil {
 			return nil
 		}
@@ -551,21 +493,14 @@ func (p *Parser) parseConstructList() Expr {
 	}
 }
 
-// construct-name = name | construct
-func (p *Parser) parseConstructName() Expr {
-	switch p.scan() {
-	case IDENT:
-		name := NameExpr(p.s.Literal())
-		return &name
-
-	case LPAREN:
-		// Constructed name.
-		p.unscan()
-		return p.parseConstruct()
+// list-child = list-any | arg
+func (p *Parser) parseListChild() Expr {
+	if p.scan() == ELLIPSES {
+		src := p.src
+		return &ListAnyExpr{Src: &src}
 	}
-
-	p.addExpectedTokenErr("construct name")
-	return nil
+	p.unscan()
+	return p.parseArg()
 }
 
 // ref = '$' label
@@ -619,6 +554,22 @@ func (p *Parser) parseString() *StringExpr {
 	s = s[1 : len(s)-1]
 
 	e := StringExpr(s)
+	return &e
+}
+
+func (p *Parser) parseNumber() *NumberExpr {
+	if p.scan() != NUMBER {
+		panic("caller should have checked for numeric literal")
+	}
+
+	// Convert token literal to int64 value.
+	i, err := strconv.ParseInt(p.s.Literal(), 10, 64)
+	if err != nil {
+		p.addErr(err.Error())
+		return nil
+	}
+
+	e := NumberExpr(i)
 	return &e
 }
 

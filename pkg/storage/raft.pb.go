@@ -6,15 +6,16 @@ package storage
 import proto "github.com/gogo/protobuf/proto"
 import fmt "fmt"
 import math "math"
-import cockroach_roachpb3 "github.com/cockroachdb/cockroach/pkg/roachpb"
-import cockroach_roachpb "github.com/cockroachdb/cockroach/pkg/roachpb"
-import cockroach_storage_storagebase "github.com/cockroachdb/cockroach/pkg/storage/storagebase"
-import raftpb "github.com/coreos/etcd/raft/raftpb"
+import raftpb "go.etcd.io/etcd/raft/raftpb"
+import roachpb "github.com/cockroachdb/cockroach/pkg/roachpb"
+import storagepb "github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 
 import github_com_cockroachdb_cockroach_pkg_roachpb "github.com/cockroachdb/cockroach/pkg/roachpb"
 
-import context "context"
-import grpc "google.golang.org/grpc"
+import (
+	context "context"
+	grpc "google.golang.org/grpc"
+)
 
 import io "io"
 
@@ -22,6 +23,12 @@ import io "io"
 var _ = proto.Marshal
 var _ = fmt.Errorf
 var _ = math.Inf
+
+// This is a compile-time assertion to ensure that this generated file
+// is compatible with the proto package it is being compiled against.
+// A compilation error at this line likely means your copy of the
+// proto package needs to be updated.
+const _ = proto.GoGoProtoPackageIsVersion2 // please upgrade the proto package
 
 type SnapshotRequest_Priority int32
 
@@ -63,7 +70,7 @@ func (x *SnapshotRequest_Priority) UnmarshalJSON(data []byte) error {
 	return nil
 }
 func (SnapshotRequest_Priority) EnumDescriptor() ([]byte, []int) {
-	return fileDescriptorRaft, []int{5, 0}
+	return fileDescriptor_raft_c419318fe988e310, []int{5, 0}
 }
 
 type SnapshotRequest_Strategy int32
@@ -100,7 +107,46 @@ func (x *SnapshotRequest_Strategy) UnmarshalJSON(data []byte) error {
 	return nil
 }
 func (SnapshotRequest_Strategy) EnumDescriptor() ([]byte, []int) {
-	return fileDescriptorRaft, []int{5, 1}
+	return fileDescriptor_raft_c419318fe988e310, []int{5, 1}
+}
+
+type SnapshotRequest_Type int32
+
+const (
+	SnapshotRequest_RAFT       SnapshotRequest_Type = 0
+	SnapshotRequest_LEARNER    SnapshotRequest_Type = 1
+	SnapshotRequest_PREEMPTIVE SnapshotRequest_Type = 2
+)
+
+var SnapshotRequest_Type_name = map[int32]string{
+	0: "RAFT",
+	1: "LEARNER",
+	2: "PREEMPTIVE",
+}
+var SnapshotRequest_Type_value = map[string]int32{
+	"RAFT":       0,
+	"LEARNER":    1,
+	"PREEMPTIVE": 2,
+}
+
+func (x SnapshotRequest_Type) Enum() *SnapshotRequest_Type {
+	p := new(SnapshotRequest_Type)
+	*p = x
+	return p
+}
+func (x SnapshotRequest_Type) String() string {
+	return proto.EnumName(SnapshotRequest_Type_name, int32(x))
+}
+func (x *SnapshotRequest_Type) UnmarshalJSON(data []byte) error {
+	value, err := proto.UnmarshalJSONEnum(SnapshotRequest_Type_value, data, "SnapshotRequest_Type")
+	if err != nil {
+		return err
+	}
+	*x = SnapshotRequest_Type(value)
+	return nil
+}
+func (SnapshotRequest_Type) EnumDescriptor() ([]byte, []int) {
+	return fileDescriptor_raft_c419318fe988e310, []int{5, 2}
 }
 
 type SnapshotResponse_Status int32
@@ -145,7 +191,7 @@ func (x *SnapshotResponse_Status) UnmarshalJSON(data []byte) error {
 	return nil
 }
 func (SnapshotResponse_Status) EnumDescriptor() ([]byte, []int) {
-	return fileDescriptorRaft, []int{6, 0}
+	return fileDescriptor_raft_c419318fe988e310, []int{6, 0}
 }
 
 // RaftHeartbeat is a request that contains the barebones information for a
@@ -159,12 +205,45 @@ type RaftHeartbeat struct {
 	Term          uint64                                                 `protobuf:"varint,4,opt,name=term" json:"term"`
 	Commit        uint64                                                 `protobuf:"varint,5,opt,name=commit" json:"commit"`
 	Quiesce       bool                                                   `protobuf:"varint,6,opt,name=quiesce" json:"quiesce"`
+	// ToIsLearner was added in v19.2 to aid in the transition from preemptive
+	// snapshots to learner replicas. If a Replica learns its ID from a message
+	// which indicates that it is a learner and it is not currently a part of the
+	// range (due to being from a preemptive snapshot) then it must delete all of
+	// its data.
+	//
+	// TODO(ajwerner): remove in 20.2 once we ensure that preemptive snapshots can
+	// no longer be present and that we're never talking to a 19.2 node.
+	ToIsLearner bool `protobuf:"varint,7,opt,name=to_is_learner,json=toIsLearner" json:"to_is_learner"`
 }
 
-func (m *RaftHeartbeat) Reset()                    { *m = RaftHeartbeat{} }
-func (m *RaftHeartbeat) String() string            { return proto.CompactTextString(m) }
-func (*RaftHeartbeat) ProtoMessage()               {}
-func (*RaftHeartbeat) Descriptor() ([]byte, []int) { return fileDescriptorRaft, []int{0} }
+func (m *RaftHeartbeat) Reset()         { *m = RaftHeartbeat{} }
+func (m *RaftHeartbeat) String() string { return proto.CompactTextString(m) }
+func (*RaftHeartbeat) ProtoMessage()    {}
+func (*RaftHeartbeat) Descriptor() ([]byte, []int) {
+	return fileDescriptor_raft_c419318fe988e310, []int{0}
+}
+func (m *RaftHeartbeat) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *RaftHeartbeat) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *RaftHeartbeat) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_RaftHeartbeat.Merge(dst, src)
+}
+func (m *RaftHeartbeat) XXX_Size() int {
+	return m.Size()
+}
+func (m *RaftHeartbeat) XXX_DiscardUnknown() {
+	xxx_messageInfo_RaftHeartbeat.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_RaftHeartbeat proto.InternalMessageInfo
 
 // RaftMessageRequest is the request used to send raft messages using our
 // protobuf-based RPC codec. If a RaftMessageRequest has a non-empty number of
@@ -172,10 +251,13 @@ func (*RaftHeartbeat) Descriptor() ([]byte, []int) { return fileDescriptorRaft, 
 // as a dummy message and discarded. A coalesced heartbeat request's replica
 // descriptor's range ID must be zero.
 type RaftMessageRequest struct {
-	RangeID     github_com_cockroachdb_cockroach_pkg_roachpb.RangeID `protobuf:"varint,1,opt,name=range_id,json=rangeId,casttype=github.com/cockroachdb/cockroach/pkg/roachpb.RangeID" json:"range_id"`
-	FromReplica cockroach_roachpb.ReplicaDescriptor                  `protobuf:"bytes,2,opt,name=from_replica,json=fromReplica" json:"from_replica"`
-	ToReplica   cockroach_roachpb.ReplicaDescriptor                  `protobuf:"bytes,3,opt,name=to_replica,json=toReplica" json:"to_replica"`
-	Message     raftpb.Message                                       `protobuf:"bytes,4,opt,name=message" json:"message"`
+	RangeID github_com_cockroachdb_cockroach_pkg_roachpb.RangeID `protobuf:"varint,1,opt,name=range_id,json=rangeId,casttype=github.com/cockroachdb/cockroach/pkg/roachpb.RangeID" json:"range_id"`
+	// Optionally, the start key of the sending replica. This is only populated
+	// as a "hint" under certain conditions.
+	RangeStartKey github_com_cockroachdb_cockroach_pkg_roachpb.RKey `protobuf:"bytes,8,opt,name=range_start_key,json=rangeStartKey,casttype=github.com/cockroachdb/cockroach/pkg/roachpb.RKey" json:"range_start_key,omitempty"`
+	FromReplica   roachpb.ReplicaDescriptor                         `protobuf:"bytes,2,opt,name=from_replica,json=fromReplica" json:"from_replica"`
+	ToReplica     roachpb.ReplicaDescriptor                         `protobuf:"bytes,3,opt,name=to_replica,json=toReplica" json:"to_replica"`
+	Message       raftpb.Message                                    `protobuf:"bytes,4,opt,name=message" json:"message"`
 	// Is this a quiesce request? A quiesce request is a MsgHeartbeat
 	// which is requesting the recipient to stop ticking its local
 	// replica as long as the current Raft state matches the heartbeat
@@ -190,28 +272,100 @@ type RaftMessageRequest struct {
 	HeartbeatResps []RaftHeartbeat `protobuf:"bytes,7,rep,name=heartbeat_resps,json=heartbeatResps" json:"heartbeat_resps"`
 }
 
-func (m *RaftMessageRequest) Reset()                    { *m = RaftMessageRequest{} }
-func (m *RaftMessageRequest) String() string            { return proto.CompactTextString(m) }
-func (*RaftMessageRequest) ProtoMessage()               {}
-func (*RaftMessageRequest) Descriptor() ([]byte, []int) { return fileDescriptorRaft, []int{1} }
+func (m *RaftMessageRequest) Reset()         { *m = RaftMessageRequest{} }
+func (m *RaftMessageRequest) String() string { return proto.CompactTextString(m) }
+func (*RaftMessageRequest) ProtoMessage()    {}
+func (*RaftMessageRequest) Descriptor() ([]byte, []int) {
+	return fileDescriptor_raft_c419318fe988e310, []int{1}
+}
+func (m *RaftMessageRequest) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *RaftMessageRequest) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *RaftMessageRequest) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_RaftMessageRequest.Merge(dst, src)
+}
+func (m *RaftMessageRequest) XXX_Size() int {
+	return m.Size()
+}
+func (m *RaftMessageRequest) XXX_DiscardUnknown() {
+	xxx_messageInfo_RaftMessageRequest.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_RaftMessageRequest proto.InternalMessageInfo
 
 type RaftMessageRequestBatch struct {
 	Requests []RaftMessageRequest `protobuf:"bytes,1,rep,name=requests" json:"requests"`
 }
 
-func (m *RaftMessageRequestBatch) Reset()                    { *m = RaftMessageRequestBatch{} }
-func (m *RaftMessageRequestBatch) String() string            { return proto.CompactTextString(m) }
-func (*RaftMessageRequestBatch) ProtoMessage()               {}
-func (*RaftMessageRequestBatch) Descriptor() ([]byte, []int) { return fileDescriptorRaft, []int{2} }
-
-type RaftMessageResponseUnion struct {
-	Error *cockroach_roachpb3.Error `protobuf:"bytes,1,opt,name=error" json:"error,omitempty"`
+func (m *RaftMessageRequestBatch) Reset()         { *m = RaftMessageRequestBatch{} }
+func (m *RaftMessageRequestBatch) String() string { return proto.CompactTextString(m) }
+func (*RaftMessageRequestBatch) ProtoMessage()    {}
+func (*RaftMessageRequestBatch) Descriptor() ([]byte, []int) {
+	return fileDescriptor_raft_c419318fe988e310, []int{2}
+}
+func (m *RaftMessageRequestBatch) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *RaftMessageRequestBatch) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *RaftMessageRequestBatch) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_RaftMessageRequestBatch.Merge(dst, src)
+}
+func (m *RaftMessageRequestBatch) XXX_Size() int {
+	return m.Size()
+}
+func (m *RaftMessageRequestBatch) XXX_DiscardUnknown() {
+	xxx_messageInfo_RaftMessageRequestBatch.DiscardUnknown(m)
 }
 
-func (m *RaftMessageResponseUnion) Reset()                    { *m = RaftMessageResponseUnion{} }
-func (m *RaftMessageResponseUnion) String() string            { return proto.CompactTextString(m) }
-func (*RaftMessageResponseUnion) ProtoMessage()               {}
-func (*RaftMessageResponseUnion) Descriptor() ([]byte, []int) { return fileDescriptorRaft, []int{3} }
+var xxx_messageInfo_RaftMessageRequestBatch proto.InternalMessageInfo
+
+type RaftMessageResponseUnion struct {
+	Error *roachpb.Error `protobuf:"bytes,1,opt,name=error" json:"error,omitempty"`
+}
+
+func (m *RaftMessageResponseUnion) Reset()         { *m = RaftMessageResponseUnion{} }
+func (m *RaftMessageResponseUnion) String() string { return proto.CompactTextString(m) }
+func (*RaftMessageResponseUnion) ProtoMessage()    {}
+func (*RaftMessageResponseUnion) Descriptor() ([]byte, []int) {
+	return fileDescriptor_raft_c419318fe988e310, []int{3}
+}
+func (m *RaftMessageResponseUnion) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *RaftMessageResponseUnion) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *RaftMessageResponseUnion) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_RaftMessageResponseUnion.Merge(dst, src)
+}
+func (m *RaftMessageResponseUnion) XXX_Size() int {
+	return m.Size()
+}
+func (m *RaftMessageResponseUnion) XXX_DiscardUnknown() {
+	xxx_messageInfo_RaftMessageResponseUnion.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_RaftMessageResponseUnion proto.InternalMessageInfo
 
 // RaftMessageResponse may be sent to the sender of a
 // RaftMessageRequest. RaftMessage does not use the usual
@@ -222,15 +376,39 @@ func (*RaftMessageResponseUnion) Descriptor() ([]byte, []int) { return fileDescr
 // may be used for certain error conditions.
 type RaftMessageResponse struct {
 	RangeID     github_com_cockroachdb_cockroach_pkg_roachpb.RangeID `protobuf:"varint,1,opt,name=range_id,json=rangeId,casttype=github.com/cockroachdb/cockroach/pkg/roachpb.RangeID" json:"range_id"`
-	FromReplica cockroach_roachpb.ReplicaDescriptor                  `protobuf:"bytes,2,opt,name=from_replica,json=fromReplica" json:"from_replica"`
-	ToReplica   cockroach_roachpb.ReplicaDescriptor                  `protobuf:"bytes,3,opt,name=to_replica,json=toReplica" json:"to_replica"`
+	FromReplica roachpb.ReplicaDescriptor                            `protobuf:"bytes,2,opt,name=from_replica,json=fromReplica" json:"from_replica"`
+	ToReplica   roachpb.ReplicaDescriptor                            `protobuf:"bytes,3,opt,name=to_replica,json=toReplica" json:"to_replica"`
 	Union       RaftMessageResponseUnion                             `protobuf:"bytes,4,opt,name=union" json:"union"`
 }
 
-func (m *RaftMessageResponse) Reset()                    { *m = RaftMessageResponse{} }
-func (m *RaftMessageResponse) String() string            { return proto.CompactTextString(m) }
-func (*RaftMessageResponse) ProtoMessage()               {}
-func (*RaftMessageResponse) Descriptor() ([]byte, []int) { return fileDescriptorRaft, []int{4} }
+func (m *RaftMessageResponse) Reset()         { *m = RaftMessageResponse{} }
+func (m *RaftMessageResponse) String() string { return proto.CompactTextString(m) }
+func (*RaftMessageResponse) ProtoMessage()    {}
+func (*RaftMessageResponse) Descriptor() ([]byte, []int) {
+	return fileDescriptor_raft_c419318fe988e310, []int{4}
+}
+func (m *RaftMessageResponse) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *RaftMessageResponse) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *RaftMessageResponse) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_RaftMessageResponse.Merge(dst, src)
+}
+func (m *RaftMessageResponse) XXX_Size() int {
+	return m.Size()
+}
+func (m *RaftMessageResponse) XXX_DiscardUnknown() {
+	xxx_messageInfo_RaftMessageResponse.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_RaftMessageResponse proto.InternalMessageInfo
 
 // SnapshotRequest is the request used to send streaming snapshot requests.
 type SnapshotRequest struct {
@@ -244,10 +422,34 @@ type SnapshotRequest struct {
 	Final      bool     `protobuf:"varint,4,opt,name=final" json:"final"`
 }
 
-func (m *SnapshotRequest) Reset()                    { *m = SnapshotRequest{} }
-func (m *SnapshotRequest) String() string            { return proto.CompactTextString(m) }
-func (*SnapshotRequest) ProtoMessage()               {}
-func (*SnapshotRequest) Descriptor() ([]byte, []int) { return fileDescriptorRaft, []int{5} }
+func (m *SnapshotRequest) Reset()         { *m = SnapshotRequest{} }
+func (m *SnapshotRequest) String() string { return proto.CompactTextString(m) }
+func (*SnapshotRequest) ProtoMessage()    {}
+func (*SnapshotRequest) Descriptor() ([]byte, []int) {
+	return fileDescriptor_raft_c419318fe988e310, []int{5}
+}
+func (m *SnapshotRequest) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *SnapshotRequest) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *SnapshotRequest) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_SnapshotRequest.Merge(dst, src)
+}
+func (m *SnapshotRequest) XXX_Size() int {
+	return m.Size()
+}
+func (m *SnapshotRequest) XXX_DiscardUnknown() {
+	xxx_messageInfo_SnapshotRequest.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_SnapshotRequest proto.InternalMessageInfo
 
 type SnapshotRequest_Header struct {
 	// The replica state at the time the snapshot was generated. Note
@@ -255,7 +457,7 @@ type SnapshotRequest_Header struct {
 	// field which holds the updated descriptor after the new replica
 	// has been added while ReplicaState.Desc holds the descriptor
 	// before the new replica has been added.
-	State cockroach_storage_storagebase.ReplicaState `protobuf:"bytes,5,opt,name=state" json:"state"`
+	State storagepb.ReplicaState `protobuf:"bytes,5,opt,name=state" json:"state"`
 	// The inner raft message is of type MsgSnap, and its snapshot data contains a UUID.
 	RaftMessageRequest RaftMessageRequest `protobuf:"bytes,2,opt,name=raft_message_request,json=raftMessageRequest" json:"raft_message_request"`
 	// The estimated size of the range, to be used in reservation decisions.
@@ -268,37 +470,119 @@ type SnapshotRequest_Header struct {
 	Priority SnapshotRequest_Priority `protobuf:"varint,6,opt,name=priority,enum=cockroach.storage.SnapshotRequest_Priority" json:"priority"`
 	// The strategy of the snapshot.
 	Strategy SnapshotRequest_Strategy `protobuf:"varint,7,opt,name=strategy,enum=cockroach.storage.SnapshotRequest_Strategy" json:"strategy"`
+	// The type of the snapshot.
+	Type SnapshotRequest_Type `protobuf:"varint,9,opt,name=type,enum=cockroach.storage.SnapshotRequest_Type" json:"type"`
+	// Whether the snapshot uses the unreplicated RaftTruncatedState or not.
+	// This is generally always true at 2.2 and above outside of the migration
+	// phase, though theoretically it could take a long time for all ranges
+	// to update to the new mechanism. This bool is true iff the Raft log at
+	// the snapshot's applied index is using the new key. In particular, it
+	// is true if the index itself carries out the migration (in which case
+	// the data in the snapshot contains neither key).
+	//
+	// See VersionUnreplicatedRaftTruncatedState.
+	UnreplicatedTruncatedState bool `protobuf:"varint,8,opt,name=unreplicated_truncated_state,json=unreplicatedTruncatedState" json:"unreplicated_truncated_state"`
 }
 
-func (m *SnapshotRequest_Header) Reset()                    { *m = SnapshotRequest_Header{} }
-func (m *SnapshotRequest_Header) String() string            { return proto.CompactTextString(m) }
-func (*SnapshotRequest_Header) ProtoMessage()               {}
-func (*SnapshotRequest_Header) Descriptor() ([]byte, []int) { return fileDescriptorRaft, []int{5, 0} }
+func (m *SnapshotRequest_Header) Reset()         { *m = SnapshotRequest_Header{} }
+func (m *SnapshotRequest_Header) String() string { return proto.CompactTextString(m) }
+func (*SnapshotRequest_Header) ProtoMessage()    {}
+func (*SnapshotRequest_Header) Descriptor() ([]byte, []int) {
+	return fileDescriptor_raft_c419318fe988e310, []int{5, 0}
+}
+func (m *SnapshotRequest_Header) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *SnapshotRequest_Header) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *SnapshotRequest_Header) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_SnapshotRequest_Header.Merge(dst, src)
+}
+func (m *SnapshotRequest_Header) XXX_Size() int {
+	return m.Size()
+}
+func (m *SnapshotRequest_Header) XXX_DiscardUnknown() {
+	xxx_messageInfo_SnapshotRequest_Header.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_SnapshotRequest_Header proto.InternalMessageInfo
 
 type SnapshotResponse struct {
 	Status  SnapshotResponse_Status `protobuf:"varint,1,opt,name=status,enum=cockroach.storage.SnapshotResponse_Status" json:"status"`
 	Message string                  `protobuf:"bytes,2,opt,name=message" json:"message"`
 }
 
-func (m *SnapshotResponse) Reset()                    { *m = SnapshotResponse{} }
-func (m *SnapshotResponse) String() string            { return proto.CompactTextString(m) }
-func (*SnapshotResponse) ProtoMessage()               {}
-func (*SnapshotResponse) Descriptor() ([]byte, []int) { return fileDescriptorRaft, []int{6} }
+func (m *SnapshotResponse) Reset()         { *m = SnapshotResponse{} }
+func (m *SnapshotResponse) String() string { return proto.CompactTextString(m) }
+func (*SnapshotResponse) ProtoMessage()    {}
+func (*SnapshotResponse) Descriptor() ([]byte, []int) {
+	return fileDescriptor_raft_c419318fe988e310, []int{6}
+}
+func (m *SnapshotResponse) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *SnapshotResponse) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *SnapshotResponse) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_SnapshotResponse.Merge(dst, src)
+}
+func (m *SnapshotResponse) XXX_Size() int {
+	return m.Size()
+}
+func (m *SnapshotResponse) XXX_DiscardUnknown() {
+	xxx_messageInfo_SnapshotResponse.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_SnapshotResponse proto.InternalMessageInfo
 
 // ConfChangeContext is encoded in the raftpb.ConfChange.Context field.
 type ConfChangeContext struct {
 	CommandID string `protobuf:"bytes,1,opt,name=command_id,json=commandId" json:"command_id"`
 	// Payload is the application-level command (i.e. an encoded
-	// storagebase.RaftCommand).
+	// storagepb.RaftCommand).
 	Payload []byte `protobuf:"bytes,2,opt,name=payload" json:"payload,omitempty"`
-	// Replica contains full details about the replica being added or removed.
-	Replica cockroach_roachpb.ReplicaDescriptor `protobuf:"bytes,3,opt,name=replica" json:"replica"`
 }
 
-func (m *ConfChangeContext) Reset()                    { *m = ConfChangeContext{} }
-func (m *ConfChangeContext) String() string            { return proto.CompactTextString(m) }
-func (*ConfChangeContext) ProtoMessage()               {}
-func (*ConfChangeContext) Descriptor() ([]byte, []int) { return fileDescriptorRaft, []int{7} }
+func (m *ConfChangeContext) Reset()         { *m = ConfChangeContext{} }
+func (m *ConfChangeContext) String() string { return proto.CompactTextString(m) }
+func (*ConfChangeContext) ProtoMessage()    {}
+func (*ConfChangeContext) Descriptor() ([]byte, []int) {
+	return fileDescriptor_raft_c419318fe988e310, []int{7}
+}
+func (m *ConfChangeContext) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *ConfChangeContext) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *ConfChangeContext) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_ConfChangeContext.Merge(dst, src)
+}
+func (m *ConfChangeContext) XXX_Size() int {
+	return m.Size()
+}
+func (m *ConfChangeContext) XXX_DiscardUnknown() {
+	xxx_messageInfo_ConfChangeContext.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_ConfChangeContext proto.InternalMessageInfo
 
 func init() {
 	proto.RegisterType((*RaftHeartbeat)(nil), "cockroach.storage.RaftHeartbeat")
@@ -312,6 +596,7 @@ func init() {
 	proto.RegisterType((*ConfChangeContext)(nil), "cockroach.storage.ConfChangeContext")
 	proto.RegisterEnum("cockroach.storage.SnapshotRequest_Priority", SnapshotRequest_Priority_name, SnapshotRequest_Priority_value)
 	proto.RegisterEnum("cockroach.storage.SnapshotRequest_Strategy", SnapshotRequest_Strategy_name, SnapshotRequest_Strategy_value)
+	proto.RegisterEnum("cockroach.storage.SnapshotRequest_Type", SnapshotRequest_Type_name, SnapshotRequest_Type_value)
 	proto.RegisterEnum("cockroach.storage.SnapshotResponse_Status", SnapshotResponse_Status_name, SnapshotResponse_Status_value)
 }
 
@@ -323,8 +608,9 @@ var _ grpc.ClientConn
 // is compatible with the grpc package it is being compiled against.
 const _ = grpc.SupportPackageIsVersion4
 
-// Client API for MultiRaft service
-
+// MultiRaftClient is the client API for MultiRaft service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://godoc.org/google.golang.org/grpc#ClientConn.NewStream.
 type MultiRaftClient interface {
 	RaftMessageBatch(ctx context.Context, opts ...grpc.CallOption) (MultiRaft_RaftMessageBatchClient, error)
 	RaftSnapshot(ctx context.Context, opts ...grpc.CallOption) (MultiRaft_RaftSnapshotClient, error)
@@ -339,7 +625,7 @@ func NewMultiRaftClient(cc *grpc.ClientConn) MultiRaftClient {
 }
 
 func (c *multiRaftClient) RaftMessageBatch(ctx context.Context, opts ...grpc.CallOption) (MultiRaft_RaftMessageBatchClient, error) {
-	stream, err := grpc.NewClientStream(ctx, &_MultiRaft_serviceDesc.Streams[0], c.cc, "/cockroach.storage.MultiRaft/RaftMessageBatch", opts...)
+	stream, err := c.cc.NewStream(ctx, &_MultiRaft_serviceDesc.Streams[0], "/cockroach.storage.MultiRaft/RaftMessageBatch", opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -370,7 +656,7 @@ func (x *multiRaftRaftMessageBatchClient) Recv() (*RaftMessageResponse, error) {
 }
 
 func (c *multiRaftClient) RaftSnapshot(ctx context.Context, opts ...grpc.CallOption) (MultiRaft_RaftSnapshotClient, error) {
-	stream, err := grpc.NewClientStream(ctx, &_MultiRaft_serviceDesc.Streams[1], c.cc, "/cockroach.storage.MultiRaft/RaftSnapshot", opts...)
+	stream, err := c.cc.NewStream(ctx, &_MultiRaft_serviceDesc.Streams[1], "/cockroach.storage.MultiRaft/RaftSnapshot", opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -400,8 +686,7 @@ func (x *multiRaftRaftSnapshotClient) Recv() (*SnapshotResponse, error) {
 	return m, nil
 }
 
-// Server API for MultiRaft service
-
+// MultiRaftServer is the server API for MultiRaft service.
 type MultiRaftServer interface {
 	RaftMessageBatch(MultiRaft_RaftMessageBatchServer) error
 	RaftSnapshot(MultiRaft_RaftSnapshotServer) error
@@ -522,6 +807,14 @@ func (m *RaftHeartbeat) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0
 	}
 	i++
+	dAtA[i] = 0x38
+	i++
+	if m.ToIsLearner {
+		dAtA[i] = 1
+	} else {
+		dAtA[i] = 0
+	}
+	i++
 	return i, nil
 }
 
@@ -598,6 +891,12 @@ func (m *RaftMessageRequest) MarshalTo(dAtA []byte) (int, error) {
 			}
 			i += n
 		}
+	}
+	if m.RangeStartKey != nil {
+		dAtA[i] = 0x42
+		i++
+		i = encodeVarintRaft(dAtA, i, uint64(len(m.RangeStartKey)))
+		i += copy(dAtA[i:], m.RangeStartKey)
 	}
 	return i, nil
 }
@@ -803,6 +1102,17 @@ func (m *SnapshotRequest_Header) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0x38
 	i++
 	i = encodeVarintRaft(dAtA, i, uint64(m.Strategy))
+	dAtA[i] = 0x40
+	i++
+	if m.UnreplicatedTruncatedState {
+		dAtA[i] = 1
+	} else {
+		dAtA[i] = 0
+	}
+	i++
+	dAtA[i] = 0x48
+	i++
+	i = encodeVarintRaft(dAtA, i, uint64(m.Type))
 	return i, nil
 }
 
@@ -856,14 +1166,6 @@ func (m *ConfChangeContext) MarshalTo(dAtA []byte) (int, error) {
 		i = encodeVarintRaft(dAtA, i, uint64(len(m.Payload)))
 		i += copy(dAtA[i:], m.Payload)
 	}
-	dAtA[i] = 0x1a
-	i++
-	i = encodeVarintRaft(dAtA, i, uint64(m.Replica.Size()))
-	n11, err := m.Replica.MarshalTo(dAtA[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n11
 	return i, nil
 }
 
@@ -877,6 +1179,9 @@ func encodeVarintRaft(dAtA []byte, offset int, v uint64) int {
 	return offset + 1
 }
 func (m *RaftHeartbeat) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	n += 1 + sovRaft(uint64(m.RangeID))
@@ -885,10 +1190,14 @@ func (m *RaftHeartbeat) Size() (n int) {
 	n += 1 + sovRaft(uint64(m.Term))
 	n += 1 + sovRaft(uint64(m.Commit))
 	n += 2
+	n += 2
 	return n
 }
 
 func (m *RaftMessageRequest) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	n += 1 + sovRaft(uint64(m.RangeID))
@@ -911,10 +1220,17 @@ func (m *RaftMessageRequest) Size() (n int) {
 			n += 1 + l + sovRaft(uint64(l))
 		}
 	}
+	if m.RangeStartKey != nil {
+		l = len(m.RangeStartKey)
+		n += 1 + l + sovRaft(uint64(l))
+	}
 	return n
 }
 
 func (m *RaftMessageRequestBatch) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	if len(m.Requests) > 0 {
@@ -927,6 +1243,9 @@ func (m *RaftMessageRequestBatch) Size() (n int) {
 }
 
 func (m *RaftMessageResponseUnion) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	if m.Error != nil {
@@ -937,6 +1256,9 @@ func (m *RaftMessageResponseUnion) Size() (n int) {
 }
 
 func (m *RaftMessageResponse) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	n += 1 + sovRaft(uint64(m.RangeID))
@@ -950,6 +1272,9 @@ func (m *RaftMessageResponse) Size() (n int) {
 }
 
 func (m *SnapshotRequest) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	if m.Header != nil {
@@ -971,6 +1296,9 @@ func (m *SnapshotRequest) Size() (n int) {
 }
 
 func (m *SnapshotRequest_Header) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	l = m.RaftMessageRequest.Size()
@@ -981,10 +1309,15 @@ func (m *SnapshotRequest_Header) Size() (n int) {
 	n += 1 + l + sovRaft(uint64(l))
 	n += 1 + sovRaft(uint64(m.Priority))
 	n += 1 + sovRaft(uint64(m.Strategy))
+	n += 2
+	n += 1 + sovRaft(uint64(m.Type))
 	return n
 }
 
 func (m *SnapshotResponse) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	n += 1 + sovRaft(uint64(m.Status))
@@ -994,6 +1327,9 @@ func (m *SnapshotResponse) Size() (n int) {
 }
 
 func (m *ConfChangeContext) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	l = len(m.CommandID)
@@ -1002,8 +1338,6 @@ func (m *ConfChangeContext) Size() (n int) {
 		l = len(m.Payload)
 		n += 1 + l + sovRaft(uint64(l))
 	}
-	l = m.Replica.Size()
-	n += 1 + l + sovRaft(uint64(l))
 	return n
 }
 
@@ -1029,7 +1363,7 @@ func (this *RaftMessageResponseUnion) GetValue() interface{} {
 
 func (this *RaftMessageResponseUnion) SetValue(value interface{}) bool {
 	switch vt := value.(type) {
-	case *cockroach_roachpb3.Error:
+	case *roachpb.Error:
 		this.Error = vt
 	default:
 		return false
@@ -1180,6 +1514,26 @@ func (m *RaftHeartbeat) Unmarshal(dAtA []byte) error {
 				}
 			}
 			m.Quiesce = bool(v != 0)
+		case 7:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ToIsLearner", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowRaft
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.ToIsLearner = bool(v != 0)
 		default:
 			iNdEx = preIndex
 			skippy, err := skipRaft(dAtA[iNdEx:])
@@ -1421,6 +1775,37 @@ func (m *RaftMessageRequest) Unmarshal(dAtA []byte) error {
 				return err
 			}
 			iNdEx = postIndex
+		case 8:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field RangeStartKey", wireType)
+			}
+			var byteLen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowRaft
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				byteLen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if byteLen < 0 {
+				return ErrInvalidLengthRaft
+			}
+			postIndex := iNdEx + byteLen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.RangeStartKey = append(m.RangeStartKey[:0], dAtA[iNdEx:postIndex]...)
+			if m.RangeStartKey == nil {
+				m.RangeStartKey = []byte{}
+			}
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipRaft(dAtA[iNdEx:])
@@ -1579,7 +1964,7 @@ func (m *RaftMessageResponseUnion) Unmarshal(dAtA []byte) error {
 				return io.ErrUnexpectedEOF
 			}
 			if m.Error == nil {
-				m.Error = &cockroach_roachpb3.Error{}
+				m.Error = &roachpb.Error{}
 			}
 			if err := m.Error.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
@@ -2094,6 +2479,45 @@ func (m *SnapshotRequest_Header) Unmarshal(dAtA []byte) error {
 					break
 				}
 			}
+		case 8:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field UnreplicatedTruncatedState", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowRaft
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.UnreplicatedTruncatedState = bool(v != 0)
+		case 9:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Type", wireType)
+			}
+			m.Type = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowRaft
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Type |= (SnapshotRequest_Type(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
 		default:
 			iNdEx = preIndex
 			skippy, err := skipRaft(dAtA[iNdEx:])
@@ -2302,36 +2726,6 @@ func (m *ConfChangeContext) Unmarshal(dAtA []byte) error {
 				m.Payload = []byte{}
 			}
 			iNdEx = postIndex
-		case 3:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Replica", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowRaft
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				msglen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthRaft
-			}
-			postIndex := iNdEx + msglen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			if err := m.Replica.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipRaft(dAtA[iNdEx:])
@@ -2458,77 +2852,86 @@ var (
 	ErrIntOverflowRaft   = fmt.Errorf("proto: integer overflow")
 )
 
-func init() { proto.RegisterFile("storage/raft.proto", fileDescriptorRaft) }
+func init() { proto.RegisterFile("storage/raft.proto", fileDescriptor_raft_c419318fe988e310) }
 
-var fileDescriptorRaft = []byte{
-	// 1104 bytes of a gzipped FileDescriptorProto
-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xe4, 0x56, 0xcd, 0x6e, 0xdb, 0x46,
-	0x17, 0x15, 0xad, 0xff, 0x2b, 0x29, 0x66, 0xe6, 0x33, 0xbe, 0x12, 0x6a, 0x21, 0xa9, 0x4c, 0x13,
-	0xa8, 0x29, 0x40, 0x05, 0x42, 0xd0, 0x45, 0x77, 0xfa, 0x61, 0x6c, 0xc5, 0xbf, 0xa0, 0x1d, 0x17,
-	0x2d, 0x10, 0x08, 0x23, 0x6a, 0x24, 0x11, 0x96, 0x38, 0x32, 0x39, 0x4a, 0xeb, 0x3c, 0x45, 0x1f,
-	0x21, 0x9b, 0xee, 0xba, 0xef, 0x2b, 0x78, 0x53, 0xa0, 0xcb, 0x2c, 0x0a, 0xa3, 0x75, 0xdf, 0xa2,
-	0xe8, 0xa2, 0x98, 0xe1, 0x8c, 0x4d, 0xdb, 0x6a, 0x63, 0x17, 0x45, 0x37, 0xdd, 0xd8, 0xe4, 0x9d,
-	0x39, 0xe7, 0x70, 0xee, 0xb9, 0xf7, 0x8e, 0x00, 0x85, 0x8c, 0x06, 0x78, 0x4c, 0x1a, 0x01, 0x1e,
-	0x31, 0x6b, 0x1e, 0x50, 0x46, 0xd1, 0x7d, 0x97, 0xba, 0x47, 0x01, 0xc5, 0xee, 0xc4, 0x92, 0xab,
-	0xe5, 0x35, 0xf1, 0x3a, 0x1f, 0x34, 0x48, 0x10, 0xd0, 0x20, 0x8c, 0x36, 0x96, 0xff, 0xaf, 0xa2,
-	0x33, 0xc2, 0xf0, 0x10, 0x33, 0x2c, 0xe3, 0x55, 0x45, 0x2a, 0xff, 0x0f, 0x70, 0xc8, 0x9f, 0x31,
-	0x23, 0x72, 0xc3, 0xfb, 0x84, 0xb9, 0x43, 0x21, 0x29, 0xfe, 0xcc, 0x07, 0x31, 0xf9, 0xf2, 0xda,
-	0x98, 0x8e, 0xa9, 0x78, 0x6c, 0xf0, 0xa7, 0x28, 0x6a, 0x7e, 0x9f, 0x84, 0x92, 0x83, 0x47, 0x6c,
-	0x83, 0xe0, 0x80, 0x0d, 0x08, 0x66, 0x68, 0x00, 0xb9, 0x00, 0xfb, 0x63, 0xd2, 0xf7, 0x86, 0x86,
-	0x56, 0xd3, 0xea, 0xa9, 0xf6, 0xfa, 0xe9, 0x59, 0x35, 0x71, 0x7e, 0x56, 0xcd, 0x3a, 0x3c, 0xde,
-	0xeb, 0xfe, 0x76, 0x56, 0x7d, 0x3a, 0xf6, 0xd8, 0x64, 0x31, 0xb0, 0x5c, 0x3a, 0x6b, 0x5c, 0x1c,
-	0x6b, 0x38, 0xb8, 0x7c, 0x6e, 0xcc, 0x8f, 0xc6, 0x0d, 0x79, 0x0e, 0x4b, 0xe2, 0x9c, 0xac, 0x20,
-	0xee, 0x0d, 0xd1, 0x57, 0xb0, 0x3a, 0x0a, 0xe8, 0xac, 0x1f, 0x90, 0xf9, 0xd4, 0x73, 0x31, 0x97,
-	0x5a, 0xa9, 0x69, 0xf5, 0x52, 0x7b, 0x57, 0x4a, 0x95, 0x9e, 0x05, 0x74, 0xe6, 0x44, 0xab, 0x42,
-	0xf0, 0xd3, 0xbb, 0x09, 0x2a, 0xa4, 0x53, 0x1a, 0xc5, 0x88, 0x86, 0xe8, 0x18, 0x4a, 0x8c, 0xc6,
-	0x65, 0x93, 0x42, 0x76, 0x5b, 0xca, 0x16, 0x0e, 0xe8, 0x3f, 0x21, 0x5a, 0x60, 0xf4, 0x52, 0xd2,
-	0x80, 0x14, 0x23, 0xc1, 0xcc, 0x48, 0x89, 0x5c, 0xa6, 0xb8, 0x92, 0x23, 0x22, 0xe8, 0x03, 0xc8,
-	0xb8, 0x74, 0x36, 0xf3, 0x98, 0x91, 0x8e, 0xad, 0xc9, 0x18, 0xaa, 0x40, 0xf6, 0x78, 0xe1, 0x91,
-	0xd0, 0x25, 0x46, 0xa6, 0xa6, 0xd5, 0x73, 0x72, 0x59, 0x05, 0xcd, 0xdf, 0x93, 0x80, 0xb8, 0x73,
-	0xdb, 0x24, 0x0c, 0xf1, 0x98, 0x38, 0xe4, 0x78, 0x41, 0xc2, 0x7f, 0xc7, 0xbe, 0x6d, 0x28, 0xc6,
-	0xed, 0x13, 0xde, 0x15, 0x9a, 0x1f, 0x59, 0x97, 0x05, 0x7e, 0x2d, 0x27, 0x5d, 0x12, 0xba, 0x81,
-	0x37, 0x67, 0x34, 0x90, 0xa7, 0x28, 0xc4, 0x6c, 0x41, 0x3d, 0x80, 0x4b, 0x53, 0x84, 0x23, 0x77,
-	0x23, 0xcb, 0x5f, 0xa4, 0x1b, 0x35, 0x20, 0x3b, 0x8b, 0xf2, 0x21, 0xf2, 0x5d, 0x68, 0xae, 0x5a,
-	0x51, 0x27, 0x58, 0x32, 0x4d, 0x2a, 0x8b, 0x72, 0x57, 0x3c, 0xcb, 0xe9, 0x25, 0x59, 0x46, 0xcf,
-	0x00, 0x26, 0xaa, 0x35, 0x42, 0x23, 0x53, 0x4b, 0xd6, 0x0b, 0xcd, 0x9a, 0x75, 0xa3, 0x93, 0xad,
-	0x2b, 0x3d, 0x24, 0x49, 0x62, 0x48, 0xb4, 0x0b, 0xab, 0x17, 0x6f, 0xfd, 0x80, 0x84, 0xf3, 0xd0,
-	0xc8, 0xde, 0x89, 0xec, 0xde, 0x05, 0xdc, 0xe1, 0x68, 0x73, 0x00, 0xef, 0xdd, 0x74, 0xbf, 0x8d,
-	0x99, 0x3b, 0x41, 0xeb, 0x90, 0x0b, 0xa2, 0xf7, 0xd0, 0xd0, 0x84, 0xc8, 0xc3, 0x3f, 0x11, 0xb9,
-	0x86, 0x8e, 0x94, 0x2e, 0xc0, 0xe6, 0x1e, 0x18, 0x57, 0x76, 0x85, 0x73, 0xea, 0x87, 0xe4, 0x85,
-	0xef, 0x51, 0x1f, 0x59, 0x90, 0x16, 0x43, 0x4b, 0x14, 0x59, 0xa1, 0x69, 0x2c, 0xf1, 0xcb, 0xe6,
-	0xeb, 0x4e, 0xb4, 0xed, 0xb3, 0xd4, 0xe9, 0x9b, 0xaa, 0x66, 0xfe, 0xb4, 0x02, 0xff, 0x5b, 0x42,
-	0xf9, 0x1f, 0xaf, 0xda, 0x75, 0x48, 0x2f, 0x78, 0x52, 0x65, 0xcd, 0x7e, 0xf2, 0x2e, 0xb7, 0x62,
-	0x3e, 0x48, 0xb2, 0x08, 0x6f, 0x7e, 0x97, 0x86, 0xd5, 0x7d, 0x1f, 0xcf, 0xc3, 0x09, 0x65, 0x6a,
-	0x20, 0xb4, 0x20, 0x33, 0x21, 0x78, 0x48, 0x94, 0x53, 0x1f, 0x2f, 0x61, 0xbf, 0x86, 0xb1, 0x36,
-	0x04, 0xc0, 0x91, 0x40, 0xf4, 0x08, 0x72, 0x47, 0xaf, 0xfa, 0x03, 0x5e, 0x5c, 0x22, 0x6b, 0xc5,
-	0x76, 0x81, 0x3b, 0xb3, 0x79, 0x28, 0xea, 0xcd, 0xc9, 0x1e, 0xbd, 0x8a, 0x0a, 0xaf, 0x0a, 0x85,
-	0x29, 0x1d, 0xf7, 0x89, 0xcf, 0x02, 0x8f, 0x84, 0x46, 0xb2, 0x96, 0xac, 0x17, 0x1d, 0x98, 0xd2,
-	0xb1, 0x1d, 0x45, 0x50, 0x19, 0xd2, 0x23, 0xcf, 0xc7, 0x53, 0x71, 0x50, 0xd5, 0x6b, 0x51, 0xa8,
-	0xfc, 0x26, 0x09, 0x99, 0x48, 0x17, 0xbd, 0x84, 0x35, 0xde, 0xb5, 0x7d, 0xd9, 0xa4, 0x7d, 0x59,
-	0x90, 0xd2, 0xb1, 0x3b, 0x15, 0x33, 0x0a, 0x6e, 0x8e, 0xc8, 0x07, 0x00, 0x51, 0xb1, 0x85, 0xde,
-	0x6b, 0x22, 0x9c, 0x4b, 0x2a, 0x4f, 0x44, 0x7c, 0xdf, 0x7b, 0x4d, 0xd0, 0x43, 0x28, 0xb8, 0xd8,
-	0xef, 0x0f, 0x89, 0x3b, 0xf5, 0x7c, 0x72, 0xe5, 0x83, 0xc1, 0xc5, 0x7e, 0x37, 0x8a, 0x73, 0xeb,
-	0xc4, 0x0d, 0x2c, 0xa6, 0xc7, 0x72, 0xeb, 0x62, 0xb7, 0xb5, 0x2a, 0x86, 0x7d, 0x0e, 0x51, 0xc7,
-	0x17, 0x78, 0xb4, 0x0d, 0xb9, 0x79, 0xe0, 0xd1, 0xc0, 0x63, 0x27, 0x62, 0xde, 0xdf, 0x5b, 0xca,
-	0x75, 0xdd, 0xa8, 0x3d, 0x09, 0x51, 0xad, 0xab, 0x28, 0x38, 0x5d, 0xc8, 0x02, 0xcc, 0xc8, 0xf8,
-	0xc4, 0xc8, 0xde, 0x9a, 0x6e, 0x5f, 0x42, 0x14, 0x9d, 0xa2, 0x78, 0x9e, 0xca, 0x69, 0xfa, 0x8a,
-	0xf9, 0x14, 0x72, 0x4a, 0x10, 0x15, 0x20, 0xfb, 0x62, 0x67, 0x73, 0x67, 0xf7, 0xf3, 0x1d, 0x3d,
-	0x81, 0x8a, 0x90, 0x73, 0xec, 0xce, 0xee, 0xa1, 0xed, 0x7c, 0xa1, 0x6b, 0xa8, 0x04, 0x79, 0xc7,
-	0x6e, 0xb7, 0xb6, 0x5a, 0x3b, 0x1d, 0x5b, 0x5f, 0x31, 0x0d, 0xc8, 0x29, 0x5e, 0xbe, 0x71, 0xf3,
-	0xb0, 0xdf, 0x6e, 0x1d, 0x74, 0x36, 0xf4, 0x84, 0xf9, 0x83, 0x06, 0xfa, 0xe5, 0x27, 0xc8, 0x51,
-	0xb0, 0x01, 0x19, 0x9e, 0x91, 0x45, 0x28, 0xea, 0xf5, 0x5e, 0xf3, 0xf1, 0x5f, 0x7e, 0x77, 0x04,
-	0xb2, 0xf6, 0x05, 0x42, 0xdd, 0xa0, 0x11, 0x9e, 0xcf, 0x76, 0x75, 0x19, 0xf0, 0xca, 0xc9, 0x5f,
-	0x9b, 0xfd, 0x66, 0x0f, 0x32, 0x11, 0xee, 0xc6, 0x61, 0x5a, 0x9d, 0x8e, 0xbd, 0x77, 0x60, 0x77,
-	0x75, 0x8d, 0x2f, 0xb5, 0xf6, 0xf6, 0xb6, 0x7a, 0x76, 0x57, 0x5f, 0x41, 0x79, 0x48, 0xdb, 0x8e,
-	0xb3, 0xeb, 0xe8, 0x49, 0xbe, 0xab, 0x6b, 0x77, 0xb6, 0x7a, 0x3b, 0x76, 0x57, 0x4f, 0x3d, 0x4f,
-	0xe5, 0x92, 0x7a, 0xca, 0xfc, 0x56, 0x83, 0xfb, 0x1d, 0xea, 0x8f, 0x3a, 0x13, 0x5e, 0x46, 0x1d,
-	0xea, 0x33, 0xf2, 0x35, 0x43, 0x4f, 0x00, 0xf8, 0x95, 0x8e, 0xfd, 0xa1, 0x9a, 0x6e, 0xf9, 0xf6,
-	0x7d, 0x39, 0xdd, 0xf2, 0x9d, 0x68, 0xa5, 0xd7, 0x75, 0xf2, 0x72, 0x93, 0xf8, 0xc9, 0x90, 0x9d,
-	0xe3, 0x93, 0x29, 0xc5, 0xd1, 0xcf, 0xa2, 0xa2, 0xa3, 0x5e, 0x51, 0x17, 0xb2, 0x7f, 0x7f, 0xe2,
-	0x28, 0x68, 0xf3, 0xad, 0x06, 0xf9, 0xed, 0xc5, 0x94, 0x79, 0xbc, 0x6d, 0xd0, 0x14, 0xf4, 0x58,
-	0xfb, 0x44, 0x9d, 0xfc, 0xf8, 0x76, 0x3d, 0xc6, 0xf7, 0x96, 0x1f, 0xdd, 0x6e, 0x5c, 0x99, 0x89,
-	0xba, 0xf6, 0x44, 0x43, 0x2f, 0xa1, 0xc8, 0x17, 0x95, 0x83, 0xc8, 0x7c, 0x77, 0x59, 0x96, 0x1f,
-	0xdc, 0xa2, 0x04, 0x22, 0xfa, 0xf6, 0x87, 0xa7, 0xbf, 0x54, 0x12, 0xa7, 0xe7, 0x15, 0xed, 0xc7,
-	0xf3, 0x8a, 0xf6, 0xf6, 0xbc, 0xa2, 0xfd, 0x7c, 0x5e, 0xd1, 0xbe, 0xf9, 0xb5, 0x92, 0xf8, 0x32,
-	0x2b, 0x91, 0x7f, 0x04, 0x00, 0x00, 0xff, 0xff, 0xa4, 0xd6, 0xb6, 0x01, 0x9c, 0x0b, 0x00, 0x00,
+var fileDescriptor_raft_c419318fe988e310 = []byte{
+	// 1243 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xe4, 0x56, 0x4b, 0x6f, 0xdb, 0x46,
+	0x10, 0x16, 0x2d, 0x5a, 0x8f, 0x91, 0x64, 0x33, 0xdb, 0xa0, 0x25, 0xd4, 0x54, 0x16, 0x94, 0x26,
+	0x55, 0x52, 0x54, 0x4a, 0x8d, 0xb4, 0x87, 0xde, 0xf4, 0xa0, 0x63, 0xc5, 0x2f, 0x81, 0x56, 0x5c,
+	0xb4, 0x40, 0x20, 0x50, 0xd4, 0x5a, 0x22, 0x2c, 0x71, 0x99, 0xe5, 0x2a, 0xad, 0xf2, 0x2b, 0xfa,
+	0x13, 0x7a, 0xed, 0x3f, 0xf1, 0xa5, 0x40, 0x8e, 0x01, 0x5a, 0x18, 0x8d, 0xd3, 0x5f, 0x91, 0x53,
+	0xb1, 0x0f, 0xca, 0x8c, 0xed, 0x36, 0x36, 0x50, 0xf4, 0xd2, 0x8b, 0x44, 0xce, 0xe3, 0x1b, 0xce,
+	0x7c, 0x33, 0xb3, 0x0b, 0x28, 0x64, 0x84, 0x3a, 0x23, 0x5c, 0xa7, 0xce, 0x21, 0xab, 0x05, 0x94,
+	0x30, 0x82, 0x6e, 0xb8, 0xc4, 0x3d, 0xa2, 0xc4, 0x71, 0xc7, 0x35, 0xa5, 0x2d, 0xde, 0x14, 0xaf,
+	0xc1, 0xa0, 0x8e, 0x29, 0x25, 0x34, 0x94, 0x86, 0xc5, 0x0f, 0x23, 0xe9, 0x14, 0x33, 0x67, 0xe8,
+	0x30, 0x47, 0xc9, 0x3f, 0x89, 0x40, 0xd5, 0x7f, 0x30, 0xa8, 0x87, 0xcc, 0x61, 0x58, 0xa9, 0x3f,
+	0xc6, 0xcc, 0x1d, 0x8a, 0x80, 0xe2, 0x27, 0x18, 0xc4, 0x82, 0x17, 0x6f, 0x8e, 0xc8, 0x88, 0x88,
+	0xc7, 0x3a, 0x7f, 0x92, 0xd2, 0xca, 0xeb, 0x24, 0x14, 0x6c, 0xe7, 0x90, 0x6d, 0x62, 0x87, 0xb2,
+	0x01, 0x76, 0x18, 0x1a, 0x40, 0x86, 0x3a, 0xfe, 0x08, 0xf7, 0xbd, 0xa1, 0xa9, 0x95, 0xb5, 0xaa,
+	0xde, 0x7c, 0x74, 0x7c, 0xb2, 0x96, 0x38, 0x3d, 0x59, 0x4b, 0xdb, 0x5c, 0xde, 0x69, 0xbf, 0x3d,
+	0x59, 0x7b, 0x38, 0xf2, 0xd8, 0x78, 0x36, 0xa8, 0xb9, 0x64, 0x5a, 0x5f, 0x24, 0x35, 0x1c, 0x9c,
+	0x3d, 0xd7, 0x83, 0xa3, 0x51, 0x5d, 0x65, 0x51, 0x53, 0x7e, 0x76, 0x5a, 0x00, 0x77, 0x86, 0xe8,
+	0x07, 0x58, 0x3d, 0xa4, 0x64, 0xda, 0xa7, 0x38, 0x98, 0x78, 0xae, 0xc3, 0x43, 0x2d, 0x95, 0xb5,
+	0x6a, 0xa1, 0xb9, 0xa7, 0x42, 0x15, 0x36, 0x28, 0x99, 0xda, 0x52, 0x2b, 0x02, 0x7e, 0x7d, 0xbd,
+	0x80, 0x91, 0xa7, 0x5d, 0x38, 0x8c, 0x01, 0x0d, 0xd1, 0x33, 0x28, 0x30, 0x12, 0x0f, 0x9b, 0x14,
+	0x61, 0x77, 0x54, 0xd8, 0x5c, 0x8f, 0xfc, 0x1b, 0x41, 0x73, 0x8c, 0x9c, 0x85, 0x34, 0x41, 0x67,
+	0x98, 0x4e, 0x4d, 0x5d, 0xd4, 0x52, 0xe7, 0x91, 0x6c, 0x21, 0x41, 0xb7, 0x20, 0xe5, 0x92, 0xe9,
+	0xd4, 0x63, 0xe6, 0x72, 0x4c, 0xa7, 0x64, 0xa8, 0x04, 0xe9, 0x67, 0x33, 0x0f, 0x87, 0x2e, 0x36,
+	0x53, 0x65, 0xad, 0x9a, 0x51, 0xea, 0x48, 0x88, 0xaa, 0x22, 0x15, 0x2f, 0xec, 0x4f, 0xb0, 0x43,
+	0x7d, 0x4c, 0xcd, 0x74, 0xcc, 0x2a, 0xc7, 0x48, 0x27, 0xdc, 0x96, 0x8a, 0xca, 0x6f, 0x3a, 0x20,
+	0xce, 0xf1, 0x0e, 0x0e, 0x43, 0x67, 0x84, 0x6d, 0xfc, 0x6c, 0x86, 0xc3, 0xff, 0x86, 0xe8, 0x1d,
+	0xc8, 0xc7, 0x89, 0x16, 0x2c, 0xe7, 0xd6, 0x3f, 0xad, 0x9d, 0x0d, 0xc2, 0xb9, 0xea, 0xb5, 0x71,
+	0xe8, 0x52, 0x2f, 0x60, 0x84, 0x46, 0x99, 0xc4, 0x08, 0x44, 0x1d, 0x80, 0x33, 0xfa, 0x04, 0x77,
+	0xd7, 0x03, 0xcb, 0x2e, 0x88, 0x41, 0x75, 0x48, 0x4f, 0x65, 0x3d, 0x04, 0x33, 0xb9, 0xf5, 0xd5,
+	0x9a, 0x9c, 0x99, 0x9a, 0x2a, 0x53, 0x54, 0x6f, 0x65, 0x15, 0xe7, 0x63, 0xf9, 0x32, 0x3e, 0x36,
+	0x00, 0xc6, 0xd1, 0x10, 0x85, 0x66, 0xaa, 0x9c, 0xac, 0xe6, 0xd6, 0xcb, 0xb5, 0x0b, 0x13, 0x5f,
+	0x7b, 0x67, 0xda, 0x14, 0x48, 0xcc, 0x13, 0xed, 0xc1, 0xea, 0xe2, 0xad, 0x4f, 0x71, 0x18, 0x84,
+	0x66, 0xfa, 0x5a, 0x60, 0x2b, 0x0b, 0x77, 0x9b, 0x7b, 0xa3, 0xa7, 0xb0, 0x2a, 0x79, 0x0e, 0x99,
+	0x43, 0x59, 0xff, 0x08, 0xcf, 0xcd, 0x4c, 0x59, 0xab, 0xe6, 0x9b, 0x5f, 0xbd, 0x3d, 0x59, 0xfb,
+	0xf2, 0x7a, 0xfc, 0x6e, 0xe1, 0xb9, 0x5d, 0x10, 0x68, 0xfb, 0x1c, 0x6c, 0x0b, 0xcf, 0x2b, 0x03,
+	0xf8, 0xe8, 0x62, 0x73, 0x35, 0x1d, 0xe6, 0x8e, 0xd1, 0x23, 0xc8, 0x50, 0xf9, 0x1e, 0x9a, 0x9a,
+	0xc8, 0xe1, 0xce, 0xdf, 0xe4, 0x70, 0xce, 0x5b, 0x26, 0xb2, 0x70, 0xae, 0x74, 0xc1, 0x7c, 0xc7,
+	0x2a, 0x0c, 0x88, 0x1f, 0xe2, 0x27, 0xbe, 0x47, 0x7c, 0x54, 0x83, 0x65, 0xb1, 0x3b, 0x45, 0x0f,
+	0xe7, 0xd6, 0xcd, 0x4b, 0xda, 0xc1, 0xe2, 0x7a, 0x5b, 0x9a, 0x7d, 0xa3, 0x1f, 0xff, 0xbc, 0xa6,
+	0x55, 0x7e, 0x5f, 0x82, 0x0f, 0x2e, 0x81, 0xfc, 0x9f, 0x0f, 0xc5, 0x23, 0x58, 0x9e, 0xf1, 0xa2,
+	0xaa, 0x91, 0xf8, 0xfc, 0x7d, 0x6c, 0xc5, 0x78, 0x50, 0x60, 0xd2, 0xbf, 0xf2, 0x67, 0x0a, 0x56,
+	0xf7, 0x7d, 0x27, 0x08, 0xc7, 0x84, 0x45, 0xfb, 0xa6, 0x01, 0xa9, 0x31, 0x76, 0x86, 0x38, 0x62,
+	0xea, 0xde, 0x25, 0xe8, 0xe7, 0x7c, 0x6a, 0x9b, 0xc2, 0xc1, 0x56, 0x8e, 0xe8, 0x2e, 0x64, 0x8e,
+	0x9e, 0xf7, 0x07, 0xbc, 0xb9, 0x44, 0xd5, 0xf2, 0xcd, 0x1c, 0x67, 0x66, 0xeb, 0x40, 0xf4, 0x9b,
+	0x9d, 0x3e, 0x7a, 0x2e, 0x1b, 0x6f, 0x0d, 0x72, 0x13, 0x32, 0xea, 0x63, 0x9f, 0x51, 0x0f, 0x87,
+	0x66, 0xb2, 0x9c, 0xac, 0xe6, 0x6d, 0x98, 0x90, 0x91, 0x25, 0x25, 0xa8, 0x08, 0xcb, 0x87, 0x9e,
+	0xef, 0x4c, 0x44, 0xa2, 0xd1, 0x28, 0x4b, 0x51, 0xf1, 0x17, 0x1d, 0x52, 0x32, 0x2e, 0x7a, 0x0a,
+	0x37, 0xf9, 0x52, 0xe8, 0xab, 0x1d, 0xd0, 0x57, 0x0d, 0xa9, 0x18, 0xbb, 0x56, 0x33, 0x23, 0x7a,
+	0x71, 0x03, 0xdf, 0x06, 0x50, 0x93, 0xe9, 0xbd, 0xc0, 0x82, 0xb9, 0x64, 0xc4, 0x89, 0x9c, 0x31,
+	0xef, 0x05, 0x46, 0x77, 0x20, 0xe7, 0x3a, 0x7e, 0x7f, 0x88, 0xdd, 0x89, 0xe7, 0xe3, 0x77, 0x3e,
+	0x18, 0x5c, 0xc7, 0x6f, 0x4b, 0x39, 0xb2, 0x60, 0x59, 0x5c, 0x05, 0xc4, 0x72, 0xba, 0xbc, 0xb8,
+	0x8b, 0x4b, 0x43, 0xd4, 0x0a, 0xfb, 0xdc, 0x21, 0x4a, 0x5e, 0x78, 0xa3, 0x1d, 0xc8, 0x04, 0xd4,
+	0x23, 0xd4, 0x63, 0x73, 0x71, 0xec, 0xac, 0x5c, 0xda, 0x04, 0xe7, 0x69, 0xea, 0x2a, 0x97, 0x68,
+	0x70, 0x23, 0x08, 0x0e, 0x17, 0x32, 0xea, 0x30, 0x3c, 0x9a, 0x8b, 0xf3, 0xe9, 0x6a, 0x70, 0xfb,
+	0xca, 0x25, 0x82, 0x8b, 0x20, 0xd0, 0x06, 0xdc, 0x9a, 0xf9, 0xaa, 0xd3, 0x19, 0x1e, 0xf6, 0x19,
+	0x9d, 0xf9, 0xf2, 0x49, 0xe6, 0x9e, 0x89, 0x15, 0xa7, 0x18, 0xb7, 0xec, 0x45, 0x86, 0x22, 0x65,
+	0xd4, 0x00, 0x9d, 0xcd, 0x03, 0x6c, 0x66, 0xc5, 0x27, 0x7d, 0x76, 0x85, 0x4f, 0xea, 0xcd, 0x03,
+	0xbc, 0x38, 0xbc, 0xe7, 0x01, 0x7e, 0xac, 0x67, 0x34, 0x63, 0xa9, 0xf2, 0x10, 0x32, 0x51, 0xee,
+	0x28, 0x07, 0xe9, 0x27, 0xbb, 0x5b, 0xbb, 0x7b, 0xdf, 0xee, 0x1a, 0x09, 0x94, 0x87, 0x8c, 0x6d,
+	0xb5, 0xf6, 0x0e, 0x2c, 0xfb, 0x3b, 0x43, 0x43, 0x05, 0xc8, 0xda, 0x56, 0xb3, 0xb1, 0xdd, 0xd8,
+	0x6d, 0x59, 0xc6, 0x52, 0xc5, 0x84, 0x4c, 0x94, 0x22, 0x37, 0xdc, 0x3a, 0xe8, 0x37, 0x1b, 0xbd,
+	0xd6, 0xa6, 0x91, 0xa8, 0x7c, 0x01, 0x3a, 0x8f, 0x84, 0x32, 0xa0, 0xdb, 0x8d, 0x8d, 0x9e, 0x91,
+	0xe0, 0xa8, 0xdb, 0x56, 0xc3, 0xde, 0xb5, 0x6c, 0x43, 0x43, 0x2b, 0x00, 0x5d, 0xdb, 0xb2, 0x76,
+	0xba, 0xbd, 0xce, 0x01, 0x07, 0xfa, 0x55, 0x03, 0xe3, 0xec, 0x4b, 0xd5, 0x0a, 0xdb, 0x84, 0x14,
+	0xaf, 0xc6, 0x2c, 0x14, 0x73, 0xb6, 0xb2, 0x7e, 0xff, 0x1f, 0xd3, 0x93, 0x4e, 0xb5, 0x7d, 0xe1,
+	0x11, 0x5d, 0x41, 0xa4, 0x3f, 0x3f, 0xf2, 0xa2, 0x33, 0x92, 0x77, 0x7c, 0xf6, 0xdc, 0x91, 0x58,
+	0xe9, 0x40, 0x4a, 0xfa, 0x5d, 0xc8, 0xbd, 0xd1, 0x6a, 0x59, 0xdd, 0x9e, 0xd5, 0x36, 0x34, 0xae,
+	0x6a, 0x74, 0xbb, 0xdb, 0x1d, 0xab, 0x6d, 0x2c, 0xa1, 0x2c, 0x2c, 0x5b, 0xb6, 0xbd, 0x67, 0x1b,
+	0x49, 0x6e, 0xd5, 0xb6, 0x5a, 0xdb, 0x9d, 0x5d, 0xab, 0x6d, 0xe8, 0x8f, 0xf5, 0x4c, 0xd2, 0xd0,
+	0x2b, 0x7d, 0xb8, 0xd1, 0x22, 0xfe, 0x61, 0x6b, 0xcc, 0xbb, 0xbf, 0x45, 0x7c, 0x86, 0x7f, 0x64,
+	0xe8, 0x01, 0x00, 0xbf, 0x12, 0x39, 0xfe, 0x30, 0x5a, 0xca, 0xd9, 0xe6, 0x0d, 0xb5, 0x94, 0xb3,
+	0x2d, 0xa9, 0xe9, 0xb4, 0xed, 0xac, 0x32, 0x12, 0x57, 0xae, 0x74, 0xe0, 0xcc, 0x27, 0xc4, 0x91,
+	0xd7, 0xca, 0xbc, 0x1d, 0xbd, 0xae, 0xbf, 0xd2, 0x20, 0xbb, 0x33, 0x9b, 0x30, 0x8f, 0xcf, 0x29,
+	0x9a, 0x80, 0x11, 0x9b, 0x57, 0xb9, 0x3a, 0xee, 0x5f, 0x6d, 0xa8, 0xb9, 0x6d, 0xf1, 0xee, 0xd5,
+	0xf6, 0x63, 0x25, 0x51, 0xd5, 0x1e, 0x68, 0xe8, 0x29, 0xe4, 0xb9, 0x32, 0x2a, 0x3d, 0xaa, 0xbc,
+	0xbf, 0xed, 0x8a, 0xb7, 0xaf, 0xc0, 0x9d, 0x84, 0x6f, 0xde, 0x3b, 0x7e, 0x5d, 0x4a, 0x1c, 0x9f,
+	0x96, 0xb4, 0x97, 0xa7, 0x25, 0xed, 0xd5, 0x69, 0x49, 0xfb, 0xe3, 0xb4, 0xa4, 0xfd, 0xf4, 0xa6,
+	0x94, 0x78, 0xf9, 0xa6, 0x94, 0x78, 0xf5, 0xa6, 0x94, 0xf8, 0x3e, 0xad, 0x10, 0xfe, 0x0a, 0x00,
+	0x00, 0xff, 0xff, 0xd1, 0xe2, 0x72, 0x64, 0x9c, 0x0c, 0x00, 0x00,
 }

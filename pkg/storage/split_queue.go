@@ -1,31 +1,31 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
 import (
 	"context"
+	"fmt"
 	"time"
-
-	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/pkg/errors"
 )
 
 const (
@@ -51,6 +51,9 @@ type splitQueue struct {
 	*baseQueue
 	db       *client.DB
 	purgChan <-chan time.Time
+
+	// loadBasedCount counts the load-based splits performed by the queue.
+	loadBasedCount telemetry.Counter
 }
 
 // newSplitQueue returns a new instance of splitQueue.
@@ -64,8 +67,9 @@ func newSplitQueue(store *Store, db *client.DB, gossip *gossip.Gossip) *splitQue
 	}
 
 	sq := &splitQueue{
-		db:       db,
-		purgChan: purgChan,
+		db:             db,
+		purgChan:       purgChan,
+		loadBasedCount: telemetry.GetCounter("kv.split.load"),
 	}
 	sq.baseQueue = newBaseQueue(
 		"split", sq, store, gossip,
@@ -85,13 +89,9 @@ func newSplitQueue(store *Store, db *client.DB, gossip *gossip.Gossip) *splitQue
 	return sq
 }
 
-// shouldQueue determines whether a range should be queued for
-// splitting. This is true if the range is intersected by a zone config
-// prefix or if the range's size in bytes exceeds the limit for the zone.
-func (sq *splitQueue) shouldQueue(
-	ctx context.Context, now hlc.Timestamp, repl *Replica, sysCfg config.SystemConfig,
+func shouldSplitRange(
+	desc *roachpb.RangeDescriptor, ms enginepb.MVCCStats, maxBytes int64, sysCfg *config.SystemConfig,
 ) (shouldQ bool, priority float64) {
-	desc := repl.Desc()
 	if sysCfg.NeedsSplit(desc.StartKey, desc.EndKey) {
 		// Set priority to 1 in the event the range is split by zone configs.
 		priority = 1
@@ -100,11 +100,31 @@ func (sq *splitQueue) shouldQueue(
 
 	// Add priority based on the size of range compared to the max
 	// size for the zone it's in.
-	if ratio := float64(repl.GetMVCCStats().Total()) / float64(repl.GetMaxBytes()); ratio > 1 {
+	if ratio := float64(ms.Total()) / float64(maxBytes); ratio > 1 {
 		priority += ratio
 		shouldQ = true
 	}
-	return
+
+	return shouldQ, priority
+}
+
+// shouldQueue determines whether a range should be queued for
+// splitting. This is true if the range is intersected by a zone config
+// prefix or if the range's size in bytes exceeds the limit for the zone,
+// or if the range has too much load on it.
+func (sq *splitQueue) shouldQueue(
+	ctx context.Context, now hlc.Timestamp, repl *Replica, sysCfg *config.SystemConfig,
+) (shouldQ bool, priority float64) {
+	shouldQ, priority = shouldSplitRange(repl.Desc(), repl.GetMVCCStats(),
+		repl.GetMaxBytes(), sysCfg)
+
+	if !shouldQ && repl.SplitByLoadEnabled() {
+		if splitKey := repl.loadBasedSplitter.MaybeSplitKey(timeutil.Now()); splitKey != nil {
+			shouldQ, priority = true, 1.0 // default priority
+		}
+	}
+
+	return shouldQ, priority
 }
 
 // unsplittableRangeError indicates that a split attempt failed because a no
@@ -117,7 +137,7 @@ func (unsplittableRangeError) purgatoryErrorMarker() {}
 var _ purgatoryError = unsplittableRangeError{}
 
 // process synchronously invokes admin split for each proposed split key.
-func (sq *splitQueue) process(ctx context.Context, r *Replica, sysCfg config.SystemConfig) error {
+func (sq *splitQueue) process(ctx context.Context, r *Replica, sysCfg *config.SystemConfig) error {
 	err := sq.processAttempt(ctx, r, sysCfg)
 	switch errors.Cause(err).(type) {
 	case nil:
@@ -127,7 +147,7 @@ func (sq *splitQueue) process(ctx context.Context, r *Replica, sysCfg config.Sys
 		// On seeing a ConditionFailedError, don't return an error and enqueue
 		// this replica again in case it still needs to be split.
 		log.Infof(ctx, "split saw concurrent descriptor modification; maybe retrying")
-		sq.MaybeAdd(r, sq.store.Clock().Now())
+		sq.MaybeAddAsync(ctx, r, sq.store.Clock().Now())
 	default:
 		return err
 	}
@@ -135,20 +155,23 @@ func (sq *splitQueue) process(ctx context.Context, r *Replica, sysCfg config.Sys
 }
 
 func (sq *splitQueue) processAttempt(
-	ctx context.Context, r *Replica, sysCfg config.SystemConfig,
+	ctx context.Context, r *Replica, sysCfg *config.SystemConfig,
 ) error {
-	// First handle case of splitting due to zone config maps.
 	desc := r.Desc()
+	// First handle the case of splitting due to zone config maps.
 	if splitKey := sysCfg.ComputeSplitKey(desc.StartKey, desc.EndKey); splitKey != nil {
 		if _, err := r.adminSplitWithDescriptor(
 			ctx,
 			roachpb.AdminSplitRequest{
-				Span: roachpb.Span{
+				RequestHeader: roachpb.RequestHeader{
 					Key: splitKey.AsRawKey(),
 				},
-				SplitKey: splitKey.AsRawKey(),
+				SplitKey:       splitKey.AsRawKey(),
+				ExpirationTime: hlc.Timestamp{},
 			},
 			desc,
+			false, /* delayable */
+			"zone config",
 		); err != nil {
 			return errors.Wrapf(err, "unable to split %s at key %q", r, splitKey)
 		}
@@ -165,8 +188,44 @@ func (sq *splitQueue) processAttempt(
 			ctx,
 			roachpb.AdminSplitRequest{},
 			desc,
+			false, /* delayable */
+			fmt.Sprintf("%s above threshold size %s", humanizeutil.IBytes(size), humanizeutil.IBytes(maxBytes)),
 		)
 		return err
+	}
+
+	now := timeutil.Now()
+	if splitByLoadKey := r.loadBasedSplitter.MaybeSplitKey(now); splitByLoadKey != nil {
+		batchHandledQPS := r.QueriesPerSecond()
+		raftAppliedQPS := r.WritesPerSecond()
+		splitQPS := r.loadBasedSplitter.LastQPS(now)
+		reason := fmt.Sprintf(
+			"load at key %s (%.2f splitQPS, %.2f batches/sec, %.2f raft mutations/sec)",
+			splitByLoadKey,
+			splitQPS,
+			batchHandledQPS,
+			raftAppliedQPS,
+		)
+		if _, pErr := r.adminSplitWithDescriptor(
+			ctx,
+			roachpb.AdminSplitRequest{
+				RequestHeader: roachpb.RequestHeader{
+					Key: splitByLoadKey,
+				},
+				SplitKey: splitByLoadKey,
+			},
+			desc,
+			false, /* delayable */
+			reason,
+		); pErr != nil {
+			return errors.Wrapf(pErr, "unable to split %s at key %q", r, splitByLoadKey)
+		}
+
+		telemetry.Inc(sq.loadBasedCount)
+
+		// Reset the splitter now that the bounds of the range changed.
+		r.loadBasedSplitter.Reset()
+		return nil
 	}
 	return nil
 }

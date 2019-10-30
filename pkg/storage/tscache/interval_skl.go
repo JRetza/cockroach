@@ -1,23 +1,20 @@
 // Copyright 2017 Andy Kimball
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tscache
 
 import (
 	"bytes"
 	"container/list"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"sync/atomic"
@@ -25,10 +22,9 @@ import (
 	"unsafe"
 
 	"github.com/andy-kimball/arenaskl"
-
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/interval"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
@@ -93,7 +89,7 @@ const (
 )
 
 const (
-	encodedTsSize      = int(unsafe.Sizeof(hlc.Timestamp{}))
+	encodedTsSize      = int(unsafe.Sizeof(int64(0)) + unsafe.Sizeof(int32(0)))
 	encodedTxnIDSize   = int(unsafe.Sizeof(uuid.UUID{}))
 	encodedValSize     = encodedTsSize + encodedTxnIDSize
 	defaultMinSklPages = 2
@@ -239,8 +235,19 @@ func (s *intervalSkl) AddRange(from, to []byte, opt rangeOptions, val cacheValue
 
 		switch {
 		case cmp > 0:
-			// Starting key is after ending key. This shouldn't happen.
-			panic(interval.ErrInvertedRange)
+			// Starting key is after ending key. This shouldn't happen. Determine
+			// the index where the keys diverged and panic.
+			d := 0
+			for d < len(from) && d < len(to) {
+				if from[d] != to[d] {
+					break
+				}
+				d++
+			}
+			msg := fmt.Sprintf("inverted range (issue #32149): key lens = [%d,%d), diff @ index %d",
+				len(from), len(to), d)
+			log.Errorf(context.Background(), "%s, [%s,%s)", msg, from, to)
+			panic(log.Safe(msg))
 		case cmp == 0:
 			// Starting key is same as ending key, so just add single node.
 			if opt == (excludeFrom | excludeTo) {
@@ -363,7 +370,7 @@ func (s *intervalSkl) frontPage() *sklPage {
 // pushNewPage prepends a new empty page to the front of the pages list. It
 // accepts an optional arena argument to facilitate re-use.
 func (s *intervalSkl) pushNewPage(maxWallTime int64, arena *arenaskl.Arena) {
-	if arena != nil && arena.Size() == s.pageSize {
+	if arena != nil {
 		// Re-use the provided arena, if possible.
 		arena.Reset()
 	} else {
@@ -826,25 +833,24 @@ func (p *sklPage) ratchetValueSet(
 			// attempt then we must have raced with node initialization before.
 			return nil
 		}
+		if (meta & cantInit) != 0 {
+			// If the meta has the cantInit flag set to true, we fail with an
+			// ErrArenaFull error to force the current goroutine to retry on a
+			// new page.
+			return arenaskl.ErrArenaFull
+		}
+
+		newMeta := meta
+		updateInit := setInit && !inited
+		if updateInit {
+			newMeta |= initialized
+		}
 
 		var keyValUpdate, gapValUpdate bool
 		oldKeyVal, oldGapVal := decodeValueSet(it.Value(), meta)
 		keyVal, keyValUpdate = ratchetValue(oldKeyVal, keyVal)
 		gapVal, gapValUpdate = ratchetValue(oldGapVal, gapVal)
 		updateVals := keyValUpdate || gapValUpdate
-
-		newMeta := meta
-		updateInit := setInit && !inited
-		if updateInit {
-			// If the meta has the cantInit flag set to true, we fail with an
-			// ErrArenaFull error to force the current goroutine to retry on a
-			// new page.
-			if (meta & cantInit) != 0 {
-				return arenaskl.ErrArenaFull
-			}
-
-			newMeta |= initialized
-		}
 
 		if updateVals {
 			// If we're updating the values (and maybe the init flag) then we

@@ -1,28 +1,25 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package parser
 
 import (
+	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
 
 func TestScanner(t *testing.T) {
@@ -65,7 +62,7 @@ func TestScanner(t *testing.T) {
 		{`^`, []int{'^'}},
 		{`$`, []int{'$'}},
 		{`&`, []int{'&'}},
-		{`&&`, []int{INET_CONTAINS_OR_CONTAINED_BY}},
+		{`&&`, []int{AND_AND}},
 		{`|`, []int{'|'}},
 		{`||`, []int{CONCAT}},
 		{`#`, []int{'#'}},
@@ -81,19 +78,17 @@ func TestScanner(t *testing.T) {
 		{`"a" "b"`, []int{IDENT, IDENT}},
 		{`'a'`, []int{SCONST}},
 		{`b'a'`, []int{BCONST}},
-		{`B'a'`, []int{BCONST}},
 		{`b'\xff'`, []int{BCONST}},
-		{`B'\xff'`, []int{BCONST}},
+		{`B'10101'`, []int{BITCONST}},
 		{`e'a'`, []int{SCONST}},
 		{`E'a'`, []int{SCONST}},
 		{`NOT`, []int{NOT}},
-		{`NOT BETWEEN`, []int{NOT_LA, BETWEEN}},
-		{`NOT IN`, []int{NOT_LA, IN}},
-		{`NOT SIMILAR`, []int{NOT_LA, SIMILAR}},
-		{`NULLS`, []int{NULLS}},
+		{`NOT BETWEEN`, []int{NOT, BETWEEN}},
+		{`NOT IN`, []int{NOT, IN}},
+		{`NOT SIMILAR`, []int{NOT, SIMILAR}},
 		{`WITH`, []int{WITH}},
-		{`WITH TIME`, []int{WITH_LA, TIME}},
-		{`WITH ORDINALITY`, []int{WITH_LA, ORDINALITY}},
+		{`WITH TIME`, []int{WITH, TIME}},
+		{`WITH ORDINALITY`, []int{WITH, ORDINALITY}},
 		{`1`, []int{ICONST}},
 		{`0xa`, []int{ICONST}},
 		{`x'2F'`, []int{BCONST}},
@@ -104,15 +99,15 @@ func TestScanner(t *testing.T) {
 		{`1e-1`, []int{FCONST}},
 	}
 	for i, d := range testData {
-		s := MakeScanner(d.sql)
+		s := makeScanner(d.sql)
 		var tokens []int
 		for {
 			var lval sqlSymType
-			id := s.Lex(&lval)
-			if id == 0 {
+			s.scan(&lval)
+			if lval.id == 0 {
 				break
 			}
-			tokens = append(tokens, id)
+			tokens = append(tokens, int(lval.id))
 		}
 
 		if !reflect.DeepEqual(d.expected, tokens) {
@@ -141,7 +136,7 @@ foo`, "", "foo"},
 		{`/* /* */`, "unterminated comment", ""},
 	}
 	for i, d := range testData {
-		s := MakeScanner(d.sql)
+		s := makeScanner(d.sql)
 		var lval sqlSymType
 		present, ok := s.scanComment(&lval)
 		if d.err == "" && (!present || !ok) {
@@ -156,12 +151,12 @@ foo`, "", "foo"},
 }
 
 func TestScanKeyword(t *testing.T) {
-	for kwName, kwID := range lex.Keywords {
-		s := MakeScanner(kwName)
+	for _, kwName := range lex.KeywordNames {
+		s := makeScanner(kwName)
 		var lval sqlSymType
-		id := s.Lex(&lval)
-		if kwID.Tok != id {
-			t.Errorf("%s: expected %d, but found %d", kwName, kwID.Tok, id)
+		s.scan(&lval)
+		if id := lex.GetKeywordID(kwName); id != lval.id {
+			t.Errorf("%s: expected %d, but found %d", kwName, id, lval.id)
 		}
 	}
 }
@@ -197,11 +192,11 @@ func TestScanNumber(t *testing.T) {
 		{`9223372036854775809`, `9223372036854775809`, ICONST},
 	}
 	for _, d := range testData {
-		s := MakeScanner(d.sql)
+		s := makeScanner(d.sql)
 		var lval sqlSymType
-		id := s.Lex(&lval)
-		if d.id != id {
-			t.Errorf("%s: expected %d, but found %d", d.sql, d.id, id)
+		s.scan(&lval)
+		if d.id != int(lval.id) {
+			t.Errorf("%s: expected %d, but found %d", d.sql, d.id, lval.id)
 		}
 		if d.expected != lval.str {
 			t.Errorf("%s: expected %s, but found %s", d.sql, d.expected, lval.str)
@@ -212,23 +207,21 @@ func TestScanNumber(t *testing.T) {
 func TestScanPlaceholder(t *testing.T) {
 	testData := []struct {
 		sql      string
-		expected int64
+		expected string
 	}{
-		{`$1`, 1},
-		{`$1a`, 1},
-		{`$123`, 123},
+		{`$1`, "1"},
+		{`$1a`, "1"},
+		{`$123`, "123"},
 	}
 	for _, d := range testData {
-		s := MakeScanner(d.sql)
+		s := makeScanner(d.sql)
 		var lval sqlSymType
-		id := s.Lex(&lval)
-		if id != PLACEHOLDER {
-			t.Errorf("%s: expected %d, but found %d", d.sql, PLACEHOLDER, id)
+		s.scan(&lval)
+		if lval.id != PLACEHOLDER {
+			t.Errorf("%s: expected %d, but found %d", d.sql, PLACEHOLDER, lval.id)
 		}
-		if i, err := lval.union.numVal().AsInt64(); err != nil {
-			t.Errorf("%s: expected success, but found %v", d.sql, err)
-		} else if d.expected != i {
-			t.Errorf("%s: expected %d, but found %d", d.sql, d.expected, i)
+		if d.expected != lval.str {
+			t.Errorf("%s: expected %s, but found %s", d.sql, d.expected, lval.str)
 		}
 	}
 }
@@ -294,11 +287,12 @@ world`},
 		{`x'666f6f'`, `foo`},
 		{`X'626172'`, `bar`},
 		{`X'FF'`, "\xff"},
+		{`B'100101'`, "100101"},
 	}
 	for _, d := range testData {
-		s := MakeScanner(d.sql)
+		s := makeScanner(d.sql)
 		var lval sqlSymType
-		_ = s.Lex(&lval)
+		s.scan(&lval)
 		if d.expected != lval.str {
 			t.Errorf("%s: expected %q, but found %q", d.sql, d.expected, lval.str)
 		}
@@ -323,18 +317,144 @@ func TestScanError(t *testing.T) {
 		{`X'zzz'`, "invalid hexadecimal bytes literal"},
 		{`x'beef\x41'`, "invalid hexadecimal bytes literal"},
 		{`X'beef\x41\x41'`, "invalid hexadecimal bytes literal"},
-		{`x'''1'''`, "invalid hexadecimal bytes literal"},
-		{`$9223372036854775809`, "integer value out of range"},
+		{`x'a'`, "invalid hexadecimal bytes literal"},
+		{`$0`, "placeholder index must be between 1 and 65536"},
+		{`$9223372036854775809`, "placeholder index must be between 1 and 65536"},
+		{`B'123'`, `"2" is not a valid binary digit`},
 	}
 	for _, d := range testData {
-		s := MakeScanner(d.sql)
+		s := makeScanner(d.sql)
 		var lval sqlSymType
-		id := s.Lex(&lval)
-		if id != ERROR {
-			t.Errorf("%s: expected ERROR, but found %d", d.sql, id)
+		s.scan(&lval)
+		if lval.id != ERROR {
+			t.Errorf("%s: expected ERROR, but found %d", d.sql, lval.id)
 		}
-		if !testutils.IsError(pgerror.NewError(pgerror.CodeInternalError, lval.str), d.err) {
+		if !testutils.IsError(errors.New(lval.str), d.err) {
 			t.Errorf("%s: expected %s, but found %v", d.sql, d.err, lval.str)
 		}
+	}
+}
+
+func TestSplitFirstStatement(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	tests := []struct {
+		s, res string
+	}{
+		{
+			s:   "SELECT 1",
+			res: "",
+		},
+		{
+			s:   "SELECT 1;",
+			res: "SELECT 1;",
+		},
+		{
+			s:   "SELECT 1  /* comment */ ;",
+			res: "SELECT 1  /* comment */ ;",
+		},
+		{
+			s:   "SELECT 1;SELECT 2",
+			res: "SELECT 1;",
+		},
+		{
+			s:   "SELECT 1  /* comment */ ;SELECT 2",
+			res: "SELECT 1  /* comment */ ;",
+		},
+		{
+			s:   "SELECT 1  /* comment */ ; /* comment */ SELECT 2",
+			res: "SELECT 1  /* comment */ ;",
+		},
+		{
+			s:   ";",
+			res: ";",
+		},
+		{
+			s:   "SELECT ';'",
+			res: "",
+		},
+	}
+
+	for i, tc := range tests {
+		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+			pos, ok := SplitFirstStatement(tc.s)
+			if !ok && pos != 0 {
+				t.Fatalf("!ok but nonzero pos")
+			}
+			if tc.res != tc.s[:pos] {
+				t.Errorf("expected `%s` but got `%s`", tc.res, tc.s[:pos])
+			}
+		})
+	}
+}
+
+func TestLastLexicalToken(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	tests := []struct {
+		s   string
+		res int
+	}{
+		{
+			s:   "",
+			res: 0,
+		},
+		{
+			s:   " /* comment */ ",
+			res: 0,
+		},
+		{
+			s:   "SELECT",
+			res: SELECT,
+		},
+		{
+			s:   "SELECT 1",
+			res: ICONST,
+		},
+		{
+			s:   "SELECT 1;",
+			res: ';',
+		},
+		{
+			s:   "SELECT 1; /* comment */",
+			res: ';',
+		},
+		{
+			s: `SELECT 1;
+			    -- comment`,
+			res: ';',
+		},
+		{
+			s: `
+				--SELECT 1, 2, 3;
+				SELECT 4, 5
+				--blah`,
+			res: ICONST,
+		},
+		{
+			s: `
+				--SELECT 1, 2, 3;
+				SELECT 4, 5;
+				--blah`,
+			res: ';',
+		},
+		{
+			s:   `SELECT 'unfinished`,
+			res: ERROR,
+		},
+		{
+			s:   `SELECT e'\xaa';`, // invalid token but last token is semicolon
+			res: ';',
+		},
+	}
+
+	for i, tc := range tests {
+		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+			tok, ok := LastLexicalToken(tc.s)
+			if !ok && tok != 0 {
+				t.Fatalf("!ok but nonzero tok")
+			}
+			if tc.res != tok {
+				t.Errorf("expected %d but got %d", tc.res, tok)
+			}
+		})
 	}
 }

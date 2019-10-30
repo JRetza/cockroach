@@ -1,5 +1,3 @@
-# LogicTest: default opt parallel-stmts distsql distsql-opt distsql-metadata distsql-disk
-
 # The join condition logic is tricky to get right with NULL
 # values. Simple implementations can deal well with NULLs on the first
 # or last row but fail to handle them in the middle. So the test table
@@ -454,10 +452,10 @@ CREATE TABLE othertype (x TEXT)
 query error pgcode 42804 JOIN/USING types.*cannot be matched
 SELECT * FROM (onecolumn AS a JOIN othertype AS b USING(x))
 
-query error cannot join columns from the same source name "onecolumn"
+query error pgcode 42712 source name "onecolumn" specified more than once \(missing AS clause\)
 SELECT * FROM (onecolumn JOIN onecolumn USING(x))
 
-query error cannot join columns from the same source name "onecolumn"
+query error pgcode 42712 source name "onecolumn" specified more than once \(missing AS clause\)
 SELECT * FROM (onecolumn JOIN twocolumn USING(x) JOIN onecolumn USING(x))
 
 # Check that star expansion works across anonymous sources.
@@ -487,7 +485,7 @@ SELECT x FROM (SELECT * FROM onecolumn), (SELECT * FROM onecolumn)
 query error column reference "x" is ambiguous \(candidates: a\.x, b\.x\)
 SELECT * FROM (onecolumn AS a JOIN onecolumn AS b ON x > 32)
 
-query error column name "a.y" not found
+query error column "a.y" does not exist
 SELECT * FROM (onecolumn AS a JOIN onecolumn AS b ON a.y > y)
 
 statement ok
@@ -553,8 +551,6 @@ SELECT     NULL::text  AS pktable_cat,
   AND      con.oid = dep.objid
   AND      pkic.oid = dep.refobjid
   AND      pkic.relkind = 'i'
-  AND      dep.classid = 'pg_constraint'::regclass::oid
-  AND      dep.refclassid = 'pg_class'::regclass::oid
   AND      fkn.nspname = 'public'
   AND      fkc.relname = 'orders'
   ORDER BY pkn.nspname,
@@ -1071,3 +1067,10 @@ FROM
 ----
 1     2
 NULL  NULL
+
+# Regression test for #28817. Do not allow special functions in ON clause.
+query error generator functions are not allowed in ON
+SELECT * FROM foo JOIN bar ON generate_series(0, 1) < 2
+
+query error aggregate functions are not allowed in ON
+SELECT * FROM foo JOIN bar ON max(foo.c) < 2

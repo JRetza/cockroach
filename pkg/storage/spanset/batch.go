@@ -1,17 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package spanset
 
@@ -116,14 +111,6 @@ func (s *Iterator) NextKey() {
 	}
 }
 
-// PrevKey is part of the engine.Iterator interface.
-func (s *Iterator) PrevKey() {
-	s.i.PrevKey()
-	if s.spans.CheckAllowed(SpanReadOnly, roachpb.Span{Key: s.UnsafeKey().Key}) != nil {
-		s.invalid = true
-	}
-}
-
 // Key is part of the engine.Iterator interface.
 func (s *Iterator) Key() engine.MVCCKey {
 	return s.i.Key()
@@ -151,9 +138,9 @@ func (s *Iterator) UnsafeValue() []byte {
 
 // ComputeStats is part of the engine.Iterator interface.
 func (s *Iterator) ComputeStats(
-	start, end engine.MVCCKey, nowNanos int64,
+	start, end roachpb.Key, nowNanos int64,
 ) (enginepb.MVCCStats, error) {
-	if err := s.spans.CheckAllowed(SpanReadOnly, roachpb.Span{Key: start.Key, EndKey: end.Key}); err != nil {
+	if err := s.spans.CheckAllowed(SpanReadOnly, roachpb.Span{Key: start, EndKey: end}); err != nil {
 		return enginepb.MVCCStats{}, err
 	}
 	return s.i.ComputeStats(start, end, nowNanos)
@@ -161,36 +148,37 @@ func (s *Iterator) ComputeStats(
 
 // FindSplitKey is part of the engine.Iterator interface.
 func (s *Iterator) FindSplitKey(
-	start, end, minSplitKey engine.MVCCKey, targetSize int64, allowMeta2Splits bool,
+	start, end, minSplitKey roachpb.Key, targetSize int64,
 ) (engine.MVCCKey, error) {
-	if err := s.spans.CheckAllowed(SpanReadOnly, roachpb.Span{Key: start.Key, EndKey: end.Key}); err != nil {
+	if err := s.spans.CheckAllowed(SpanReadOnly, roachpb.Span{Key: start, EndKey: end}); err != nil {
 		return engine.MVCCKey{}, err
 	}
-	return s.i.FindSplitKey(start, end, minSplitKey, targetSize, allowMeta2Splits)
+	return s.i.FindSplitKey(start, end, minSplitKey, targetSize)
 }
 
 // MVCCGet is part of the engine.Iterator interface.
 func (s *Iterator) MVCCGet(
-	key roachpb.Key, timestamp hlc.Timestamp, txn *roachpb.Transaction, consistent, tombstones bool,
-) (*roachpb.Value, []roachpb.Intent, error) {
+	key roachpb.Key, timestamp hlc.Timestamp, opts engine.MVCCGetOptions,
+) (*roachpb.Value, *roachpb.Intent, error) {
 	if err := s.spans.CheckAllowed(SpanReadOnly, roachpb.Span{Key: key}); err != nil {
 		return nil, nil, err
 	}
-	return s.i.MVCCGet(key, timestamp, txn, consistent, tombstones)
+	return s.i.MVCCGet(key, timestamp, opts)
 }
 
 // MVCCScan is part of the engine.Iterator interface.
 func (s *Iterator) MVCCScan(
-	start, end roachpb.Key,
-	max int64,
-	timestamp hlc.Timestamp,
-	txn *roachpb.Transaction,
-	consistent, reverse, tombstones bool,
-) (kvs []byte, numKvs int64, intents []byte, err error) {
+	start, end roachpb.Key, max int64, timestamp hlc.Timestamp, opts engine.MVCCScanOptions,
+) (kvData [][]byte, numKVs int64, resumeSpan *roachpb.Span, intents []roachpb.Intent, err error) {
 	if err := s.spans.CheckAllowed(SpanReadOnly, roachpb.Span{Key: start, EndKey: end}); err != nil {
-		return nil, 0, nil, err
+		return nil, 0, nil, nil, err
 	}
-	return s.i.MVCCScan(start, end, max, timestamp, txn, consistent, reverse, tombstones)
+	return s.i.MVCCScan(start, end, max, timestamp, opts)
+}
+
+// SetUpperBound is part of the engine.Iterator interface.
+func (s *Iterator) SetUpperBound(key roachpb.Key) {
+	s.i.SetUpperBound(key)
 }
 
 type spanSetReader struct {
@@ -212,6 +200,7 @@ func (s spanSetReader) Get(key engine.MVCCKey) ([]byte, error) {
 	if err := s.spans.CheckAllowed(SpanReadOnly, roachpb.Span{Key: key.Key}); err != nil {
 		return nil, err
 	}
+	//lint:ignore SA1019 implementing deprecated interface function (Get) is OK
 	return s.r.Get(key)
 }
 
@@ -221,13 +210,14 @@ func (s spanSetReader) GetProto(
 	if err := s.spans.CheckAllowed(SpanReadOnly, roachpb.Span{Key: key.Key}); err != nil {
 		return false, 0, 0, err
 	}
+	//lint:ignore SA1019 implementing deprecated interface function (GetProto) is OK
 	return s.r.GetProto(key, msg)
 }
 
 func (s spanSetReader) Iterate(
-	start, end engine.MVCCKey, f func(engine.MVCCKeyValue) (bool, error),
+	start, end roachpb.Key, f func(engine.MVCCKeyValue) (bool, error),
 ) error {
-	if err := s.spans.CheckAllowed(SpanReadOnly, roachpb.Span{Key: start.Key, EndKey: end.Key}); err != nil {
+	if err := s.spans.CheckAllowed(SpanReadOnly, roachpb.Span{Key: start, EndKey: end}); err != nil {
 		return err
 	}
 	return s.r.Iterate(start, end, f)
@@ -237,10 +227,26 @@ func (s spanSetReader) NewIterator(opts engine.IterOptions) engine.Iterator {
 	return &Iterator{s.r.NewIterator(opts), s.spans, nil, false}
 }
 
-func (s spanSetReader) NewTimeBoundIterator(
-	start, end hlc.Timestamp, withStats bool,
-) engine.Iterator {
-	return &Iterator{s.r.NewTimeBoundIterator(start, end, withStats), s.spans, nil, false}
+// GetDBEngine recursively searches for the underlying rocksDB engine.
+func GetDBEngine(e engine.Reader, span roachpb.Span) engine.Reader {
+	switch v := e.(type) {
+	case ReadWriter:
+		return GetDBEngine(getSpanReader(v, span), span)
+	case *spanSetBatch:
+		return GetDBEngine(getSpanReader(v.ReadWriter, span), span)
+	default:
+		return e
+	}
+}
+
+// getSpanReader is a getter to access the engine.Reader field of the
+// spansetReader.
+func getSpanReader(r ReadWriter, span roachpb.Span) engine.Reader {
+	if err := r.spanSetReader.spans.CheckAllowed(SpanReadOnly, span); err != nil {
+		panic("Not in the span")
+	}
+
+	return r.spanSetReader.r
 }
 
 type spanSetWriter struct {
@@ -262,6 +268,13 @@ func (s spanSetWriter) Clear(key engine.MVCCKey) error {
 	return s.w.Clear(key)
 }
 
+func (s spanSetWriter) SingleClear(key engine.MVCCKey) error {
+	if err := s.spans.CheckAllowed(SpanReadWrite, roachpb.Span{Key: key.Key}); err != nil {
+		return err
+	}
+	return s.w.SingleClear(key)
+}
+
 func (s spanSetWriter) ClearRange(start, end engine.MVCCKey) error {
 	if err := s.spans.CheckAllowed(SpanReadWrite, roachpb.Span{Key: start.Key, EndKey: end.Key}); err != nil {
 		return err
@@ -269,8 +282,8 @@ func (s spanSetWriter) ClearRange(start, end engine.MVCCKey) error {
 	return s.w.ClearRange(start, end)
 }
 
-func (s spanSetWriter) ClearIterRange(iter engine.Iterator, start, end engine.MVCCKey) error {
-	if err := s.spans.CheckAllowed(SpanReadWrite, roachpb.Span{Key: start.Key, EndKey: end.Key}); err != nil {
+func (s spanSetWriter) ClearIterRange(iter engine.Iterator, start, end roachpb.Key) error {
+	if err := s.spans.CheckAllowed(SpanReadWrite, roachpb.Span{Key: start, EndKey: end}); err != nil {
 		return err
 	}
 	return s.w.ClearIterRange(iter, start, end)
@@ -294,15 +307,22 @@ func (s spanSetWriter) LogData(data []byte) error {
 	return s.w.LogData(data)
 }
 
-type spanSetReadWriter struct {
+func (s spanSetWriter) LogLogicalOp(
+	op engine.MVCCLogicalOpType, details engine.MVCCLogicalOpDetails,
+) {
+	s.w.LogLogicalOp(op, details)
+}
+
+// ReadWriter is used outside of the spanset package internally, in ccl.
+type ReadWriter struct {
 	spanSetReader
 	spanSetWriter
 }
 
-var _ engine.ReadWriter = spanSetReadWriter{}
+var _ engine.ReadWriter = ReadWriter{}
 
-func makeSpanSetReadWriter(rw engine.ReadWriter, spans *SpanSet) spanSetReadWriter {
-	return spanSetReadWriter{
+func makeSpanSetReadWriter(rw engine.ReadWriter, spans *SpanSet) ReadWriter {
+	return ReadWriter{
 		spanSetReader{
 			r:     rw,
 			spans: spans,
@@ -321,7 +341,7 @@ func NewReadWriter(rw engine.ReadWriter, spans *SpanSet) engine.ReadWriter {
 }
 
 type spanSetBatch struct {
-	spanSetReadWriter
+	ReadWriter
 	b     engine.Batch
 	spans *SpanSet
 }
@@ -338,6 +358,10 @@ func (s spanSetBatch) Distinct() engine.ReadWriter {
 
 func (s spanSetBatch) Empty() bool {
 	return s.b.Empty()
+}
+
+func (s spanSetBatch) Len() int {
+	return s.b.Len()
 }
 
 func (s spanSetBatch) Repr() []byte {

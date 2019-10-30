@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package batcheval
 
@@ -20,15 +16,15 @@ import (
 	"strings"
 	"testing"
 
-	opentracing "github.com/opentracing/opentracing-go"
-
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/abortspan"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/spanset"
+	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/storage/txnwait"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -37,12 +33,17 @@ import (
 )
 
 type mockEvalCtx struct {
-	clusterSettings *cluster.Settings
-	desc            *roachpb.RangeDescriptor
-	clock           *hlc.Clock
-	stats           enginepb.MVCCStats
-	abortSpan       *abortspan.AbortSpan
-	gcThreshold     hlc.Timestamp
+	clusterSettings  *cluster.Settings
+	desc             *roachpb.RangeDescriptor
+	storeID          roachpb.StoreID
+	clock            *hlc.Clock
+	stats            enginepb.MVCCStats
+	qps              float64
+	abortSpan        *abortspan.AbortSpan
+	gcThreshold      hlc.Timestamp
+	term, firstIndex uint64
+	canCreateTxnFn   func() (bool, hlc.Timestamp, roachpb.TransactionAbortedReason)
+	lease            roachpb.Lease
 }
 
 func (m *mockEvalCtx) String() string {
@@ -51,10 +52,7 @@ func (m *mockEvalCtx) String() string {
 func (m *mockEvalCtx) ClusterSettings() *cluster.Settings {
 	return m.clusterSettings
 }
-func (m *mockEvalCtx) EvalKnobs() TestingKnobs {
-	panic("unimplemented")
-}
-func (m *mockEvalCtx) Tracer() opentracing.Tracer {
+func (m *mockEvalCtx) EvalKnobs() storagebase.BatchEvalTestingKnobs {
 	panic("unimplemented")
 }
 func (m *mockEvalCtx) Engine() engine.Engine {
@@ -78,8 +76,11 @@ func (m *mockEvalCtx) GetTxnWaitQueue() *txnwait.Queue {
 func (m *mockEvalCtx) NodeID() roachpb.NodeID {
 	panic("unimplemented")
 }
-func (m *mockEvalCtx) StoreID() roachpb.StoreID {
+func (m *mockEvalCtx) GetNodeLocality() roachpb.Locality {
 	panic("unimplemented")
+}
+func (m *mockEvalCtx) StoreID() roachpb.StoreID {
+	return m.storeID
 }
 func (m *mockEvalCtx) GetRangeID() roachpb.RangeID {
 	return m.desc.RangeID
@@ -88,9 +89,12 @@ func (m *mockEvalCtx) IsFirstRange() bool {
 	panic("unimplemented")
 }
 func (m *mockEvalCtx) GetFirstIndex() (uint64, error) {
-	panic("unimplemented")
+	return m.firstIndex, nil
 }
 func (m *mockEvalCtx) GetTerm(uint64) (uint64, error) {
+	return m.term, nil
+}
+func (m *mockEvalCtx) GetLeaseAppliedIndex() uint64 {
 	panic("unimplemented")
 }
 func (m *mockEvalCtx) Desc() *roachpb.RangeDescriptor {
@@ -102,16 +106,33 @@ func (m *mockEvalCtx) ContainsKey(key roachpb.Key) bool {
 func (m *mockEvalCtx) GetMVCCStats() enginepb.MVCCStats {
 	return m.stats
 }
+func (m *mockEvalCtx) GetSplitQPS() float64 {
+	return m.qps
+}
+func (m *mockEvalCtx) CanCreateTxnRecord(
+	uuid.UUID, []byte, hlc.Timestamp,
+) (bool, hlc.Timestamp, roachpb.TransactionAbortedReason) {
+	return m.canCreateTxnFn()
+}
 func (m *mockEvalCtx) GetGCThreshold() hlc.Timestamp {
 	return m.gcThreshold
-}
-func (m *mockEvalCtx) GetTxnSpanGCThreshold() hlc.Timestamp {
-	panic("unimplemented")
 }
 func (m *mockEvalCtx) GetLastReplicaGCTimestamp(context.Context) (hlc.Timestamp, error) {
 	panic("unimplemented")
 }
-func (m *mockEvalCtx) GetLease() (roachpb.Lease, *roachpb.Lease) {
+func (m *mockEvalCtx) GetLease() (roachpb.Lease, roachpb.Lease) {
+	return m.lease, roachpb.Lease{}
+}
+
+func (m *mockEvalCtx) GetExternalStorage(
+	ctx context.Context, dest roachpb.ExternalStorage,
+) (cloud.ExternalStorage, error) {
+	panic("unimplemented")
+}
+
+func (m *mockEvalCtx) GetExternalStorageFromURI(
+	ctx context.Context, uri string,
+) (cloud.ExternalStorage, error) {
 	panic("unimplemented")
 }
 
@@ -127,7 +148,7 @@ func TestDeclareKeysResolveIntent(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	abortSpanKey := fmt.Sprintf(`1 1: /Local/RangeID/99/r/AbortSpan/"%s"`, id)
+	abortSpanKey := fmt.Sprintf(`write local: /Local/RangeID/99/r/AbortSpan/"%s"`, id)
 	desc := roachpb.RangeDescriptor{
 		RangeID:  99,
 		StartKey: roachpb.RKey("a"),
@@ -194,13 +215,13 @@ func TestDeclareKeysResolveIntent(t *testing.T) {
 
 				if !ranged {
 					cArgs.Args = &ri
-					declareKeysResolveIntent(desc, h, &ri, &spans)
+					declareKeysResolveIntent(&desc, h, &ri, &spans)
 					if _, err := ResolveIntent(ctx, batch, cArgs, &roachpb.ResolveIntentResponse{}); err != nil {
 						t.Fatal(err)
 					}
 				} else {
 					cArgs.Args = &rir
-					declareKeysResolveIntentRange(desc, h, &rir, &spans)
+					declareKeysResolveIntentRange(&desc, h, &rir, &spans)
 					if _, err := ResolveIntentRange(ctx, batch, cArgs, &roachpb.ResolveIntentRangeResponse{}); err != nil {
 						t.Fatal(err)
 					}

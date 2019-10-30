@@ -1,24 +1,19 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
+	"github.com/cockroachdb/errors"
 )
 
 type normalizableExpr interface {
@@ -90,12 +85,9 @@ func (expr *UnaryExpr) normalize(v *NormalizeVisitor) TypedExpr {
 	}
 
 	switch expr.Operator {
-	case UnaryPlus:
-		// +a -> a
-		return val
 	case UnaryMinus:
 		// -0 -> 0 (except for float which has negative zero)
-		if val.ResolvedType() != types.Float && v.isNumericZero(val) {
+		if val.ResolvedType().Family() != types.FloatFamily && v.isNumericZero(val) {
 			return val
 		}
 		switch b := val.(type) {
@@ -143,7 +135,7 @@ func (expr *BinaryExpr) normalize(v *NormalizeVisitor) TypedExpr {
 			break
 		}
 	case Minus:
-		if v.isNumericZero(right) {
+		if types.IsAdditiveType(left.ResolvedType()) && v.isNumericZero(right) {
 			final, v.err = ReType(left, expectedType)
 			break
 		}
@@ -356,7 +348,7 @@ func (expr *ComparisonExpr) normalize(v *NormalizeVisitor) TypedExpr {
 				expr.Left = left.Left
 				expr.Right = newRightExpr
 				expr.memoizeFn()
-				if !isVar(v.ctx, expr.Left) {
+				if !isVar(v.ctx, expr.Left, true /*allowConstPlaceholders*/) {
 					// Continue as long as the left side of the comparison is not a
 					// variable.
 					continue
@@ -410,7 +402,7 @@ func (expr *ComparisonExpr) normalize(v *NormalizeVisitor) TypedExpr {
 				expr.Left = left.Right
 				expr.Right = newRightExpr
 				expr.memoizeFn()
-				if !isVar(v.ctx, expr.Left) {
+				if !isVar(v.ctx, expr.Left, true /*allowConstPlaceholders*/) {
 					// Continue as long as the left side of the comparison is not a
 					// variable.
 					continue
@@ -422,12 +414,16 @@ func (expr *ComparisonExpr) normalize(v *NormalizeVisitor) TypedExpr {
 				// x->y=z to x @> {y:z} which can be used to build spans for inverted index
 				// lookups.
 
-				if left.TypedRight().ResolvedType() != types.String {
+				if left.TypedRight().ResolvedType().Family() != types.StringFamily {
 					break
 				}
 
 				str, err := left.TypedRight().Eval(v.ctx)
 				if err != nil {
+					break
+				}
+				// Check that we still have a string after evaluation.
+				if _, ok := str.(*DString); !ok {
 					break
 				}
 
@@ -436,15 +432,26 @@ func (expr *ComparisonExpr) normalize(v *NormalizeVisitor) TypedExpr {
 					break
 				}
 
+				rjson := rhs.(*DJSON).JSON
+				t := rjson.Type()
+				if t == json.ObjectJSONType || t == json.ArrayJSONType {
+					// We can't make this transformation in cases like
+					//
+					//   a->'b' = '["c"]',
+					//
+					// because containment is not equivalent to equality for non-scalar types.
+					break
+				}
+
 				j := json.NewObjectBuilder(1)
-				j.Add(string(*str.(*DString)), rhs.(*DJSON).JSON)
+				j.Add(string(*str.(*DString)), rjson)
 
 				dj, err := MakeDJSON(j.Build())
 				if err != nil {
 					break
 				}
 
-				typedJ, err := dj.TypeCheck(nil, types.JSON)
+				typedJ, err := dj.TypeCheck(nil, types.Jsonb)
 				if err != nil {
 					break
 				}
@@ -470,7 +477,10 @@ func (expr *ComparisonExpr) normalize(v *NormalizeVisitor) TypedExpr {
 			}
 			if len(tupleCopy.D) == 0 {
 				// NULL IN <empty-tuple> is false.
-				return DBoolFalse
+				if expr.Operator == In {
+					return DBoolFalse
+				}
+				return DBoolTrue
 			}
 			if expr.TypedLeft() == DNull {
 				// NULL IN <non-empty-tuple> is NULL.
@@ -671,14 +681,14 @@ type NormalizeVisitor struct {
 	ctx *EvalContext
 	err error
 
-	isConstVisitor isConstVisitor
+	fastIsConstVisitor fastIsConstVisitor
 }
 
 var _ Visitor = &NormalizeVisitor{}
 
 // MakeNormalizeVisitor creates a NormalizeVisitor instance.
 func MakeNormalizeVisitor(ctx *EvalContext) NormalizeVisitor {
-	return NormalizeVisitor{ctx: ctx, isConstVisitor: isConstVisitor{ctx: ctx}}
+	return NormalizeVisitor{ctx: ctx, fastIsConstVisitor: fastIsConstVisitor{ctx: ctx}}
 }
 
 // Err retrieves the error field in the NormalizeVisitor.
@@ -692,10 +702,8 @@ func (v *NormalizeVisitor) VisitPre(expr Expr) (recurse bool, newExpr Expr) {
 
 	switch expr.(type) {
 	case *Subquery:
-		// Avoid normalizing subqueries. We need the subquery to be expanded in
-		// order to do so properly.
-		// TODO(knz): This should happen when the prepare and execute phases are
-		//     separated for SelectClause.
+		// Subqueries are pre-normalized during semantic analysis. There
+		// is nothing to do here.
 		return false, expr
 	}
 
@@ -721,9 +729,6 @@ func (v *NormalizeVisitor) VisitPost(expr Expr) Expr {
 
 	// Evaluate all constant expressions.
 	if v.isConst(expr) {
-		if _, ok := expr.(*Placeholder); ok {
-			return expr
-		}
 		value, err := expr.(TypedExpr).Eval(v.ctx)
 		if err != nil {
 			// Ignore any errors here (e.g. division by zero), so they can happen
@@ -749,7 +754,7 @@ func (v *NormalizeVisitor) VisitPost(expr Expr) Expr {
 }
 
 func (v *NormalizeVisitor) isConst(expr Expr) bool {
-	return v.isConstVisitor.run(expr)
+	return v.fastIsConstVisitor.run(expr)
 }
 
 // isNumericZero returns true if the datum is a number and equal to
@@ -797,7 +802,7 @@ func invertComparisonOp(op ComparisonOperator) (ComparisonOperator, error) {
 	case LT:
 		return GT, nil
 	default:
-		return op, pgerror.NewErrorf(pgerror.CodeInternalError, "internal error: unable to invert: %s", op)
+		return op, errors.AssertionFailedf("unable to invert: %s", op)
 	}
 }
 
@@ -810,7 +815,7 @@ var _ Visitor = &isConstVisitor{}
 
 func (v *isConstVisitor) VisitPre(expr Expr) (recurse bool, newExpr Expr) {
 	if v.isConst {
-		if isVar(v.ctx, expr) {
+		if isVar(v.ctx, expr, true /*allowConstPlaceholders*/) {
 			v.isConst = false
 			return false, expr
 		}
@@ -841,58 +846,105 @@ func IsConst(evalCtx *EvalContext, expr Expr) bool {
 	return v.run(expr)
 }
 
-type impureFunctionsVisitor struct {
-	fns []*FuncExpr
+// fastIsConstVisitor is similar to isConstVisitor, but it only visits
+// at most two levels of the tree (with one exception, see below).
+// In essence, it determines whether an expression is constant by checking
+// whether its children are const Datums.
+//
+// This can be used during normalization since constants are evaluated
+// bottom-up. If a child is *not* a const Datum, that means it was already
+// determined to be non-constant, and therefore was not evaluated.
+type fastIsConstVisitor struct {
+	ctx     *EvalContext
+	isConst bool
+
+	// visited indicates whether we have already visited one level of the tree.
+	// fastIsConstVisitor only visits at most two levels of the tree, with one
+	// exception: If the second level has a Cast expression, fastIsConstVisitor
+	// may visit three levels.
+	visited bool
 }
 
-var _ Visitor = &impureFunctionsVisitor{}
+var _ Visitor = &fastIsConstVisitor{}
 
-func (v *impureFunctionsVisitor) VisitPre(expr Expr) (recurse bool, newExpr Expr) {
+func (v *fastIsConstVisitor) VisitPre(expr Expr) (recurse bool, newExpr Expr) {
+	if v.visited {
+		if _, ok := expr.(*CastExpr); ok {
+			// We recurse one more time for cast expressions, since the
+			// NormalizeVisitor may have wrapped a NULL.
+			return true, expr
+		}
+		if _, ok := expr.(Datum); !ok || isVar(v.ctx, expr, true /*allowConstPlaceholders*/) {
+			// If the child expression is not a const Datum, the parent expression is
+			// not constant. Note that all constant literals have already been
+			// normalized to Datum in TypeCheck.
+			v.isConst = false
+		}
+		return false, expr
+	}
+	v.visited = true
+
+	// If the parent expression is a variable or impure function, we know that it
+	// is not constant.
+
+	if isVar(v.ctx, expr, true /*allowConstPlaceholders*/) {
+		v.isConst = false
+		return false, expr
+	}
+
 	switch t := expr.(type) {
 	case *FuncExpr:
 		if t.IsImpure() {
-			v.fns = append(v.fns, t)
-			return true, expr
+			v.isConst = false
+			return false, expr
 		}
 	}
+
 	return true, expr
 }
 
-func (*impureFunctionsVisitor) VisitPost(expr Expr) Expr { return expr }
+func (*fastIsConstVisitor) VisitPost(expr Expr) Expr { return expr }
 
-func (v *impureFunctionsVisitor) run(expr Expr) []*FuncExpr {
+func (v *fastIsConstVisitor) run(expr Expr) bool {
+	v.isConst = true
+	v.visited = false
 	WalkExprConst(v, expr)
-	return v.fns
-}
-
-// ImpureFunctions returns the impure functions in an expression. It does not
-// return any column references, which distinguishes it from IsConst.
-func ImpureFunctions(expr Expr) []*FuncExpr {
-	v := impureFunctionsVisitor{}
-	return v.run(expr)
+	return v.isConst
 }
 
 // isVar returns true if the expression's value can vary during plan
-// execution.
-func isVar(evalCtx *EvalContext, expr Expr) bool {
+// execution. The parameter allowConstPlaceholders should be true
+// in the common case of scalar expressions that will be evaluated
+// in the context of the execution of a prepared query, where the
+// placeholder will have the same value for every row processed.
+// It is set to false for scalar expressions that are not
+// evaluated as part of query execution, eg. DEFAULT expressions.
+func isVar(evalCtx *EvalContext, expr Expr, allowConstPlaceholders bool) bool {
 	switch expr.(type) {
 	case VariableExpr:
 		return true
 	case *Placeholder:
-		return evalCtx != nil && (!evalCtx.HasPlaceholders() || evalCtx.Placeholders.IsUnresolvedPlaceholder(expr))
+		if allowConstPlaceholders {
+			if evalCtx == nil || !evalCtx.HasPlaceholders() {
+				// The placeholder cannot be resolved -- it is variable.
+				return true
+			}
+			return evalCtx.Placeholders.IsUnresolvedPlaceholder(expr)
+		}
+		// Placeholders considered always variable.
+		return true
 	}
 	return false
 }
 
 type containsVarsVisitor struct {
-	evalCtx      *EvalContext
 	containsVars bool
 }
 
 var _ Visitor = &containsVarsVisitor{}
 
 func (v *containsVarsVisitor) VisitPre(expr Expr) (recurse bool, newExpr Expr) {
-	if !v.containsVars && isVar(v.evalCtx, expr) {
+	if !v.containsVars && isVar(nil, expr, false /*allowConstPlaceholders*/) {
 		v.containsVars = true
 	}
 	if v.containsVars {
@@ -905,8 +957,8 @@ func (*containsVarsVisitor) VisitPost(expr Expr) Expr { return expr }
 
 // ContainsVars returns true if the expression contains any variables.
 // (variables = sub-expressions, placeholders, indexed vars, etc.)
-func ContainsVars(evalCtx *EvalContext, expr Expr) bool {
-	v := containsVarsVisitor{evalCtx: evalCtx, containsVars: false}
+func ContainsVars(expr Expr) bool {
+	v := containsVarsVisitor{containsVars: false}
 	WalkExprConst(&v, expr)
 	return v.containsVars
 }
@@ -915,20 +967,16 @@ func ContainsVars(evalCtx *EvalContext, expr Expr) bool {
 var DecimalOne DDecimal
 
 func init() {
-	DecimalOne.SetCoefficient(1)
+	DecimalOne.SetFinite(1, 0)
 }
 
 // ReType ensures that the given numeric expression evaluates
 // to the requested type, inserting a cast if necessary.
-func ReType(expr TypedExpr, wantedType types.T) (TypedExpr, error) {
+func ReType(expr TypedExpr, wantedType *types.T) (TypedExpr, error) {
 	if expr.ResolvedType().Equivalent(wantedType) {
 		return expr, nil
 	}
-	reqType, err := coltypes.DatumTypeToColumnType(wantedType)
-	if err != nil {
-		return nil, err
-	}
-	res := &CastExpr{Expr: expr, Type: reqType}
+	res := &CastExpr{Expr: expr, Type: wantedType}
 	res.typ = wantedType
 	return res, nil
 }

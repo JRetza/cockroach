@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package kv
 
@@ -27,16 +23,16 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/pkg/errors"
-
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/localtestcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/pkg/errors"
 )
 
 type retryError struct {
@@ -317,71 +313,15 @@ func parseHistories(histories []string, t *testing.T) [][]*cmd {
 	return results
 }
 
-// Easily accessible slices of transaction isolation variations.
-var (
-	bothIsolations   = []enginepb.IsolationType{enginepb.SERIALIZABLE, enginepb.SNAPSHOT}
-	onlySerializable = []enginepb.IsolationType{enginepb.SERIALIZABLE}
-	onlySnapshot     = []enginepb.IsolationType{enginepb.SNAPSHOT}
-)
-
-// enumerateIsolations returns a slice enumerating all combinations of
-// isolation types across the transactions. The inner slice describes
-// the isolation type for each transaction. The outer slice contains
-// each possible combination of such transaction isolations.
-func enumerateIsolations(
-	numTxns int, isolations []enginepb.IsolationType,
-) [][]enginepb.IsolationType {
-	// Use a count from 0 to pow(# isolations, numTxns)-1 and examine
-	// n-ary digits to get all possible combinations of txn isolations.
-	n := len(isolations)
-	result := [][]enginepb.IsolationType{}
-	for i := 0; i < int(math.Pow(float64(n), float64(numTxns))); i++ {
-		desc := make([]enginepb.IsolationType, numTxns)
-		val := i
-		for j := 0; j < numTxns; j++ {
-			desc[j] = isolations[val%n]
-			val /= n
-		}
-		result = append(result, desc)
-	}
-	return result
-}
-
-func TestEnumerateIsolations(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	SSI := enginepb.SERIALIZABLE
-	SI := enginepb.SNAPSHOT
-	expIsolations := [][]enginepb.IsolationType{
-		{SSI, SSI, SSI},
-		{SI, SSI, SSI},
-		{SSI, SI, SSI},
-		{SI, SI, SSI},
-		{SSI, SSI, SI},
-		{SI, SSI, SI},
-		{SSI, SI, SI},
-		{SI, SI, SI},
-	}
-	if enum := enumerateIsolations(3, bothIsolations); !reflect.DeepEqual(enum, expIsolations) {
-		t.Errorf("expected enumeration to match %s; got %s", expIsolations, enum)
-	}
-
-	expDegenerate := [][]enginepb.IsolationType{
-		{SSI, SSI, SSI},
-	}
-	if enum := enumerateIsolations(3, onlySerializable); !reflect.DeepEqual(enum, expDegenerate) {
-		t.Errorf("expected enumeration to match %s; got %s", expDegenerate, enum)
-	}
-}
-
 // enumeratePriorities returns a slice enumerating all combinations of
 // priorities across the transactions. The inner slice describes the
 // priority for each transaction. The outer slice contains each possible
 // combination of such transaction priorities.
-func enumeratePriorities(numTxns int, priorities []int32) [][]int32 {
+func enumeratePriorities(numTxns int, priorities []enginepb.TxnPriority) [][]enginepb.TxnPriority {
 	n := len(priorities)
-	result := [][]int32{}
+	result := [][]enginepb.TxnPriority{}
 	for i := 0; i < int(math.Pow(float64(n), float64(numTxns))); i++ {
-		desc := make([]int32, numTxns)
+		desc := make([]enginepb.TxnPriority, numTxns)
 		val := i
 		for j := 0; j < numTxns; j++ {
 			desc[j] = priorities[val%n]
@@ -394,9 +334,9 @@ func enumeratePriorities(numTxns int, priorities []int32) [][]int32 {
 
 func TestEnumeratePriorities(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	p1 := int32(1)
-	p2 := int32(2)
-	expPriorities := [][]int32{
+	p1 := enginepb.TxnPriority(1)
+	p2 := enginepb.TxnPriority(2)
+	expPriorities := [][]enginepb.TxnPriority{
 		{p1, p1, p1},
 		{p2, p1, p1},
 		{p1, p2, p1},
@@ -406,7 +346,7 @@ func TestEnumeratePriorities(t *testing.T) {
 		{p1, p2, p2},
 		{p2, p2, p2},
 	}
-	enum := enumeratePriorities(3, []int32{p1, p2})
+	enum := enumeratePriorities(3, []enginepb.TxnPriority{p1, p2})
 	if !reflect.DeepEqual(enum, expPriorities) {
 		t.Errorf("expected enumeration to match %v; got %v", expPriorities, enum)
 	}
@@ -640,20 +580,17 @@ func newHistoryVerifier(
 	}
 }
 
-func (hv *historyVerifier) run(isolations []enginepb.IsolationType, db *client.DB, t *testing.T) {
+func (hv *historyVerifier) run(db *client.DB, t *testing.T) {
 	log.Infof(context.Background(), "verifying all possible histories for the %q anomaly", hv.name)
-	enumPri := enumeratePriorities(len(hv.txns), []int32{1, roachpb.MaxTxnPriority})
-	enumIso := enumerateIsolations(len(hv.txns), isolations)
+	enumPri := enumeratePriorities(len(hv.txns), []enginepb.TxnPriority{1, enginepb.MaxTxnPriority})
 	enumHis := enumerateHistories(hv.txns, hv.equal)
 
 	for _, p := range enumPri {
-		for _, i := range enumIso {
-			for _, h := range enumHis {
-				hv.retriedTxns = map[int]struct{}{} // always reset the retried txns set
-				if err := hv.runHistoryWithRetry(p, i, h, db, t); err != nil {
-					t.Errorf("expected success, experienced %s", err)
-					return
-				}
+		for _, h := range enumHis {
+			hv.retriedTxns = map[int]struct{}{} // always reset the retried txns set
+			if err := hv.runHistoryWithRetry(p, h, db, t); err != nil {
+				t.Errorf("expected success, experienced %s", err)
+				return
 			}
 		}
 	}
@@ -667,9 +604,9 @@ func (hv *historyVerifier) run(isolations []enginepb.IsolationType, db *client.D
 //
 // This process continues recursively if there are further retries.
 func (hv *historyVerifier) runHistoryWithRetry(
-	priorities []int32, isolations []enginepb.IsolationType, cmds []*cmd, db *client.DB, t *testing.T,
+	priorities []enginepb.TxnPriority, cmds []*cmd, db *client.DB, t *testing.T,
 ) error {
-	if err := hv.runHistory(priorities, isolations, cmds, db, t); err != nil {
+	if err := hv.runHistory(priorities, cmds, db, t); err != nil {
 		if log.V(1) {
 			log.Infof(context.Background(), "got an error running history %s: %s", historyString(cmds), err)
 		}
@@ -692,7 +629,7 @@ func (hv *historyVerifier) runHistoryWithRetry(
 			if log.V(1) {
 				log.Infof(context.Background(), "after retry, running alternate history %d of %d", i, len(enumHis))
 			}
-			if err := hv.runHistoryWithRetry(priorities, isolations, h, db, t); err != nil {
+			if err := hv.runHistoryWithRetry(priorities, h, db, t); err != nil {
 				return err
 			}
 		}
@@ -701,7 +638,7 @@ func (hv *historyVerifier) runHistoryWithRetry(
 }
 
 func (hv *historyVerifier) runHistory(
-	priorities []int32, isolations []enginepb.IsolationType, cmds []*cmd, db *client.DB, t *testing.T,
+	priorities []enginepb.TxnPriority, cmds []*cmd, db *client.DB, t *testing.T,
 ) error {
 	hv.idx++
 	if t.Failed() {
@@ -709,7 +646,7 @@ func (hv *historyVerifier) runHistory(
 	}
 	// Execute pre-history if applicable.
 	if hv.preHistoryCmds != nil {
-		if str, _, err := hv.runCmds(hv.preHistoryCmds, db, t); err != nil {
+		if str, _, err := hv.runCmds("pre-history", hv.preHistoryCmds, db, t); err != nil {
 			t.Errorf("failed on execution of pre history %s: %s", str, err)
 			return err
 		}
@@ -717,7 +654,7 @@ func (hv *historyVerifier) runHistory(
 	plannedStr := historyString(cmds)
 
 	if log.V(1) {
-		log.Infof(context.Background(), "iso=%d pri=%d history=%s", isolations, priorities, plannedStr)
+		log.Infof(context.Background(), "pri=%d history=%s", priorities, plannedStr)
 	}
 
 	hv.mu.actual = []string{}
@@ -737,7 +674,7 @@ func (hv *historyVerifier) runHistory(
 
 	for i, txnCmds := range txnMap {
 		go func(i int, txnCmds []*cmd) {
-			if err := hv.runTxn(i, priorities[i], isolations[i], txnCmds, db, t); err != nil {
+			if err := hv.runTxn(i, priorities[i], txnCmds, db, t); err != nil {
 				if re, ok := err.(*retryError); !ok {
 					reportErr := errors.Wrapf(err, "(%s): unexpected failure", cmds)
 					select {
@@ -771,7 +708,7 @@ func (hv *historyVerifier) runHistory(
 	actualStr := strings.Join(hv.mu.actual, " ")
 
 	// Verify history.
-	verifyStr, verifyEnv, err := hv.runCmds(hv.verifyCmds, db, t)
+	verifyStr, verifyEnv, err := hv.runCmds("verify", hv.verifyCmds, db, t)
 	if err != nil {
 		t.Errorf("failed on execution of verification history %s: %s", verifyStr, err)
 		return err
@@ -779,22 +716,23 @@ func (hv *historyVerifier) runHistory(
 	err = hv.verify.checkFn(verifyEnv)
 	if err == nil {
 		if log.V(1) {
-			log.Infof(context.Background(), "PASSED: iso=%d, pri=%d, history=%q", isolations, priorities, actualStr)
+			log.Infof(context.Background(), "PASSED: pri=%d, history=%q", priorities, actualStr)
 		}
 	}
 	if err != nil {
-		t.Errorf("%d: iso=%d, pri=%d, history=%q: actual=%q, verify=%q: %s",
-			hv.idx, isolations, priorities, plannedStr, actualStr, verifyStr, err)
+		t.Errorf("%d: pri=%d, history=%q: actual=%q, verify=%q: %s",
+			hv.idx, priorities, plannedStr, actualStr, verifyStr, err)
 	}
 	return err
 }
 
 func (hv *historyVerifier) runCmds(
-	cmds []*cmd, db *client.DB, t *testing.T,
+	txnName string, cmds []*cmd, db *client.DB, t *testing.T,
 ) (string, map[string]int64, error) {
 	var strs []string
 	env := map[string]int64{}
 	err := db.Txn(context.TODO(), func(ctx context.Context, txn *client.Txn) error {
+		txn.SetDebugName(txnName)
 		for _, c := range cmds {
 			c.historyIdx = hv.idx
 			c.env = env
@@ -811,12 +749,7 @@ func (hv *historyVerifier) runCmds(
 }
 
 func (hv *historyVerifier) runTxn(
-	txnIdx int,
-	priority int32,
-	isolation enginepb.IsolationType,
-	cmds []*cmd,
-	db *client.DB,
-	t *testing.T,
+	txnIdx int, priority enginepb.TxnPriority, cmds []*cmd, db *client.DB, t *testing.T,
 ) error {
 	var retry int
 	txnName := fmt.Sprintf("txn %d", txnIdx+1)
@@ -844,11 +777,6 @@ func (hv *historyVerifier) runTxn(
 		}
 
 		txn.SetDebugName(txnName)
-		if isolation == enginepb.SNAPSHOT {
-			if err := txn.SetIsolation(enginepb.SNAPSHOT); err != nil {
-				return err
-			}
-		}
 		txn.InternalSetPriority(priority)
 
 		env := map[string]int64{}
@@ -886,16 +814,26 @@ func (hv *historyVerifier) runCmd(
 
 // checkConcurrency creates a history verifier, starts a new database
 // and runs the verifier.
-func checkConcurrency(
-	name string, isolations []enginepb.IsolationType, txns []string, verify *verifier, t *testing.T,
-) {
+func checkConcurrency(name string, txns []string, verify *verifier, t *testing.T) {
 	verifier := newHistoryVerifier(name, txns, verify, t)
 	s := &localtestcluster.LocalTestCluster{
-		DontRetryPushTxnFailures: true,
+		StoreTestingKnobs: &storage.StoreTestingKnobs{
+			DontRetryPushTxnFailures: true,
+			// Immediately attempt to recover pushed transactions with STAGING
+			// statuses, even if the push would otherwise fail because the
+			// pushee has not yet expired. This prevents low-priority pushes from
+			// occasionally throwing retry errors due to DontRetryPushTxnFailures
+			// after the pushee's commit has already returned successfully. This
+			// is a result of the asynchronous nature of making transaction commits
+			// explicit after a parallel commit.
+			EvalKnobs: storagebase.BatchEvalTestingKnobs{
+				RecoverIndeterminateCommitsOnFailedPushes: true,
+			},
+		},
 	}
 	s.Start(t, testutils.NewNodeTestBaseContext(), InitFactoryForLocalTestCluster)
 	defer s.Stop()
-	verifier.run(isolations, s.DB, t)
+	verifier.run(s.DB, t)
 }
 
 // The following tests for concurrency anomalies include documentation
@@ -921,8 +859,8 @@ func checkConcurrency(
 //   In.m(x) - increment from txn "n" ("m"th retry) of key "x"
 //   Cn.m - commit of txn "n" ("m"th retry)
 
-// TestTxnDBReadSkewAnomaly verifies that neither SI nor SSI isolation
-// are subject to the read skew anomaly, an example of a database
+// TestTxnDBReadSkewAnomaly verifies that transactions are not
+// subject to the read skew anomaly, an example of a database
 // constraint violation known as inconsistent analysis (see
 // http://research.microsoft.com/pubs/69541/tr-95-51.pdf). This anomaly
 // is prevented by REPEATABLE_READ.
@@ -951,11 +889,11 @@ func TestTxnDBReadSkewAnomaly(t *testing.T) {
 			return nil
 		},
 	}
-	checkConcurrency("read skew", bothIsolations, []string{txn1, txn2}, verify, t)
+	checkConcurrency("read skew", []string{txn1, txn2}, verify, t)
 }
 
-// TestTxnDBLostUpdateAnomaly verifies that neither SI nor SSI isolation
-// are subject to the lost update anomaly. This anomaly is prevented
+// TestTxnDBLostUpdateAnomaly verifies that transactions are not
+// subject to the lost update anomaly. This anomaly is prevented
 // in most cases by using the READ_COMMITTED ANSI isolation level.
 // However, only REPEATABLE_READ fully protects against it.
 //
@@ -982,11 +920,11 @@ func TestTxnDBLostUpdateAnomaly(t *testing.T) {
 			return nil
 		},
 	}
-	checkConcurrency("lost update", bothIsolations, []string{txn, txn}, verify, t)
+	checkConcurrency("lost update", []string{txn, txn}, verify, t)
 }
 
-// TestTxnDBLostDeleteAnomaly verifies that neither SI nor SSI
-// isolation are subject to the lost delete anomaly. See #6240.
+// TestTxnDBLostDeleteAnomaly verifies that transactions are not
+// subject to the lost delete anomaly. See #6240.
 //
 // With lost delete, the two deletions from txn2 are interleaved
 // with a read and write from txn1, allowing txn1 to read a pre-
@@ -1014,11 +952,11 @@ func TestTxnDBLostDeleteAnomaly(t *testing.T) {
 			return nil
 		},
 	}
-	checkConcurrency("lost update (delete)", onlySnapshot, []string{txn1, txn2}, verify, t)
+	checkConcurrency("lost update (delete)", []string{txn1, txn2}, verify, t)
 }
 
-// TestTxnDBLostDeleteRangeAnomaly verifies that neither SI nor SSI
-// isolation are subject to the lost delete range anomaly. See #6240.
+// TestTxnDBLostDeleteRangeAnomaly verifies that transactions are not
+// subject to the lost delete range anomaly. See #6240.
 //
 // With lost delete range, the delete range for keys B-C leave no
 // deletion tombstones (as there are an infinite number of keys in the
@@ -1028,8 +966,8 @@ func TestTxnDBLostDeleteAnomaly(t *testing.T) {
 // delete range request therefore committed but failed to delete the
 // value written to key B.
 //
-// This anomaly is prevented by making snapshot transactions which
-// involve a range deletion restart when they are pushed.
+// Note that the snapshot isolation level is no longer supported. This
+// test is retained for good measure.
 //
 // Lost delete range would typically fail with a history such as:
 //   D2(A) DR2(B-C) R1(A) C2 W1(B,A) C1
@@ -1049,11 +987,11 @@ func TestTxnDBLostDeleteRangeAnomaly(t *testing.T) {
 			return nil
 		},
 	}
-	checkConcurrency("lost update (range delete)", onlySnapshot, []string{txn1, txn2}, verify, t)
+	checkConcurrency("lost update (range delete)", []string{txn1, txn2}, verify, t)
 }
 
-// TestTxnDBPhantomReadAnomaly verifies that neither SI nor SSI isolation
-// are subject to the phantom reads anomaly. This anomaly is prevented by
+// TestTxnDBPhantomReadAnomaly verifies that transactions are not subject
+// to the phantom reads anomaly. This anomaly is prevented by
 // the SQL ANSI SERIALIZABLE isolation level, though it's also prevented
 // by snapshot isolation (i.e. Oracle's traditional "serializable").
 //
@@ -1077,11 +1015,11 @@ func TestTxnDBPhantomReadAnomaly(t *testing.T) {
 			return nil
 		},
 	}
-	checkConcurrency("phantom read", bothIsolations, []string{txn1, txn2}, verify, t)
+	checkConcurrency("phantom read", []string{txn1, txn2}, verify, t)
 }
 
-// TestTxnDBPhantomDeleteAnomaly verifies that neither SI nor SSI
-// isolation are subject to the phantom deletion anomaly; this is
+// TestTxnDBPhantomDeleteAnomaly verifies that transactions are not
+// subject to the phantom deletion anomaly; this is
 // similar to phantom reads, but verifies the delete range
 // functionality causes read/write conflicts.
 //
@@ -1100,41 +1038,18 @@ func TestTxnDBPhantomDeleteAnomaly(t *testing.T) {
 			return nil
 		},
 	}
-	checkConcurrency("phantom delete", bothIsolations, []string{txn1, txn2}, verify, t)
+	checkConcurrency("phantom delete", []string{txn1, txn2}, verify, t)
 }
 
-func runWriteSkewTest(t *testing.T, iso enginepb.IsolationType) {
-	checks := make(map[enginepb.IsolationType]func(map[string]int64) error)
-	checks[enginepb.SERIALIZABLE] = func(env map[string]int64) error {
-		if !((env["A"] == 1 && env["B"] == 2) || (env["A"] == 2 && env["B"] == 1)) {
-			return errors.Errorf("expected either A=1, B=2 -or- A=2, B=1, but have A=%d, B=%d", env["A"], env["B"])
-		}
-		return nil
-	}
-	checks[enginepb.SNAPSHOT] = func(env map[string]int64) error {
-		if env["A"] == 1 && env["B"] == 1 {
-			return nil
-		}
-		return checks[enginepb.SERIALIZABLE](env)
-	}
-
-	txn1 := "SC(A-C) W(A,A+B+1) C"
-	txn2 := "SC(A-C) W(B,A+B+1) C"
-	verify := &verifier{
-		history: "R(A) R(B)",
-		checkFn: checks[iso],
-	}
-	checkConcurrency("write skew", []enginepb.IsolationType{iso}, []string{txn1, txn2}, verify, t)
-}
-
-// TestTxnDBWriteSkewAnomaly verifies that SI suffers from the write
-// skew anomaly but not SSI. The write skew anomaly is a condition which
-// illustrates that snapshot isolation is not serializable in practice.
+// TestTxnDBWriteSkewAnomaly verifies that transactions are not
+// subject to the write skew anomaly. Write skew is only possible
+// at the weaker, snapshot isolation level, which is no longer
+// supported.
 //
 // With write skew, two transactions both read values from A and B
 // respectively, but each writes to either A or B only. Thus there are
 // no write/write conflicts but a cycle of dependencies which result in
-// "skew". Only serializable isolation prevents this anomaly.
+// "skew".
 //
 // Write skew would typically fail with a history such as:
 //   SC1(A-C) SC2(A-C) W1(A,A+B+1) C1 W2(B,A+B+1) C2
@@ -1148,6 +1063,16 @@ func runWriteSkewTest(t *testing.T, iso enginepb.IsolationType) {
 // history above) and may set A=1, B=1.
 func TestTxnDBWriteSkewAnomaly(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	runWriteSkewTest(t, enginepb.SERIALIZABLE)
-	runWriteSkewTest(t, enginepb.SNAPSHOT)
+	txn1 := "SC(A-C) W(A,A+B+1) C"
+	txn2 := "SC(A-C) W(B,A+B+1) C"
+	verify := &verifier{
+		history: "R(A) R(B)",
+		checkFn: func(env map[string]int64) error {
+			if !((env["A"] == 1 && env["B"] == 2) || (env["A"] == 2 && env["B"] == 1)) {
+				return errors.Errorf("expected either A=1, B=2 -or- A=2, B=1, but have A=%d, B=%d", env["A"], env["B"])
+			}
+			return nil
+		},
+	}
+	checkConcurrency("write skew", []string{txn1, txn2}, verify, t)
 }

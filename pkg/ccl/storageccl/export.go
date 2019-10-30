@@ -14,15 +14,14 @@ import (
 	"crypto/sha512"
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl/engineccl"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/storage/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/storage/batcheval/result"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/spanset"
-	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/pkg/errors"
@@ -33,52 +32,10 @@ func init() {
 }
 
 func declareKeysExport(
-	desc roachpb.RangeDescriptor, header roachpb.Header, req roachpb.Request, spans *spanset.SpanSet,
+	desc *roachpb.RangeDescriptor, header roachpb.Header, req roachpb.Request, spans *spanset.SpanSet,
 ) {
 	batcheval.DefaultDeclareKeys(desc, header, req, spans)
 	spans.Add(spanset.SpanReadOnly, roachpb.Span{Key: keys.RangeLastGCKey(header.RangeID)})
-}
-
-type rowCounter struct {
-	prev roachpb.Key
-	roachpb.BulkOpSummary
-}
-
-func (r *rowCounter) count(key roachpb.Key) error {
-	// EnsureSafeSplitKey is usually used to avoid splitting a row across ranges,
-	// by returning the row's key prefix.
-	// We reuse it here to count "rows" by counting when it changes.
-	// Non-SQL keys are returned unchanged or may error -- we ignore them, since
-	// non-SQL keys are obviously thus not SQL rows.
-	row, err := keys.EnsureSafeSplitKey(key)
-	if err != nil || len(key) == len(row) {
-		return nil
-	}
-
-	// no change key prefix => no new row.
-	if bytes.Equal(row, r.prev) {
-		return nil
-	}
-	r.prev = append(r.prev[:0], row...)
-
-	rest, tbl, err := keys.DecodeTablePrefix(row)
-	if err != nil {
-		return err
-	}
-
-	if tbl < keys.MaxReservedDescID {
-		r.SystemRecords++
-	} else {
-		if _, indexID, err := encoding.DecodeUvarintAscending(rest); err != nil {
-			return err
-		} else if indexID == 1 {
-			r.Rows++
-		} else {
-			r.IndexEntries++
-		}
-	}
-
-	return nil
 }
 
 // evalExport dumps the requested keys into files of non-overlapping key ranges
@@ -110,122 +67,109 @@ func evalExport(
 		reply.StartTime = gcThreshold
 	}
 
-	if err := cArgs.EvalCtx.GetLimiters().ConcurrentExports.Begin(ctx); err != nil {
+	if err := cArgs.EvalCtx.GetLimiters().ConcurrentExportRequests.Begin(ctx); err != nil {
 		return result.Result{}, err
 	}
-	defer cArgs.EvalCtx.GetLimiters().ConcurrentExports.Finish()
+	defer cArgs.EvalCtx.GetLimiters().ConcurrentExportRequests.Finish()
 
-	makeExportStorage := !args.ReturnSST || (args.Storage != roachpb.ExportStorage{})
-	if makeExportStorage || log.V(1) {
+	makeExternalStorage := !args.ReturnSST || args.Storage != roachpb.ExternalStorage{} ||
+		(args.StorageByLocalityKV != nil && len(args.StorageByLocalityKV) > 0)
+	if makeExternalStorage || log.V(1) {
 		log.Infof(ctx, "export [%s,%s)", args.Key, args.EndKey)
 	} else {
 		// Requests that don't write to export storage are expected to be small.
 		log.Eventf(ctx, "export [%s,%s)", args.Key, args.EndKey)
 	}
 
-	var exportStore ExportStorage
-	if makeExportStorage {
+	// To get the store to export to, first try to match the locality of this node
+	// to the locality KVs in args.StorageByLocalityKV (used for partitioned
+	// backups). If that map isn't set or there's no match, fall back to
+	// args.Storage.
+	var localityKV string
+	var exportStore cloud.ExternalStorage
+	if makeExternalStorage {
+		var storeConf roachpb.ExternalStorage
 		var err error
-		exportStore, err = MakeExportStorage(ctx, args.Storage, cArgs.EvalCtx.ClusterSettings())
+		foundStoreByLocality := false
+		if args.StorageByLocalityKV != nil && len(args.StorageByLocalityKV) > 0 {
+			locality := cArgs.EvalCtx.GetNodeLocality()
+			localityKV, storeConf, foundStoreByLocality = getMatchingStore(&locality, args.StorageByLocalityKV)
+		}
+		if !foundStoreByLocality {
+			storeConf = args.Storage
+		}
+		exportStore, err = cArgs.EvalCtx.GetExternalStorage(ctx, storeConf)
 		if err != nil {
 			return result.Result{}, err
 		}
 		defer exportStore.Close()
 	}
 
-	sst, err := engine.MakeRocksDBSstFileWriter()
-	if err != nil {
-		return result.Result{}, err
-	}
-	defer sst.Close()
-
-	var skipTombstones bool
-	var iterFn func(*engineccl.MVCCIncrementalIterator)
+	var exportAllRevisions bool
 	switch args.MVCCFilter {
 	case roachpb.MVCCFilter_Latest:
-		skipTombstones = true
-		iterFn = (*engineccl.MVCCIncrementalIterator).NextKey
+		exportAllRevisions = false
 	case roachpb.MVCCFilter_All:
-		skipTombstones = false
-		iterFn = (*engineccl.MVCCIncrementalIterator).Next
+		exportAllRevisions = true
 	default:
 		return result.Result{}, errors.Errorf("unknown MVCC filter: %s", args.MVCCFilter)
 	}
 
-	var rows rowCounter
-	// TODO(dan): Move all this iteration into cpp to avoid the cgo calls.
-	// TODO(dan): Consider checking ctx periodically during the MVCCIterate call.
-	iter := engineccl.NewMVCCIncrementalIterator(batch, args.StartTime, h.Timestamp)
-	defer iter.Close()
-	for iter.Seek(engine.MakeMVCCMetadataKey(args.Key)); ; iterFn(iter) {
-		ok, err := iter.Valid()
-		if err != nil {
-			// The error may be a WriteIntentError. In which case, returning it will
-			// cause this command to be retried.
-			return result.Result{}, err
-		}
-		if !ok || iter.UnsafeKey().Key.Compare(args.EndKey) >= 0 {
-			break
-		}
+	start := engine.MVCCKey{Key: args.Key, Timestamp: args.StartTime}
+	end := engine.MVCCKey{Key: args.EndKey, Timestamp: h.Timestamp}
 
-		// Skip tombstone (len=0) records when startTime is zero
-		// (non-incremental) and we're not exporting all versions.
-		if skipTombstones && args.StartTime.IsEmpty() && len(iter.UnsafeValue()) == 0 {
-			iter.NextKey()
-			if ok, err := iter.Valid(); err != nil {
-				return result.Result{}, err
-			} else if !ok {
-				break
-			}
-			continue
-		}
-
-		if log.V(3) {
-			v := roachpb.Value{RawBytes: iter.UnsafeValue()}
-			log.Infof(ctx, "Export %s %s", iter.UnsafeKey(), v.PrettyPrint())
-		}
-
-		if err := rows.count(iter.UnsafeKey().Key); err != nil {
-			return result.Result{}, errors.Wrapf(err, "decoding %s", iter.UnsafeKey())
-		}
-		if err := sst.Add(engine.MVCCKeyValue{Key: iter.UnsafeKey(), Value: iter.UnsafeValue()}); err != nil {
-			return result.Result{}, errors.Wrapf(err, "adding key %s", iter.UnsafeKey())
-		}
+	io := engine.IterOptions{
+		UpperBound: args.EndKey,
 	}
 
-	if sst.DataSize == 0 {
-		// Let the defer Close the sstable.
+	// Time-bound iterators only make sense to use if the start time is set.
+	if args.EnableTimeBoundIteratorOptimization && !args.StartTime.IsEmpty() {
+		// The call to startTime.Next() converts our exclusive start bound into the
+		// inclusive start bound that MinTimestampHint expects. This is strictly a
+		// performance optimization; omitting the call would still return correct
+		// results.
+		io.MinTimestampHint = args.StartTime.Next()
+		io.MaxTimestampHint = h.Timestamp
+	}
+
+	e := spanset.GetDBEngine(batch, roachpb.Span{Key: args.Key, EndKey: args.EndKey})
+
+	data, summary, err := engine.ExportToSst(ctx, e, start, end, exportAllRevisions, io)
+
+	if err != nil {
+		return result.Result{}, err
+	}
+
+	if summary.DataSize == 0 {
 		reply.Files = []roachpb.ExportResponse_File{}
 		return result.Result{}, nil
 	}
-	rows.BulkOpSummary.DataSize = sst.DataSize
 
-	sstContents, err := sst.Finish()
-	if err != nil {
-		return result.Result{}, err
-	}
-
-	// Compute the checksum before we upload and remove the local file.
-	checksum, err := SHA512ChecksumData(sstContents)
-	if err != nil {
-		return result.Result{}, err
+	var checksum []byte
+	if !args.OmitChecksum {
+		// Compute the checksum before we upload and remove the local file.
+		checksum, err = SHA512ChecksumData(data)
+		if err != nil {
+			return result.Result{}, err
+		}
 	}
 
 	exported := roachpb.ExportResponse_File{
-		Span:     args.Span,
-		Exported: rows.BulkOpSummary,
-		Sha512:   checksum,
+		Span:       args.Span(),
+		Exported:   summary,
+		Sha512:     checksum,
+		LocalityKV: localityKV,
 	}
 
 	if exportStore != nil {
 		exported.Path = fmt.Sprintf("%d.sst", builtins.GenerateUniqueInt(cArgs.EvalCtx.NodeID()))
-		if err := exportStore.WriteFile(ctx, exported.Path, bytes.NewReader(sstContents)); err != nil {
+		if err := exportStore.WriteFile(ctx, exported.Path, bytes.NewReader(data)); err != nil {
 			return result.Result{}, err
 		}
 	}
 
 	if args.ReturnSST {
-		exported.SST = sstContents
+		exported.SST = data
 	}
 
 	reply.Files = []roachpb.ExportResponse_File{exported}
@@ -239,4 +183,18 @@ func SHA512ChecksumData(data []byte) ([]byte, error) {
 		panic(errors.Wrap(err, `"It never returns an error." -- https://golang.org/pkg/hash`))
 	}
 	return h.Sum(nil), nil
+}
+
+func getMatchingStore(
+	locality *roachpb.Locality, storageByLocalityKV map[string]*roachpb.ExternalStorage,
+) (string, roachpb.ExternalStorage, bool) {
+	kvs := locality.Tiers
+	// When matching, more specific KVs in the node locality take precedence
+	// over less specific ones.
+	for i := len(kvs) - 1; i >= 0; i-- {
+		if store, ok := storageByLocalityKV[kvs[i].String()]; ok {
+			return kvs[i].String(), *store, true
+		}
+	}
+	return "", roachpb.ExternalStorage{}, false
 }

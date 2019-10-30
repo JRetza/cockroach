@@ -1,33 +1,31 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tracing
 
 import (
 	"bytes"
 	"fmt"
+	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/net/trace"
-
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/logtags"
 	proto "github.com/gogo/protobuf/proto"
 	"github.com/gogo/protobuf/types"
 	opentracing "github.com/opentracing/opentracing-go"
 	otlog "github.com/opentracing/opentracing-go/log"
 	"github.com/pkg/errors"
+	"golang.org/x/net/trace"
 )
 
 // spanMeta stores span information that is common to span and spanContext.
@@ -110,6 +108,12 @@ type span struct {
 	operation string
 	startTime time.Time
 
+	// startTags are set to the log tags that were available when this span was
+	// created, so that there's no need to eagerly copy all of those log tags
+	// into this span's tags. If the span's tags are actually requested, these
+	// startTags will be copied out at that point.
+	startTags *logtags.Buffer
+
 	// Atomic flag used to avoid taking the mutex in the hot path.
 	recording int32
 
@@ -121,7 +125,10 @@ type span struct {
 		recordingGroup *spanGroup
 		recordingType  RecordingType
 		recordedLogs   []opentracing.LogRecord
-		// tags are only set when recording.
+		// tags are only set when recording. These are tags that have been added to
+		// this span, and will be appended to the tags in startTags when someone
+		// needs to actually observe the total set of tags that is a part of this
+		// span.
 		// TODO(radu): perhaps we want a recording to capture all the tags (even
 		// those that were set before recording started)?
 		tags opentracing.Tags
@@ -170,7 +177,7 @@ func (s *span) enableRecording(group *spanGroup, recType RecordingType) {
 // will be part of the same recording.
 //
 // Recording is not supported by noop spans; to ensure a real span is always
-// created, use the Force option to StartSpan.
+// created, use the Recordable option to StartSpan.
 //
 // If recording was already started on this span (either directly or because a
 // parent span is recording), the old recording is lost.
@@ -179,7 +186,7 @@ func StartRecording(os opentracing.Span, recType RecordingType) {
 		panic("StartRecording called with NoRecording")
 	}
 	if _, noop := os.(*noopSpan); noop {
-		panic("StartRecording called on NoopSpan; use the Force option for StartSpan")
+		panic("StartRecording called on NoopSpan; use the Recordable option for StartSpan")
 	}
 	os.(*span).enableRecording(new(spanGroup), recType)
 }
@@ -220,11 +227,13 @@ func IsRecordable(os opentracing.Span) bool {
 	return isCockroachSpan
 }
 
-// GetRecording retrieves the current recording, if the span has
-// recording enabled. This can be called while spans that are part of the
-// record are still open; it can run concurrently with operations on those
-// spans.
-func GetRecording(os opentracing.Span) []RecordedSpan {
+// Recording represents a group of RecordedSpans, as returned by GetRecording.
+type Recording []RecordedSpan
+
+// GetRecording retrieves the current recording, if the span has recording
+// enabled. This can be called while spans that are part of the record are
+// still open; it can run concurrently with operations on those spans.
+func GetRecording(os opentracing.Span) Recording {
 	if _, noop := os.(*noopSpan); noop {
 		return nil
 	}
@@ -239,6 +248,102 @@ func GetRecording(os opentracing.Span) []RecordedSpan {
 		return nil
 	}
 	return group.getSpans()
+}
+
+type traceLogData struct {
+	opentracing.LogRecord
+	depth int
+}
+
+type traceLogs []traceLogData
+
+func (l traceLogs) Len() int {
+	return len(l)
+}
+
+func (l traceLogs) Less(i, j int) bool {
+	return l[i].Timestamp.Before(l[j].Timestamp)
+}
+
+func (l traceLogs) Swap(i, j int) {
+	l[i], l[j] = l[j], l[i]
+}
+
+// String formats the given spans for human consumption, showing the
+// relationship using nesting and times as both relative to the previous event
+// and cumulative.
+//
+// TODO(andrei): this should be unified with
+// SessionTracing.GenerateSessionTraceVTable.
+func (r Recording) String() string {
+	m := make(map[uint64]*RecordedSpan)
+	for i, sp := range r {
+		m[sp.SpanID] = &r[i]
+	}
+
+	var depth func(uint64) int
+	depth = func(parentID uint64) int {
+		p := m[parentID]
+		if p == nil {
+			return 0
+		}
+		return depth(p.ParentSpanID) + 1
+	}
+
+	var logs traceLogs
+	var start time.Time
+	for _, sp := range r {
+		if sp.ParentSpanID == 0 {
+			start = sp.StartTime
+		}
+		d := depth(sp.ParentSpanID)
+		// Issue a log with the operation name. Include any tags.
+		lr := opentracing.LogRecord{
+			Timestamp: sp.StartTime,
+			Fields:    []otlog.Field{otlog.String("operation", sp.Operation)},
+		}
+		if len(sp.Tags) > 0 {
+			tags := make([]string, 0, len(sp.Tags))
+			for k := range sp.Tags {
+				tags = append(tags, k)
+			}
+			sort.Strings(tags)
+			for _, k := range tags {
+				lr.Fields = append(lr.Fields, otlog.String(k, sp.Tags[k]))
+			}
+		}
+		logs = append(logs, traceLogData{LogRecord: lr, depth: d})
+		for _, l := range sp.Logs {
+			lr := opentracing.LogRecord{
+				Timestamp: l.Time,
+				Fields:    make([]otlog.Field, len(l.Fields)),
+			}
+			for i, f := range l.Fields {
+				lr.Fields[i] = otlog.String(f.Key, f.Value)
+			}
+
+			logs = append(logs, traceLogData{LogRecord: lr, depth: d})
+		}
+	}
+	sort.Sort(logs)
+
+	var buf bytes.Buffer
+	last := start
+	for _, entry := range logs {
+		fmt.Fprintf(&buf, "% 10.3fms % 10.3fms%s",
+			1000*entry.Timestamp.Sub(start).Seconds(),
+			1000*entry.Timestamp.Sub(last).Seconds(),
+			strings.Repeat("    ", entry.depth+1))
+		for i, f := range entry.Fields {
+			if i != 0 {
+				buf.WriteByte(' ')
+			}
+			fmt.Fprintf(&buf, "%s:%v", f.Key(), f.Value())
+		}
+		buf.WriteByte('\n')
+		last = entry.Timestamp
+	}
+	return buf.String()
 }
 
 // ImportRemoteSpans adds RecordedSpan data to the recording of the given span;
@@ -362,17 +467,16 @@ func (s *span) setTagInner(key string, value interface{}, locked bool) opentraci
 	if s.netTr != nil {
 		s.netTr.LazyPrintf("%s:%v", key, value)
 	}
-	if s.isRecording() {
-		if !locked {
-			s.mu.Lock()
-		}
-		if s.mu.tags == nil {
-			s.mu.tags = make(opentracing.Tags)
-		}
-		s.mu.tags[key] = value
-		if !locked {
-			s.mu.Unlock()
-		}
+	// The internal tags will be used if we start a recording on this span.
+	if !locked {
+		s.mu.Lock()
+	}
+	if s.mu.tags == nil {
+		s.mu.tags = make(opentracing.Tags)
+	}
+	s.mu.tags[key] = value
+	if !locked {
+		s.mu.Unlock()
 	}
 	return s
 }
@@ -539,8 +643,18 @@ func (ss *spanGroup) getSpans() []RecordedSpan {
 				rs.Baggage[k] = v
 			}
 		}
-		if len(s.mu.tags) > 0 {
+		if s.startTags != nil {
 			rs.Tags = make(map[string]string)
+			tags := s.startTags.Get()
+			for i := range tags {
+				tag := &tags[i]
+				rs.Tags[tag.Key()] = tag.ValueStr()
+			}
+		}
+		if len(s.mu.tags) > 0 {
+			if rs.Tags == nil {
+				rs.Tags = make(map[string]string)
+			}
 			for k, v := range s.mu.tags {
 				// We encode the tag values as strings.
 				rs.Tags[k] = fmt.Sprint(v)
@@ -590,7 +704,7 @@ func (n *noopSpan) Log(data opentracing.LogData)                           {}
 
 func (n *noopSpan) SetBaggageItem(key, val string) opentracing.Span {
 	if key == Snowball {
-		panic("attempting to set Snowball on a noop span; use the Force option to StartSpan")
+		panic("attempting to set Snowball on a noop span; use the Recordable option to StartSpan")
 	}
 	return n
 }

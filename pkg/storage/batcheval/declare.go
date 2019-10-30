@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package batcheval
 
@@ -23,15 +19,23 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/spanset"
 )
 
-// DefaultDeclareKeys is the default implementation of Command.DeclareKeys
+// DefaultDeclareKeys is the default implementation of Command.DeclareKeys.
 func DefaultDeclareKeys(
-	desc roachpb.RangeDescriptor, header roachpb.Header, req roachpb.Request, spans *spanset.SpanSet,
+	desc *roachpb.RangeDescriptor, header roachpb.Header, req roachpb.Request, spans *spanset.SpanSet,
 ) {
 	if roachpb.IsReadOnly(req) {
-		spans.Add(spanset.SpanReadOnly, req.Header())
+		spans.Add(spanset.SpanReadOnly, req.Header().Span())
 	} else {
-		spans.Add(spanset.SpanReadWrite, req.Header())
+		spans.Add(spanset.SpanReadWrite, req.Header().Span())
 	}
+}
+
+// DeclareKeysForBatch adds all keys that the batch with the provided header
+// touches to the given SpanSet. This does not include keys touched during the
+// processing of the batch's individual commands.
+func DeclareKeysForBatch(
+	desc *roachpb.RangeDescriptor, header roachpb.Header, spans *spanset.SpanSet,
+) {
 	if header.Txn != nil {
 		header.Txn.AssertInitialized(context.TODO())
 		spans.Add(spanset.SpanReadOnly, roachpb.Span{

@@ -1,22 +1,20 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
+	"context"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
@@ -50,6 +48,10 @@ const (
 	plannerStartExecStmt    // Execution starts.
 	plannerEndExecStmt      // Execution ends.
 
+	// Transaction phases.
+	transactionStart // Transaction starts.
+	transactionEnd   // Transaction ends.
+
 	// sessionNumPhases must be listed last so that it can be used to
 	// define arrays sufficiently large to hold all the other values.
 	sessionNumPhases
@@ -64,11 +66,28 @@ type phaseTimes [sessionNumPhases]time.Time
 // EngineMetrics groups a set of SQL metrics.
 type EngineMetrics struct {
 	// The subset of SELECTs that are processed through DistSQL.
-	DistSQLSelectCount    *metric.Counter
+	DistSQLSelectCount *metric.Counter
+	// The subset of queries that are processed by the cost-based optimizer.
+	SQLOptCount *metric.Counter
+	// The subset of queries which we attempted and failed to plan with the
+	// cost-based optimizer.
+	SQLOptFallbackCount   *metric.Counter
+	SQLOptPlanCacheHits   *metric.Counter
+	SQLOptPlanCacheMisses *metric.Counter
+
 	DistSQLExecLatency    *metric.Histogram
 	SQLExecLatency        *metric.Histogram
 	DistSQLServiceLatency *metric.Histogram
 	SQLServiceLatency     *metric.Histogram
+	SQLTxnLatency         *metric.Histogram
+
+	// TxnAbortCount counts transactions that were aborted, either due
+	// to non-retriable errors, or retriable errors when the client-side
+	// retry protocol is not in use.
+	TxnAbortCount *metric.Counter
+
+	// FailureCount counts non-retriable errors in open transactions.
+	FailureCount *metric.Counter
 }
 
 // EngineMetrics implements the metric.Struct interface
@@ -76,6 +95,21 @@ var _ metric.Struct = EngineMetrics{}
 
 // MetricStruct is part of the metric.Struct interface.
 func (EngineMetrics) MetricStruct() {}
+
+func (ex *connExecutor) maybeSavePlan(
+	ctx context.Context, p *planner,
+) *roachpb.ExplainTreePlanNode {
+	if ex.saveLogicalPlanDescription(
+		p.stmt,
+		p.curPlan.flags.IsSet(planFlagDistributed),
+		p.curPlan.flags.IsSet(planFlagOptUsed),
+		p.curPlan.flags.IsSet(planFlagImplicitTxn),
+		p.curPlan.execErr) {
+		// If statement plan sample is requested, collect a sample.
+		return planToTree(ctx, &p.curPlan)
+	}
+	return nil
+}
 
 // recordStatementSummery gathers various details pertaining to the
 // last executed statement/query and performs the associated
@@ -86,19 +120,15 @@ func (EngineMetrics) MetricStruct() {}
 // - result is the result set computed by the query/statement.
 // - err is the error encountered, if any.
 func (ex *connExecutor) recordStatementSummary(
+	ctx context.Context,
 	planner *planner,
-	stmt Statement,
-	distSQLUsed bool,
 	automaticRetryCount int,
 	rowsAffected int,
 	err error,
-	m *EngineMetrics,
+	bytesRead int64,
+	rowsRead int64,
 ) {
-	if ex.stmtCounterDisabled {
-		return
-	}
-
-	phaseTimes := planner.statsCollector.PhaseTimes()
+	phaseTimes := &ex.statsCollector.phaseTimes
 
 	// Compute the run latency. This is always recorded in the
 	// server metrics.
@@ -121,22 +151,27 @@ func (ex *connExecutor) recordStatementSummary(
 	// overhead latency: txn/retry management, error checking, etc
 	execOverhead := svcLat - processingLat
 
+	stmt := planner.stmt
+	flags := planner.curPlan.flags
 	if automaticRetryCount == 0 {
-		if distSQLUsed {
+		ex.updateOptCounters(flags)
+		m := &ex.metrics.EngineMetrics
+		if flags.IsSet(planFlagDistributed) {
 			if _, ok := stmt.AST.(*tree.Select); ok {
 				m.DistSQLSelectCount.Inc(1)
 			}
 			m.DistSQLExecLatency.RecordValue(runLatRaw.Nanoseconds())
 			m.DistSQLServiceLatency.RecordValue(svcLatRaw.Nanoseconds())
-		} else {
-			m.SQLExecLatency.RecordValue(runLatRaw.Nanoseconds())
-			m.SQLServiceLatency.RecordValue(svcLatRaw.Nanoseconds())
 		}
+		m.SQLExecLatency.RecordValue(runLatRaw.Nanoseconds())
+		m.SQLServiceLatency.RecordValue(svcLatRaw.Nanoseconds())
 	}
 
-	planner.statsCollector.RecordStatement(
-		stmt, distSQLUsed, automaticRetryCount, rowsAffected, err,
-		parseLat, planLat, runLat, svcLat, execOverhead,
+	ex.statsCollector.recordStatement(
+		stmt, planner.curPlan.savedPlanForStats,
+		flags.IsSet(planFlagDistributed), flags.IsSet(planFlagOptUsed), flags.IsSet(planFlagImplicitTxn),
+		automaticRetryCount, rowsAffected, err,
+		parseLat, planLat, runLat, svcLat, execOverhead, bytesRead, rowsRead,
 	)
 
 	if log.V(2) {
@@ -144,7 +179,7 @@ func (ex *connExecutor) recordStatementSummary(
 		sessionAge := phaseTimes[plannerEndExecStmt].
 			Sub(phaseTimes[sessionInit]).Seconds()
 
-		log.Infof(planner.EvalContext().Ctx(),
+		log.Infof(ctx,
 			"query stats: %d rows, %d retries, "+
 				"parse %.2fµs (%.1f%%), "+
 				"plan %.2fµs (%.1f%%), "+
@@ -158,5 +193,18 @@ func (ex *connExecutor) recordStatementSummary(
 			execOverhead*1e6, 100*execOverhead/svcLat,
 			sessionAge,
 		)
+	}
+}
+
+func (ex *connExecutor) updateOptCounters(planFlags planFlags) {
+	m := &ex.metrics.EngineMetrics
+	if planFlags.IsSet(planFlagOptUsed) {
+		m.SQLOptCount.Inc(1)
+	}
+
+	if planFlags.IsSet(planFlagOptCacheHit) {
+		m.SQLOptPlanCacheHits.Inc(1)
+	} else if planFlags.IsSet(planFlagOptCacheMiss) {
+		m.SQLOptPlanCacheMisses.Inc(1)
 	}
 }

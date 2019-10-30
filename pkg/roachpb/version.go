@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package roachpb
 
@@ -36,10 +32,19 @@ func (v Version) CanBump(o Version) bool {
 		// placeholder.
 		return false
 	}
+
 	if o.Major == v.Major {
 		return o.Minor <= v.Minor+1
 	}
-	return o.Major == v.Major+1 && o.Minor == 0
+	if o.Major <= 2 {
+		// The semver era, 1.0 to 2.1
+		return o.Major == v.Major+1 && o.Minor == 0
+	} else if v.Major == 2 && o.Major == 19 {
+		// Transitioning from 2.1 to 19.1
+		return v.Minor == 1 && o.Minor == 1
+	}
+	// The calver era, 19.1 and onwards.
+	return o.Major == v.Major+1 && o.Minor == 1
 }
 
 // Less compares two Versions.

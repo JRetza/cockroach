@@ -34,6 +34,26 @@ spawn $argv sql --format=tsv
 eexpect root@
 end_test
 
+start_test "Check that quit terminates the client."
+send "quit\r"
+eexpect eof
+spawn $argv sql --format=tsv
+eexpect root@
+end_test
+
+start_test "Check that quit does not terminate the client in the middle of a statement."
+send "select\rquit\r;\r"
+eexpect "column \"quit\" does not exist"
+eexpect root@
+end_test
+
+start_test "Check that exit terminates the client."
+send "exit\r"
+eexpect eof
+spawn $argv sql --format=tsv
+eexpect root@
+end_test
+
 start_test "Check that \\| reads statements."
 send "\\| echo 'select '; echo '38 + 4;'\r"
 eexpect 42
@@ -79,16 +99,44 @@ start_test "Check that \\set can change the display format"
 send "\\set display_format csv\r\\set\r"
 eexpect "display_format,csv"
 eexpect root@
-send "\\set display_format tsv\r"
+
+send "\\set display_format=tsv\r\\set\r"
+eexpect "display_format\ttsv"
+eexpect root@
 end_test
+
+start_test "Check various ways to set a boolean flag."
+send "\\set show_times=false\r\\set\r"
+eexpect "show_times\tfalse"
+eexpect root@
+send "\\set show_times=true\r\\set\r"
+eexpect "show_times\ttrue"
+eexpect root@
+send "\\set show_times=0\r\\set\r"
+eexpect "show_times\tfalse"
+eexpect root@
+send "\\set show_times=1\r\\set\r"
+eexpect "show_times\ttrue"
+eexpect root@
+send "\\set show_times=off\r\\set\r"
+eexpect "show_times\tfalse"
+eexpect root@
+send "\\set show_times=on\r\\set\r"
+eexpect "show_times\ttrue"
+eexpect root@
+send "\\set show_times=blah\r"
+eexpect "invalid syntax"
+eexpect root@
+end_test
+
 
 start_test "Check that a built-in command in the middle of a token (eg a string) is processed locally."
 send "select 'hello\r"
 eexpect " ->"
 send "\\?\r"
 eexpect " ->"
-send "world';\r"
-eexpect "hello\\\\nworld"
+send "world' as woo;\r"
+eexpect "hello\r\nworld"
 eexpect "Time"
 eexpect root@
 end_test
@@ -98,8 +146,8 @@ start_test "Check that \\set can change the display of query times"
 send "\\unset show_times\r\\set\r"
 eexpect "show_times\tfalse"
 eexpect root@
-send "select 1;\r"
-eexpect "1\r\n1\r\n"
+send "select 1 as woo;\r"
+eexpect "woo\r\n1\r\n"
 expect {
     "Time:" {
 	report "unexpected Time"
@@ -192,12 +240,13 @@ send "PS1=':''/# '\r"
 eexpect ":/# "
 
 start_test "Check that non-interactive built-in commands are only accepted at the start of a statement."
-send "(echo '\\set check_syntax'; echo 'select '; echo '\\help'; echo '1;') | $argv sql\r"
+send "(echo '\\set check_syntax'; echo 'select '; echo '\\help'; echo ';') | $argv sql\r"
 eexpect "statement ignored"
 eexpect ":/# "
 
 send "(echo '\\unset check_syntax'; echo 'select '; echo '\\help'; echo '1;') | $argv sql\r"
-eexpect "pq: syntax error"
+eexpect "pq: at or near"
+eexpect "syntax error"
 eexpect ":/# "
 end_test
 

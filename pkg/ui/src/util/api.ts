@@ -1,9 +1,18 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 /**
  * This module contains all the REST endpoints for communicating with the admin UI.
  */
 
 import _ from "lodash";
-import "whatwg-fetch"; // needed for jsdom?
 import moment from "moment";
 
 import * as protos from "src/js/protos";
@@ -80,9 +89,6 @@ export type RangeLogRequestMessage =
 export type RangeLogResponseMessage =
   protos.cockroach.server.serverpb.RangeLogResponse;
 
-export type CommandQueueRequestMessage = protos.cockroach.server.serverpb.CommandQueueRequest;
-export type CommandQueueResponseMessage = protos.cockroach.server.serverpb.CommandQueueResponse;
-
 export type SettingsRequestMessage = protos.cockroach.server.serverpb.SettingsRequest;
 export type SettingsResponseMessage = protos.cockroach.server.serverpb.SettingsResponse;
 
@@ -92,10 +98,18 @@ export type UserLoginResponseMessage = protos.cockroach.server.serverpb.UserLogi
 export type StoresRequestMessage = protos.cockroach.server.serverpb.StoresRequest;
 export type StoresResponseMessage = protos.cockroach.server.serverpb.StoresResponse;
 
+export type UserLogoutResponseMessage = protos.cockroach.server.serverpb.UserLogoutResponse;
+
+export type StatementsResponseMessage = protos.cockroach.server.serverpb.StatementsResponse;
+
+export type DataDistributionResponseMessage = protos.cockroach.server.serverpb.DataDistributionResponse;
+
+export type EnqueueRangeRequestMessage = protos.cockroach.server.serverpb.EnqueueRangeRequest;
+export type EnqueueRangeResponseMessage = protos.cockroach.server.serverpb.EnqueueRangeResponse;
+
 // API constants
 
 export const API_PREFIX = "_admin/v1";
-export const AUTH_PREFIX = "_auth/v1";
 export const STATUS_PREFIX = "_status";
 
 // HELPER FUNCTIONS
@@ -307,18 +321,17 @@ export function getRangeLog(
   );
 }
 
-// getCommandQueue returns a representation of the command queue for a given range id
-export function getCommandQueue(req: CommandQueueRequestMessage, timeout?: moment.Duration): Promise<CommandQueueResponseMessage> {
-  return timeoutFetch(serverpb.CommandQueueResponse, `${STATUS_PREFIX}/range/${req.range_id}/cmdqueue`, null, timeout);
-}
-
 // getSettings gets all cluster settings
 export function getSettings(_req: SettingsRequestMessage, timeout?: moment.Duration): Promise<SettingsResponseMessage> {
   return timeoutFetch(serverpb.SettingsResponse, `${API_PREFIX}/settings`, null, timeout);
 }
 
 export function userLogin(req: UserLoginRequestMessage, timeout?: moment.Duration): Promise<UserLoginResponseMessage> {
-  return timeoutFetch(serverpb.UserLoginResponse, `${AUTH_PREFIX}/login`, req as any, timeout);
+  return timeoutFetch(serverpb.UserLoginResponse, `login`, req as any, timeout);
+}
+
+export function userLogout(timeout?: moment.Duration): Promise<UserLogoutResponseMessage> {
+  return timeoutFetch(serverpb.UserLogoutResponse, `logout`, null, timeout);
 }
 
 // getStores returns information about a node's stores.
@@ -326,4 +339,16 @@ export function getStores(req: StoresRequestMessage, timeout?: moment.Duration):
   return timeoutFetch(serverpb.StoresResponse, `${STATUS_PREFIX}/stores/${req.node_id}`, null, timeout);
 }
 
-// TODO(vilterp): logout
+// getStatements returns statements the cluster has recently executed, and some stats about them.
+export function getStatements(timeout?: moment.Duration): Promise<StatementsResponseMessage> {
+  return timeoutFetch(serverpb.StatementsResponse, `${STATUS_PREFIX}/statements`, null, timeout);
+}
+
+// getDataDistribution returns information about how replicas are distributed across nodes.
+export function getDataDistribution(timeout?: moment.Duration): Promise<DataDistributionResponseMessage> {
+  return timeoutFetch(serverpb.DataDistributionResponse, `${API_PREFIX}/data_distribution`, null, timeout);
+}
+
+export function enqueueRange(req: EnqueueRangeRequestMessage, timeout?: moment.Duration): Promise<EnqueueRangeResponseMessage> {
+  return timeoutFetch(serverpb.EnqueueRangeResponse, `${API_PREFIX}/enqueue_range`, req as any, timeout);
+}

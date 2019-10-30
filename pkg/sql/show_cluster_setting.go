@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -22,11 +18,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -43,54 +41,59 @@ func (p *planner) showStateMachineSetting(
 	// immediately while at the same time guaranteeing that a node reporting a certain version has
 	// also processed the corresponding Gossip update (which is important as only then does the node
 	// update its persisted state; see #22796).
-	retryCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-	tBegin := timeutil.Now()
-	// The (slight ab)use of WithMaxAttempts achieves convenient context cancellation.
-	if err := retry.WithMaxAttempts(retryCtx, retry.Options{}, math.MaxInt32, func() error {
-		datums, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryRow(
-			ctx, "read-setting",
-			p.txn,
-			"SELECT value FROM system.settings WHERE name = $1", name,
-		)
-		if err != nil {
-			return err
-		}
-		var prevRawVal []byte
-		if len(datums) != 0 {
-			dStr, ok := datums[0].(*tree.DString)
-			if !ok {
-				return errors.New("the existing value is not a string")
-			}
-			prevRawVal = []byte(string(*dStr))
-		}
-		// Note that if no entry is found, we pretend that an entry
-		// exists which is the version used for the running binary. This
-		// may not be 100.00% correct, but it will do. The input is
-		// checked more thoroughly when a user tries to change the
-		// value, and the corresponding sql migration that makes sure
-		// the above select finds something usually runs pretty quickly
-		// when the cluster is bootstrapped.
-		kvRawVal, kvObj, err := s.Validate(&st.SV, prevRawVal, nil)
-		if err != nil {
-			return errors.Errorf("unable to read existing value: %s", err)
-		}
+	if err := contextutil.RunWithTimeout(ctx, fmt.Sprintf("show cluster setting %s", name), 2*time.Minute,
+		func(ctx context.Context) error {
+			tBegin := timeutil.Now()
 
-		// NB: if there is no persisted cluster version yet, this will match
-		// kvRawVal (which is taken from `st.SV` in this case too).
-		gossipRawVal := []byte(s.Get(&st.SV))
+			// The (slight ab)use of WithMaxAttempts achieves convenient context cancellation.
+			return retry.WithMaxAttempts(ctx, retry.Options{}, math.MaxInt32, func() error {
+				return p.execCfg.DB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+					datums, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryRow(
+						ctx, "read-setting",
+						txn,
+						"SELECT value FROM system.settings WHERE name = $1", name,
+					)
+					if err != nil {
+						return err
+					}
+					var prevRawVal []byte
+					if len(datums) != 0 {
+						dStr, ok := datums[0].(*tree.DString)
+						if !ok {
+							return errors.New("the existing value is not a string")
+						}
+						prevRawVal = []byte(string(*dStr))
+					}
+					// Note that if no entry is found, we pretend that an entry
+					// exists which is the version used for the running binary. This
+					// may not be 100.00% correct, but it will do. The input is
+					// checked more thoroughly when a user tries to change the
+					// value, and the corresponding sql migration that makes sure
+					// the above select finds something usually runs pretty quickly
+					// when the cluster is bootstrapped.
+					kvRawVal, kvObj, err := s.Validate(&st.SV, prevRawVal, nil /* update */)
+					if err != nil {
+						return errors.Errorf("unable to read existing value: %s", err)
+					}
 
-		_, gossipObj, err := s.Validate(&st.SV, gossipRawVal, nil)
-		if err != nil {
-			gossipObj = fmt.Sprintf("<error: %s>", err)
-		}
-		if !bytes.Equal(gossipRawVal, kvRawVal) {
-			return errors.Errorf("value differs between gossip (%v) and KV (%v); try again later (%v after %s)", gossipObj, kvObj, retryCtx.Err(), timeutil.Since(tBegin))
-		}
+					// NB: if there is no persisted cluster version yet, this will match
+					// kvRawVal (which is taken from `st.SV` in this case too).
+					gossipRawVal := []byte(s.Get(&st.SV))
 
-		d = tree.NewDString(kvObj.(fmt.Stringer).String())
-		return nil
-	}); err != nil {
+					_, gossipObj, err := s.Validate(&st.SV, gossipRawVal, nil /* update */)
+					if err != nil {
+						gossipObj = fmt.Sprintf("<error: %s>", err)
+					}
+					if !bytes.Equal(gossipRawVal, kvRawVal) {
+						return errors.Errorf("value differs between gossip (%v) and KV (%v); try again later (%v after %s)",
+							gossipObj, kvObj, ctx.Err(), timeutil.Since(tBegin))
+					}
+
+					d = tree.NewDString(kvObj.(fmt.Stringer).String())
+					return nil
+				})
+			})
+		}); err != nil {
 		return nil, err
 	}
 
@@ -101,27 +104,21 @@ func (p *planner) ShowClusterSetting(
 	ctx context.Context, n *tree.ShowClusterSetting,
 ) (planNode, error) {
 
-	if err := p.RequireSuperUser(ctx, "SHOW CLUSTER SETTINGS"); err != nil {
+	if err := p.RequireAdminRole(ctx, "SHOW CLUSTER SETTING"); err != nil {
 		return nil, err
 	}
 
 	name := strings.ToLower(n.Name)
-
-	if name == "all" {
-		return p.delegateQuery(ctx, "SHOW CLUSTER SETTINGS",
-			"TABLE crdb_internal.cluster_settings", nil, nil)
-	}
-
 	st := p.ExecCfg().Settings
 	val, ok := settings.Lookup(name)
 	if !ok {
 		return nil, errors.Errorf("unknown setting: %q", name)
 	}
-	var dType types.T
+	var dType *types.T
 	switch val.(type) {
-	case *settings.IntSetting, *settings.EnumSetting:
+	case *settings.IntSetting:
 		dType = types.Int
-	case *settings.StringSetting, *settings.ByteSizeSetting, *settings.StateMachineSetting:
+	case *settings.StringSetting, *settings.ByteSizeSetting, *settings.StateMachineSetting, *settings.EnumSetting:
 		dType = types.String
 	case *settings.BoolSetting:
 		dType = types.Bool
@@ -155,9 +152,9 @@ func (p *planner) ShowClusterSetting(
 			case *settings.FloatSetting:
 				d = tree.NewDFloat(tree.DFloat(s.Get(&st.SV)))
 			case *settings.DurationSetting:
-				d = &tree.DInterval{Duration: duration.Duration{Nanos: s.Get(&st.SV).Nanoseconds()}}
+				d = &tree.DInterval{Duration: duration.MakeDuration(s.Get(&st.SV).Nanoseconds(), 0, 0)}
 			case *settings.EnumSetting:
-				d = tree.NewDInt(tree.DInt(s.Get(&st.SV)))
+				d = tree.NewDString(s.String(&st.SV))
 			case *settings.ByteSizeSetting:
 				d = tree.NewDString(s.String(&st.SV))
 			default:

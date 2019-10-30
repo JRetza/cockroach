@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package batcheval
 
@@ -30,7 +26,7 @@ func init() {
 }
 
 func declareKeysResolveIntentCombined(
-	desc roachpb.RangeDescriptor, header roachpb.Header, req roachpb.Request, spans *spanset.SpanSet,
+	desc *roachpb.RangeDescriptor, header roachpb.Header, req roachpb.Request, spans *spanset.SpanSet,
 ) {
 	DefaultDeclareKeys(desc, header, req, spans)
 	var status roachpb.TransactionStatus
@@ -49,9 +45,23 @@ func declareKeysResolveIntentCombined(
 }
 
 func declareKeysResolveIntent(
-	desc roachpb.RangeDescriptor, header roachpb.Header, req roachpb.Request, spans *spanset.SpanSet,
+	desc *roachpb.RangeDescriptor, header roachpb.Header, req roachpb.Request, spans *spanset.SpanSet,
 ) {
 	declareKeysResolveIntentCombined(desc, header, req, spans)
+}
+
+func resolveToMetricType(status roachpb.TransactionStatus, poison bool) *result.Metrics {
+	var typ result.Metrics
+	if WriteAbortSpanOnResolve(status) {
+		if poison {
+			typ.ResolvePoison = 1
+		} else {
+			typ.ResolveAbort = 1
+		}
+	} else {
+		typ.ResolveCommit = 1
+	}
+	return &typ
 }
 
 // ResolveIntent resolves a write intent from the specified key
@@ -68,15 +78,21 @@ func ResolveIntent(
 	}
 
 	intent := roachpb.Intent{
-		Span:   args.Span,
+		Span:   args.Span(),
 		Txn:    args.IntentTxn,
 		Status: args.Status,
 	}
 	if err := engine.MVCCResolveWriteIntent(ctx, batch, ms, intent); err != nil {
 		return result.Result{}, err
 	}
+
+	var res result.Result
+	res.Local.Metrics = resolveToMetricType(args.Status, args.Poison)
+
 	if WriteAbortSpanOnResolve(args.Status) {
-		return result.Result{}, SetAbortSpan(ctx, cArgs.EvalCtx, batch, ms, args.IntentTxn, args.Poison)
+		if err := SetAbortSpan(ctx, cArgs.EvalCtx, batch, ms, args.IntentTxn, args.Poison); err != nil {
+			return result.Result{}, err
+		}
 	}
-	return result.Result{}, nil
+	return res, nil
 }

@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 #include "engine.h"
 #include "db.h"
@@ -55,6 +51,22 @@ DBSSTable* DBEngine::GetSSTables(int* n) {
     }
   }
   return tables;
+}
+
+DBStatus DBEngine::GetSortedWALFiles(DBWALFile** out_files, int* n) {
+  rocksdb::VectorLogPtr files;
+  rocksdb::Status s = rep->GetSortedWalFiles(files);
+  if (!s.ok()) {
+    return ToDBStatus(s);
+  }
+  *n = files.size();
+  // We calloc the result so it can be deallocated by the caller using free().
+  *out_files = reinterpret_cast<DBWALFile*>(calloc(files.size(), sizeof(DBWALFile)));
+  for (int i = 0; i < files.size(); i++) {
+    (*out_files)[i].log_number = files[i]->LogNumber();
+    (*out_files)[i].size = files[i]->SizeFileBytes();
+  }
+  return kSuccess;
 }
 
 DBString DBEngine::GetUserProperties() {
@@ -143,6 +155,11 @@ DBStatus DBImpl::Delete(DBKey key) {
   return ToDBStatus(rep->Delete(options, EncodeKey(key)));
 }
 
+DBStatus DBImpl::SingleDelete(DBKey key) {
+  rocksdb::WriteOptions options;
+  return ToDBStatus(rep->SingleDelete(options, EncodeKey(key)));
+}
+
 DBStatus DBImpl::DeleteRange(DBKey start, DBKey end) {
   rocksdb::WriteOptions options;
   return ToDBStatus(
@@ -160,9 +177,9 @@ DBStatus DBImpl::ApplyBatchRepr(DBSlice repr, bool sync) {
 
 DBSlice DBImpl::BatchRepr() { return ToDBSlice("unsupported"); }
 
-DBIterator* DBImpl::NewIter(rocksdb::ReadOptions* read_opts) {
-  DBIterator* iter = new DBIterator(iters);
-  iter->rep.reset(rep->NewIterator(*read_opts));
+DBIterator* DBImpl::NewIter(DBIterOptions iter_opts) {
+  DBIterator* iter = new DBIterator(iters, iter_opts);
+  iter->rep.reset(rep->NewIterator(iter->read_opts));
   return iter;
 }
 
@@ -182,6 +199,9 @@ DBStatus DBImpl::GetStats(DBStatsResult* stats) {
   rep->GetIntProperty("rocksdb.estimate-pending-compaction-bytes",
                       &pending_compaction_bytes_estimate);
 
+  std::string l0_file_count_str;
+  rep->GetProperty("rocksdb.num-files-at-level0", &l0_file_count_str);
+
   stats->block_cache_hits = (int64_t)s->getTickerCount(rocksdb::BLOCK_CACHE_HIT);
   stats->block_cache_misses = (int64_t)s->getTickerCount(rocksdb::BLOCK_CACHE_MISS);
   stats->block_cache_usage = (int64_t)block_cache->GetUsage();
@@ -195,6 +215,50 @@ DBStatus DBImpl::GetStats(DBStatsResult* stats) {
   stats->compactions = (int64_t)event_listener->GetCompactions();
   stats->table_readers_mem_estimate = table_readers_mem_estimate;
   stats->pending_compaction_bytes_estimate = pending_compaction_bytes_estimate;
+  stats->l0_file_count = std::atoi(l0_file_count_str.c_str());
+  return kSuccess;
+}
+
+// `GetTickersAndHistograms` retrieves maps of all RocksDB tickers and histograms.
+// It differs from `GetStats` by getting _every_ ticker and histogram, and by not
+// getting anything else (DB properties, for example).
+//
+// In addition to freeing the `DBString`s in the result, the caller is also
+// responsible for freeing `DBTickersAndHistogramsResult::tickers` and
+// `DBTickersAndHistogramsResult::histograms`.
+DBStatus DBImpl::GetTickersAndHistograms(DBTickersAndHistogramsResult* stats) {
+  const rocksdb::Options& opts = rep->GetOptions();
+  const std::shared_ptr<rocksdb::Statistics>& s = opts.statistics;
+  stats->tickers_len = rocksdb::TickersNameMap.size();
+  // We malloc the result so it can be deallocated by the caller using free().
+  stats->tickers = static_cast<TickerInfo*>(malloc(stats->tickers_len * sizeof(TickerInfo)));
+  if (stats->tickers == nullptr) {
+    return FmtStatus("malloc failed");
+  }
+  for (size_t i = 0; i < stats->tickers_len; ++i) {
+    stats->tickers[i].name = ToDBString(rocksdb::TickersNameMap[i].second);
+    stats->tickers[i].value = s->getTickerCount(static_cast<uint32_t>(i));
+  }
+
+  stats->histograms_len = rocksdb::HistogramsNameMap.size();
+  // We malloc the result so it can be deallocated by the caller using free().
+  stats->histograms =
+      static_cast<HistogramInfo*>(malloc(stats->histograms_len * sizeof(HistogramInfo)));
+  if (stats->histograms == nullptr) {
+    return FmtStatus("malloc failed");
+  }
+  for (size_t i = 0; i < stats->histograms_len; ++i) {
+    stats->histograms[i].name = ToDBString(rocksdb::HistogramsNameMap[i].second);
+    rocksdb::HistogramData data;
+    s->histogramData(static_cast<uint32_t>(i), &data);
+    stats->histograms[i].mean = data.average;
+    stats->histograms[i].p50 = data.median;
+    stats->histograms[i].p95 = data.percentile95;
+    stats->histograms[i].p99 = data.percentile99;
+    stats->histograms[i].max = data.max;
+    stats->histograms[i].count = data.count;
+    stats->histograms[i].sum = data.sum;
+  }
   return kSuccess;
 }
 
@@ -205,20 +269,78 @@ DBString DBImpl::GetCompactionStats() {
 }
 
 DBStatus DBImpl::GetEnvStats(DBEnvStatsResult* stats) {
-  // Always initialize the field to the empty string.
+  // Always initialize the fields.
   stats->encryption_status = DBString();
+  stats->total_files = stats->total_bytes = stats->active_key_files = stats->active_key_bytes = 0;
+  stats->encryption_type = 0;
 
-  if (this->env_mgr->env_stats_handler == nullptr) {
+  if (env_mgr->env_stats_handler == nullptr || env_mgr->file_registry == nullptr) {
+    // We can't compute these if we don't have a file registry or stats handler.
+    // This happens in OSS mode or when encryption has not been turned on.
     return kSuccess;
   }
 
+  // Get encryption algorithm.
+  stats->encryption_type = env_mgr->env_stats_handler->GetActiveStoreKeyType();
+
+  // Get encryption status.
   std::string encryption_status;
-  auto status = this->env_mgr->env_stats_handler->GetEncryptionStats(&encryption_status);
+  auto status = env_mgr->env_stats_handler->GetEncryptionStats(&encryption_status);
   if (!status.ok()) {
     return ToDBStatus(status);
   }
 
   stats->encryption_status = ToDBString(encryption_status);
+
+  // Get file statistics.
+  FileStats file_stats(env_mgr.get());
+  status = file_stats.GetFiles(rep);
+  if (!status.ok()) {
+    return ToDBStatus(status);
+  }
+
+  // Get current active key ID.
+  auto active_key_id = env_mgr->env_stats_handler->GetActiveDataKeyID();
+
+  // Request stats for the Data env only.
+  status = file_stats.GetStatsForEnvAndKey(enginepb::Data, active_key_id, stats);
+  if (!status.ok()) {
+    return ToDBStatus(status);
+  }
+
+  return kSuccess;
+}
+
+DBStatus DBImpl::GetEncryptionRegistries(DBEncryptionRegistries* result) {
+  // Always initialize the fields.
+  result->file_registry = DBString();
+  result->key_registry = DBString();
+
+  if (env_mgr->env_stats_handler == nullptr || env_mgr->file_registry == nullptr) {
+    // We can't compute these if we don't have a file registry or stats handler.
+    // This happens in OSS mode or when encryption has not been turned on.
+    return kSuccess;
+  }
+
+  auto file_registry = env_mgr->file_registry->GetFileRegistry();
+  if (file_registry == nullptr) {
+    return ToDBStatus(rocksdb::Status::InvalidArgument("file registry has not been loaded"));
+  }
+
+  std::string serialized_file_registry;
+  if (!file_registry->SerializeToString(&serialized_file_registry)) {
+    return ToDBStatus(rocksdb::Status::InvalidArgument("failed to serialize file registry proto"));
+  }
+
+  std::string serialized_key_registry;
+  auto status = env_mgr->env_stats_handler->GetEncryptionRegistry(&serialized_key_registry);
+  if (!status.ok()) {
+    return ToDBStatus(status);
+  }
+
+  result->file_registry = ToDBString(serialized_file_registry);
+  result->key_registry = ToDBString(serialized_key_registry);
+
   return kSuccess;
 }
 
@@ -227,7 +349,7 @@ DBStatus DBImpl::EnvWriteFile(DBSlice path, DBSlice contents) {
   rocksdb::Status s;
 
   const rocksdb::EnvOptions soptions;
-  rocksdb::unique_ptr<rocksdb::WritableFile> destfile;
+  std::unique_ptr<rocksdb::WritableFile> destfile;
   s = this->rep->GetEnv()->NewWritableFile(ToString(path), &destfile, soptions);
   if (!s.ok()) {
     return ToDBStatus(s);
@@ -245,7 +367,7 @@ DBStatus DBImpl::EnvWriteFile(DBSlice path, DBSlice contents) {
 DBStatus DBImpl::EnvOpenFile(DBSlice path, rocksdb::WritableFile** file) {
   rocksdb::Status status;
   const rocksdb::EnvOptions soptions;
-  rocksdb::unique_ptr<rocksdb::WritableFile> rocksdb_file;
+  std::unique_ptr<rocksdb::WritableFile> rocksdb_file;
 
   // Create the file.
   status = this->rep->GetEnv()->NewWritableFile(ToString(path), &rocksdb_file, soptions);
@@ -259,7 +381,7 @@ DBStatus DBImpl::EnvOpenFile(DBSlice path, rocksdb::WritableFile** file) {
 // EnvReadFile reads the content of the given filename.
 DBStatus DBImpl::EnvReadFile(DBSlice path, DBSlice* contents) {
   rocksdb::Status status;
-  std::string data;  
+  std::string data;
 
   status = ReadFileToString(this->rep->GetEnv(), ToString(path), &data);
   if (!status.ok()) {
@@ -293,13 +415,38 @@ DBStatus DBImpl::EnvSyncFile(rocksdb::WritableFile* file) {
   return ToDBStatus(status);
 }
 
-// EnvDelete deletes the file with the given filename.
+// EnvDeleteFile deletes the file with the given filename.
 DBStatus DBImpl::EnvDeleteFile(DBSlice path) {
   rocksdb::Status status = this->rep->GetEnv()->DeleteFile(ToString(path));
   if (status.IsNotFound()) {
     return FmtStatus("No such file or directory");
   }
   return ToDBStatus(status);
+}
+
+// EnvDeleteDirAndFiles deletes the directory with the given dir name and any
+// files it contains but not subdirectories.
+DBStatus DBImpl::EnvDeleteDirAndFiles(DBSlice dir) {
+  rocksdb::Status status;
+
+  std::vector<std::string> files;
+  this->rep->GetEnv()->GetChildren(ToString(dir), &files);
+  for (auto& file : files) {
+    if (file != "." && file != "..") {
+      this->rep->GetEnv()->DeleteFile(ToString(dir) + "/" + file);
+    }
+  }
+
+  status = this->rep->GetEnv()->DeleteDir(ToString(dir));
+  if (status.IsNotFound()) {
+    return FmtStatus("No such file or directory");
+  }
+  return ToDBStatus(status);
+}
+
+// EnvLinkFile creates 'newname' as a hard link to 'oldname'.
+DBStatus DBImpl::EnvLinkFile(DBSlice oldname, DBSlice newname) {
+  return ToDBStatus(this->rep->GetEnv()->LinkFile(ToString(oldname), ToString(newname)));
 }
 
 }  // namespace cockroach

@@ -18,28 +18,32 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/importccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
-	"github.com/pkg/errors"
-	yaml "gopkg.in/yaml.v2"
-
-	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/gogo/protobuf/proto"
+	"github.com/pkg/errors"
+	yaml "gopkg.in/yaml.v2"
 )
 
 // partitioningTest represents a single test case used in the various
@@ -104,39 +108,40 @@ type repartitioningTest struct {
 }
 
 // parse fills in the various fields of `partitioningTest.parsed`.
-func (t *partitioningTest) parse() error {
-	if t.parsed.parsed {
+func (pt *partitioningTest) parse() error {
+	if pt.parsed.parsed {
 		return nil
 	}
 
-	t.parsed.tableName = tree.NameStringP(&t.name)
-	t.parsed.createStmt = fmt.Sprintf(t.schema, t.parsed.tableName)
+	pt.parsed.tableName = tree.NameStringP(&pt.name)
+	pt.parsed.createStmt = fmt.Sprintf(pt.schema, pt.parsed.tableName)
 
 	{
 		ctx := context.Background()
-		stmt, err := parser.ParseOne(t.parsed.createStmt)
+		stmt, err := parser.ParseOne(pt.parsed.createStmt)
 		if err != nil {
-			return errors.Wrapf(err, `parsing %s`, t.parsed.createStmt)
+			return errors.Wrapf(err, `parsing %s`, pt.parsed.createStmt)
 		}
-		createTable, ok := stmt.(*tree.CreateTable)
+		createTable, ok := stmt.AST.(*tree.CreateTable)
 		if !ok {
 			return errors.Errorf("expected *tree.CreateTable got %T", stmt)
 		}
 		st := cluster.MakeTestingClusterSettings()
 		const parentID, tableID = keys.MinUserDescID, keys.MinUserDescID + 1
-		t.parsed.tableDesc, err = importccl.MakeSimpleTableDescriptor(
-			ctx, st, createTable, parentID, tableID, hlc.UnixNano())
+		mutDesc, err := importccl.MakeSimpleTableDescriptor(
+			ctx, st, createTable, parentID, tableID, importccl.NoFKs, hlc.UnixNano())
 		if err != nil {
 			return err
 		}
-		if err := t.parsed.tableDesc.ValidateTable(st); err != nil {
+		pt.parsed.tableDesc = mutDesc.TableDesc()
+		if err := pt.parsed.tableDesc.ValidateTable(); err != nil {
 			return err
 		}
 	}
 
 	var zoneConfigStmts bytes.Buffer
 	// TODO(dan): Can we run all the zoneConfigStmts in a txn?
-	for _, c := range t.configs {
+	for _, c := range pt.configs {
 		var subzoneShort, constraints string
 		configParts := strings.Split(c, `:`)
 		switch len(configParts) {
@@ -148,30 +153,40 @@ func (t *partitioningTest) parse() error {
 			panic(errors.Errorf("unsupported config: %s", c))
 		}
 
+		var indexName string
 		var subzone config.Subzone
-		if strings.HasPrefix(subzoneShort, "@") {
-			idxDesc, _, err := t.parsed.tableDesc.FindIndexByName(subzoneShort[1:])
-			if err != nil {
-				return errors.Wrapf(err, "could not find index %s", subzoneShort)
+		subzoneParts := strings.Split(subzoneShort, ".")
+		switch len(subzoneParts) {
+		case 1:
+			indexName = subzoneParts[0]
+		case 2:
+			if subzoneParts[0] == "" {
+				indexName = "@primary"
+			} else {
+				indexName = subzoneParts[0]
 			}
-			subzone.IndexID = uint32(idxDesc.ID)
-			if len(constraints) > 0 {
+			subzone.PartitionName = subzoneParts[1]
+		default:
+			panic(errors.Errorf("unsupported config: %s", c))
+		}
+		if !strings.HasPrefix(indexName, "@") {
+			panic(errors.Errorf("unsupported config: %s", c))
+		}
+		idxDesc, _, err := pt.parsed.tableDesc.FindIndexByName(indexName[1:])
+		if err != nil {
+			return errors.Wrapf(err, "could not find index %s", indexName)
+		}
+		subzone.IndexID = uint32(idxDesc.ID)
+		if len(constraints) > 0 {
+			if subzone.PartitionName == "" {
 				fmt.Fprintf(&zoneConfigStmts,
-					`ALTER INDEX %s@%s EXPERIMENTAL CONFIGURE ZONE 'constraints: [%s]';`,
-					t.parsed.tableName, idxDesc.Name, constraints,
+					`ALTER INDEX %s@%s CONFIGURE ZONE USING constraints = '[%s]';`,
+					pt.parsed.tableName, idxDesc.Name, constraints,
 				)
-			}
-		} else if strings.HasPrefix(subzoneShort, ".") {
-			subzone.PartitionName = subzoneShort[1:]
-			_, index, err := t.parsed.tableDesc.FindNonDropPartitionByName(subzone.PartitionName)
-			if err != nil {
-				return err
-			}
-			subzone.IndexID = uint32(index.ID)
-			if len(constraints) > 0 {
+			} else {
 				fmt.Fprintf(&zoneConfigStmts,
-					`ALTER PARTITION %s OF TABLE %s EXPERIMENTAL CONFIGURE ZONE 'constraints: [%s]';`,
-					subzone.PartitionName, t.parsed.tableName, constraints,
+					`ALTER PARTITION %s OF INDEX %s@%s CONFIGURE ZONE USING constraints = '[%s]';`,
+					subzone.PartitionName, pt.parsed.tableName, idxDesc.Name, constraints,
 				)
 			}
 		}
@@ -180,12 +195,13 @@ func (t *partitioningTest) parse() error {
 		if err := yaml.UnmarshalStrict([]byte("["+constraints+"]"), &parsedConstraints); err != nil {
 			return errors.Wrapf(err, "parsing constraints: %s", constraints)
 		}
-		subzone.Config.Constraints = ([]config.Constraints)(parsedConstraints)
+		subzone.Config.Constraints = parsedConstraints.Constraints
+		subzone.Config.InheritedConstraints = parsedConstraints.Inherited
 
-		t.parsed.subzones = append(t.parsed.subzones, subzone)
+		pt.parsed.subzones = append(pt.parsed.subzones, subzone)
 	}
-	t.parsed.zoneConfigStmts = zoneConfigStmts.String()
-	t.parsed.parsed = true
+	pt.parsed.zoneConfigStmts = zoneConfigStmts.String()
+	pt.parsed.parsed = true
 
 	return nil
 }
@@ -193,12 +209,14 @@ func (t *partitioningTest) parse() error {
 // verifyScansFn returns a closure that runs the test's `scans` and returns a
 // descriptive error if any of them fail. It is not required for `parse` to have
 // been called.
-func (t *partitioningTest) verifyScansFn(ctx context.Context, db *gosql.DB) func() error {
+func (pt *partitioningTest) verifyScansFn(
+	ctx context.Context, t *testing.T, db *gosql.DB,
+) func() error {
 	return func() error {
-		for where, expectedNodes := range t.scans {
-			query := fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE %s`, tree.NameStringP(&t.name), where)
+		for where, expectedNodes := range pt.scans {
+			query := fmt.Sprintf(`SELECT count(*) FROM %s WHERE %s`, tree.NameStringP(&pt.name), where)
 			log.Infof(ctx, "query: %s", query)
-			if err := verifyScansOnNode(db, query, expectedNodes); err != nil {
+			if err := verifyScansOnNode(ctx, t, db, query, expectedNodes); err != nil {
 				if log.V(1) {
 					log.Errorf(ctx, "scan verification failed: %s", err)
 				}
@@ -759,7 +777,7 @@ func allPartitioningTests(rng *rand.Rand) []partitioningTest {
 				PARTITION p3 VALUES IN (3),
 				PARTITION p4 VALUES IN (4)
 			))`,
-			configs: []string{`@b_idx:+n1`, `.p3:+n2`, `.p4:+n3`},
+			configs: []string{`@b_idx:+n1`, `@b_idx.p3:+n2`, `@b_idx.p4:+n3`},
 			generatedSpans: []string{
 				`@b_idx /2-/2/3`,
 				`   .p3 /2/3-/2/4`,
@@ -777,7 +795,7 @@ func allPartitioningTests(rng *rand.Rand) []partitioningTest {
 				PARTITION p5 VALUES IN (5),
 				PARTITION pd VALUES IN (DEFAULT)
 			))`,
-			configs: []string{`@b_idx`, `.p4:+n2`, `.p5:+n3`, `.pd:+n1`},
+			configs: []string{`@b_idx`, `@b_idx.p4:+n2`, `@b_idx.p5:+n3`, `@b_idx.pd:+n1`},
 			generatedSpans: []string{
 				`.pd /2-/2/4`,
 				`.p4 /2/4-/2/5`,
@@ -792,7 +810,7 @@ func allPartitioningTests(rng *rand.Rand) []partitioningTest {
 				PARTITION pl1 VALUES IN (NULL, 1),
 				PARTITION p3  VALUES IN (3)
 			))`,
-			configs: []string{`@b_idx:+n1`, `.pl1:+n2`, `.p3:+n3`},
+			configs: []string{`@b_idx:+n1`, `@b_idx.pl1:+n2`, `@b_idx.p3:+n3`},
 			generatedSpans: []string{
 				`@b_idx /2-/2/NULL`,
 				`  .pl1 /2/NULL-/2/!NULL`,
@@ -842,31 +860,30 @@ func allPartitioningTests(rng *rand.Rand) []partitioningTest {
 	}
 
 	const schemaFmt = `CREATE TABLE %%s (a %s PRIMARY KEY) PARTITION BY LIST (a) (PARTITION p VALUES IN (%s))`
-	for semTypeID, semTypeName := range sqlbase.ColumnType_SemanticType_name {
-		typ := sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_SemanticType(semTypeID)}
-		colType := semTypeName
-		switch typ.SemanticType {
-		case sqlbase.ColumnType_COLLATEDSTRING:
-			typ.Locale = sqlbase.RandCollationLocale(rng)
-			colType = fmt.Sprintf(`STRING COLLATE %s`, *typ.Locale)
-		case sqlbase.ColumnType_JSON:
+	for _, typ := range append(types.Scalar, types.AnyCollatedString) {
+		switch typ.Family() {
+		case types.JsonFamily:
 			// Not indexable.
 			continue
+		case types.CollatedStringFamily:
+			typ = types.MakeCollatedString(types.String, *sqlbase.RandCollationLocale(rng))
 		}
 		datum := sqlbase.RandDatum(rng, typ, false /* nullOk */)
 		if datum == tree.DNull {
-			// DNull is returned by RandDatum for ColumnType_NULL or if the
+			// DNull is returned by RandDatum for types.UNKNOWN or if the
 			// column type is unimplemented in RandDatum. In either case, the
 			// correct thing to do is skip this one.
 			continue
 		}
 		serializedDatum := tree.Serialize(datum)
+		// name can be "char" (with quotes), so needs to be escaped.
+		escapedName := fmt.Sprintf("%s_table", strings.Replace(typ.String(), "\"", "", -1))
 		// schema is used in a fmt.Sprintf to fill in the table name, so we have
 		// to escape any stray %s.
 		escapedDatum := strings.Replace(serializedDatum, `%`, `%%`, -1)
 		test := partitioningTest{
-			name:    semTypeName,
-			schema:  fmt.Sprintf(schemaFmt, colType, escapedDatum),
+			name:    escapedName,
+			schema:  fmt.Sprintf(schemaFmt, typ.SQLString(), escapedDatum),
 			configs: []string{`@primary:+n1`, `.p:+n2`},
 			scans: map[string]string{
 				fmt.Sprintf(`a < %s`, serializedDatum):    `n1`,
@@ -1053,28 +1070,40 @@ func allRepartitioningTests(partitioningTests []partitioningTest) ([]repartition
 	return tests, nil
 }
 
-func verifyScansOnNode(db *gosql.DB, query string, node string) error {
+func verifyScansOnNode(
+	ctx context.Context, t *testing.T, db *gosql.DB, query string, node string,
+) error {
 	// TODO(dan): This is a stopgap. At some point we should have a syntax for
 	// doing this directly (running a query and getting back the nodes it ran on
 	// and attributes/localities of those nodes). Users will also want this to
 	// be sure their partitioning is working.
-	rows, err := db.Query(
-		fmt.Sprintf(`SELECT CONCAT(tag, ' ', message) FROM [SHOW TRACE FOR %s]`, query),
-	)
+	conn, err := db.Conn(ctx)
 	if err != nil {
-		return err
+		t.Fatalf("failed to create conn: %v", err)
 	}
+	sqlDB := sqlutils.MakeSQLRunner(conn)
+	defer func() { _ = conn.Close() }()
+	sqlDB.Exec(t, fmt.Sprintf(`SET tracing = on; %s; SET tracing = off`, query))
+	rows := sqlDB.Query(t, `SELECT concat(tag, ' ', message) FROM [SHOW TRACE FOR SESSION]`)
 	defer rows.Close()
 	var scansWrongNode []string
 	var traceLines []string
 	var traceLine gosql.NullString
 	for rows.Next() {
 		if err := rows.Scan(&traceLine); err != nil {
-			return err
+			t.Fatal(err)
 		}
 		traceLines = append(traceLines, traceLine.String)
-		if strings.Contains(traceLine.String, "read completed") && !strings.Contains(traceLine.String, node) {
-			scansWrongNode = append(scansWrongNode, traceLine.String)
+		if strings.Contains(traceLine.String, "read completed") {
+			if strings.Contains(traceLine.String, "SystemCon") {
+				// Ignore trace lines for the system config range (abbreviated as
+				// "SystemCon" in pretty printing of the range descriptor). A read might
+				// be performed to the system config range to update the table lease.
+				continue
+			}
+			if !strings.Contains(traceLine.String, node) {
+				scansWrongNode = append(scansWrongNode, traceLine.String)
+			}
 		}
 	}
 	if len(scansWrongNode) > 0 {
@@ -1090,13 +1119,24 @@ func verifyScansOnNode(db *gosql.DB, query string, node string) error {
 	return nil
 }
 
-func setupPartitioningTestCluster(ctx context.Context, t testing.TB) (*sqlutils.SQLRunner, func()) {
+func setupPartitioningTestCluster(
+	ctx context.Context, t testing.TB,
+) (*gosql.DB, *sqlutils.SQLRunner, func()) {
 	cfg := config.DefaultZoneConfig()
-	cfg.NumReplicas = 1
-	resetZoneConfig := config.TestingSetDefaultZoneConfig(cfg)
+	cfg.NumReplicas = proto.Int32(1)
 
 	tsArgs := func(attr string) base.TestServerArgs {
 		return base.TestServerArgs{
+			Knobs: base.TestingKnobs{
+				Store: &storage.StoreTestingKnobs{
+					// Disable LBS because when the scan is happening at the rate it's happening
+					// below, it's possible that one of the system ranges trigger a split.
+					DisableLoadBasedSplitting: true,
+				},
+				Server: &server.TestingKnobs{
+					DefaultZoneConfigOverride: &cfg,
+				},
+			},
 			ScanInterval: 100 * time.Millisecond,
 			StoreSpecs: []base.StoreSpec{
 				{InMemory: true, Attributes: roachpb.Attributes{Attrs: []string{attr}}},
@@ -1118,23 +1158,28 @@ func setupPartitioningTestCluster(ctx context.Context, t testing.TB) (*sqlutils.
 	sqlDB.Exec(t, `SET CLUSTER SETTING server.declined_reservation_timeout = '0s'`)
 	sqlDB.Exec(t, `SET CLUSTER SETTING server.failed_reservation_timeout = '0s'`)
 
-	// Make sure all stores are present in the NodeStatus endpoint or else zone
-	// config changes may flake (#25488).
-	tc.WaitForNodeStatuses(t)
-
-	return sqlDB, func() {
+	return tc.Conns[0], sqlDB, func() {
 		tc.Stopper().Stop(context.Background())
-		resetZoneConfig()
 	}
 }
 
 func TestInitialPartitioning(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+
+	// This test configures many sub-tests and is too slow to run under nightly
+	// race stress.
+	if testutils.NightlyStress() && util.RaceEnabled {
+		t.Skip("too big for nightly stress race")
+	}
+	if testing.Short() {
+		t.Skip("short")
+	}
+
 	rng, _ := randutil.NewPseudoRand()
 	testCases := allPartitioningTests(rng)
 
 	ctx := context.Background()
-	sqlDB, cleanup := setupPartitioningTestCluster(ctx, t)
+	db, sqlDB, cleanup := setupPartitioningTestCluster(ctx, t)
 	defer cleanup()
 
 	for _, test := range testCases {
@@ -1148,7 +1193,7 @@ func TestInitialPartitioning(t *testing.T) {
 			sqlDB.Exec(t, test.parsed.createStmt)
 			sqlDB.Exec(t, test.parsed.zoneConfigStmts)
 
-			testutils.SucceedsSoon(t, test.verifyScansFn(ctx, sqlDB.DB))
+			testutils.SucceedsSoon(t, test.verifyScansFn(ctx, t, db))
 		})
 	}
 }
@@ -1181,15 +1226,15 @@ func TestSelectPartitionExprs(t *testing.T) {
 		// expr is the expected output
 		expr string
 	}{
-		{`p33p44`, `(a, b) IN ((3, 3), (4, 4))`},
-		{`p335p445`, `(a, b, c) IN ((3, 3, 5), (4, 4, 5))`},
-		{`p33dp44d`, `(((a, b) IN ((3, 3))) AND ((a, b, c) != (3, 3, 5))) OR (((a, b) IN ((4, 4))) AND ((a, b, c) != (4, 4, 5)))`},
+		{`p33p44`, `((a, b) = (3, 3)) OR ((a, b) = (4, 4))`},
+		{`p335p445`, `((a, b, c) = (3, 3, 5)) OR ((a, b, c) = (4, 4, 5))`},
+		{`p33dp44d`, `(((a, b) = (3, 3)) AND (NOT ((a, b, c) = (3, 3, 5)))) OR (((a, b) = (4, 4)) AND (NOT ((a, b, c) = (4, 4, 5))))`},
 		// NB See the TODO in the impl for why this next case has some clearly
 		// unrelated `!=`s.
-		{`p6d`, `((a) IN ((6))) AND (((a, b) != (3, 3)) AND ((a, b) != (4, 4)))`},
-		{`pdd`, `((a, b) != (3, 3)) AND (((a, b) != (4, 4)) AND ((a) != (6)))`},
+		{`p6d`, `((a,) = (6,)) AND (NOT (((a, b) = (3, 3)) OR ((a, b) = (4, 4))))`},
+		{`pdd`, `NOT ((((a, b) = (3, 3)) OR ((a, b) = (4, 4))) OR ((a,) = (6,)))`},
 
-		{`p335p445,p6d`, `((a, b, c) IN ((3, 3, 5), (4, 4, 5))) OR (((a) IN ((6))) AND (((a, b) != (3, 3)) AND ((a, b) != (4, 4))))`},
+		{`p335p445,p6d`, `(((a, b, c) = (3, 3, 5)) OR ((a, b, c) = (4, 4, 5))) OR (((a,) = (6,)) AND (NOT (((a, b) = (3, 3)) OR ((a, b) = (4, 4)))))`},
 
 		// TODO(dan): The expression simplification in this method is all done
 		// by our normal SQL expression simplification code. Seems like it could
@@ -1198,9 +1243,9 @@ func TestSelectPartitionExprs(t *testing.T) {
 		// because for every requested partition, all descendent partitions are
 		// omitted, which is an optimization to save a little work with the side
 		// benefit of making more of these what we want.
-		{`p335p445,p33dp44d`, `((a, b, c) IN ((3, 3, 5), (4, 4, 5))) OR ((((a, b) IN ((4, 4))) AND ((a, b, c) != (4, 4, 5))) OR (((a, b) IN ((3, 3))) AND ((a, b, c) != (3, 3, 5))))`},
-		{`p33p44,p335p445`, `(a, b) IN ((3, 3), (4, 4))`},
-		{`p33p44,p335p445,p33dp44d`, `(a, b) IN ((3, 3), (4, 4))`},
+		{`p335p445,p33dp44d`, `(((a, b, c) = (3, 3, 5)) OR ((a, b, c) = (4, 4, 5))) OR ((((a, b) = (3, 3)) AND (NOT ((a, b, c) = (3, 3, 5)))) OR (((a, b) = (4, 4)) AND (NOT ((a, b, c) = (4, 4, 5)))))`},
+		{`p33p44,p335p445`, `((a, b) = (3, 3)) OR ((a, b) = (4, 4))`},
+		{`p33p44,p335p445,p33dp44d`, `((a, b) = (3, 3)) OR ((a, b) = (4, 4))`},
 	}
 
 	evalCtx := &tree.EvalContext{}
@@ -1231,6 +1276,12 @@ func TestSelectPartitionExprs(t *testing.T) {
 func TestRepartitioning(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
+	// This test configures many sub-tests and is too slow to run under nightly
+	// race stress.
+	if testutils.NightlyStress() && util.RaceEnabled {
+		t.Skip()
+	}
+
 	rng, _ := randutil.NewPseudoRand()
 	testCases, err := allRepartitioningTests(allPartitioningTests(rng))
 	if err != nil {
@@ -1238,7 +1289,7 @@ func TestRepartitioning(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	sqlDB, cleanup := setupPartitioningTestCluster(ctx, t)
+	db, sqlDB, cleanup := setupPartitioningTestCluster(ctx, t)
 	defer cleanup()
 
 	for _, test := range testCases {
@@ -1253,7 +1304,7 @@ func TestRepartitioning(t *testing.T) {
 				sqlDB.Exec(t, test.old.parsed.createStmt)
 				sqlDB.Exec(t, test.old.parsed.zoneConfigStmts)
 
-				testutils.SucceedsSoon(t, test.old.verifyScansFn(ctx, sqlDB.DB))
+				testutils.SucceedsSoon(t, test.old.verifyScansFn(ctx, t, db))
 			}
 
 			{
@@ -1277,15 +1328,13 @@ func TestRepartitioning(t *testing.T) {
 					repartition.WriteString(`PARTITION BY NOTHING`)
 				} else {
 					if err := sql.ShowCreatePartitioning(
-						&sqlbase.DatumAlloc{}, test.new.parsed.tableDesc, &testIndex,
+						&sqlbase.DatumAlloc{}, test.new.parsed.tableDesc, testIndex,
 						&testIndex.Partitioning, &repartition, 0 /* indent */, 0, /* colOffset */
 					); err != nil {
 						t.Fatalf("%+v", err)
 					}
 				}
-				if _, err := sqlDB.DB.Exec(repartition.String()); err != nil {
-					t.Fatalf("%s: %+v", repartition.String(), err)
-				}
+				sqlDB.Exec(t, repartition.String())
 
 				// Verify that repartitioning removes zone configs for partitions that
 				// have been removed.
@@ -1293,26 +1342,11 @@ func TestRepartitioning(t *testing.T) {
 				for _, name := range test.new.parsed.tableDesc.PartitionNames() {
 					newPartitionNames[name] = struct{}{}
 				}
-				rows := sqlDB.QueryStr(t, "SELECT cli_specifier FROM [EXPERIMENTAL SHOW ALL ZONE CONFIGURATIONS] WHERE cli_specifier IS NOT NULL")
-				for _, row := range rows {
-					zs, err := config.ParseCLIZoneSpecifier(row[0])
-					if err != nil {
-						t.Fatal(err)
-					}
-					if !zs.TargetsTable() {
-						// Ignore zone configs that target databases or system ranges.
-						continue
-					}
-					tn, err := zs.TableOrIndex.Table.Normalize()
-					if err != nil {
-						t.Fatal(err)
-					}
-					if tn.Table() != test.new.parsed.tableDesc.Name || zs.Partition == "" {
-						// Ignore zone configs that do not target a partition of this table.
-						continue
-					}
-					if _, ok := newPartitionNames[string(zs.Partition)]; !ok {
-						t.Errorf("zone config for removed partition %q exists after repartitioning", zs.Partition)
+				for _, row := range sqlDB.QueryStr(
+					t, "SELECT partition_name FROM crdb_internal.zones WHERE partition_name IS NOT NULL") {
+					partitionName := row[0]
+					if _, ok := newPartitionNames[partitionName]; !ok {
+						t.Errorf("zone config for removed partition %q exists after repartitioning", partitionName)
 					}
 				}
 
@@ -1322,8 +1356,7 @@ func TestRepartitioning(t *testing.T) {
 				// sitting around (e.g., when a repartitioning preserves a partition but
 				// does not apply a new zone config). This is fine.
 				sqlDB.Exec(t, test.new.parsed.zoneConfigStmts)
-
-				testutils.SucceedsSoon(t, test.new.verifyScansFn(ctx, sqlDB.DB))
+				testutils.SucceedsSoon(t, test.new.verifyScansFn(ctx, t, db))
 			}
 		})
 	}
@@ -1348,39 +1381,38 @@ func TestRemovePartitioningExpiredLicense(t *testing.T) {
 	sqlDB.Exec(t, `CREATE INDEX i ON t (a) PARTITION BY RANGE (a) (
 		PARTITION p34 VALUES FROM (3) TO (4)
 	)`)
-	sqlDB.Exec(t, `ALTER PARTITION p1 OF TABLE t EXPERIMENTAL CONFIGURE ZONE ''`)
-	sqlDB.Exec(t, `ALTER PARTITION p34 OF TABLE t EXPERIMENTAL CONFIGURE ZONE ''`)
-	sqlDB.Exec(t, `ALTER INDEX t@primary EXPERIMENTAL CONFIGURE ZONE ''`)
-	sqlDB.Exec(t, `ALTER INDEX t@i EXPERIMENTAL CONFIGURE ZONE ''`)
+	sqlDB.Exec(t, `ALTER PARTITION p1 OF TABLE t CONFIGURE ZONE USING DEFAULT`)
+	sqlDB.Exec(t, `ALTER PARTITION p34 OF INDEX t@i CONFIGURE ZONE USING DEFAULT`)
+	sqlDB.Exec(t, `ALTER INDEX t@primary CONFIGURE ZONE USING DEFAULT`)
+	sqlDB.Exec(t, `ALTER INDEX t@i CONFIGURE ZONE USING DEFAULT`)
 
 	// Remove the enterprise license.
 	defer utilccl.TestingDisableEnterprise()()
 
-	expectLicenseErr := func(q string) {
+	const partitionErr = "use of partitions requires an enterprise license"
+	const zoneErr = "use of replication zones on indexes or partitions requires an enterprise license"
+	expectErr := func(q string, expErr string) {
 		t.Helper()
-		const expErr = "use of partitions requires an enterprise license"
-		if _, err := sqlDB.DB.Exec(q); !testutils.IsError(err, expErr) {
-			t.Fatalf("expected error %q, but got %+v", expErr, err)
-		}
+		sqlDB.ExpectErr(t, expErr, q)
 	}
 
 	// Partitions and zone configs cannot be modified without a valid license.
-	expectLicenseErr(`ALTER TABLE t PARTITION BY LIST (a) (PARTITION p2 VALUES IN (2))`)
-	expectLicenseErr(`ALTER INDEX t@i PARTITION BY RANGE (a) (PARTITION p45 VALUES FROM (4) TO (5))`)
-	expectLicenseErr(`ALTER PARTITION p1 OF TABLE t EXPERIMENTAL CONFIGURE ZONE ''`)
-	expectLicenseErr(`ALTER PARTITION p34 OF TABLE t EXPERIMENTAL CONFIGURE ZONE ''`)
-	expectLicenseErr(`ALTER INDEX t@primary EXPERIMENTAL CONFIGURE ZONE ''`)
-	expectLicenseErr(`ALTER INDEX t@i EXPERIMENTAL CONFIGURE ZONE ''`)
+	expectErr(`ALTER TABLE t PARTITION BY LIST (a) (PARTITION p2 VALUES IN (2))`, partitionErr)
+	expectErr(`ALTER INDEX t@i PARTITION BY RANGE (a) (PARTITION p45 VALUES FROM (4) TO (5))`, partitionErr)
+	expectErr(`ALTER PARTITION p1 OF TABLE t CONFIGURE ZONE USING DEFAULT`, zoneErr)
+	expectErr(`ALTER PARTITION p34 OF INDEX t@i CONFIGURE ZONE USING DEFAULT`, zoneErr)
+	expectErr(`ALTER INDEX t@primary CONFIGURE ZONE USING DEFAULT`, zoneErr)
+	expectErr(`ALTER INDEX t@i CONFIGURE ZONE USING DEFAULT`, zoneErr)
 
 	// But they can be removed.
 	sqlDB.Exec(t, `ALTER TABLE t PARTITION BY NOTHING`)
 	sqlDB.Exec(t, `ALTER INDEX t@i PARTITION BY NOTHING`)
-	sqlDB.Exec(t, `ALTER INDEX t@primary EXPERIMENTAL CONFIGURE ZONE NULL`)
-	sqlDB.Exec(t, `ALTER INDEX t@i EXPERIMENTAL CONFIGURE ZONE NULL`)
+	sqlDB.Exec(t, `ALTER INDEX t@primary CONFIGURE ZONE DISCARD`)
+	sqlDB.Exec(t, `ALTER INDEX t@i CONFIGURE ZONE DISCARD`)
 
 	// Once removed, they cannot be added back.
-	expectLicenseErr(`ALTER TABLE t PARTITION BY LIST (a) (PARTITION p2 VALUES IN (2))`)
-	expectLicenseErr(`ALTER INDEX t@i PARTITION BY RANGE (a) (PARTITION p45 VALUES FROM (4) TO (5))`)
-	expectLicenseErr(`ALTER INDEX t@primary EXPERIMENTAL CONFIGURE ZONE ''`)
-	expectLicenseErr(`ALTER INDEX t@i EXPERIMENTAL CONFIGURE ZONE ''`)
+	expectErr(`ALTER TABLE t PARTITION BY LIST (a) (PARTITION p2 VALUES IN (2))`, partitionErr)
+	expectErr(`ALTER INDEX t@i PARTITION BY RANGE (a) (PARTITION p45 VALUES FROM (4) TO (5))`, partitionErr)
+	expectErr(`ALTER INDEX t@primary CONFIGURE ZONE USING DEFAULT`, zoneErr)
+	expectErr(`ALTER INDEX t@i CONFIGURE ZONE USING DEFAULT`, zoneErr)
 }

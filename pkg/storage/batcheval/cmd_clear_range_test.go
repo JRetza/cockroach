@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package batcheval
 
@@ -61,8 +57,8 @@ func TestCmdClearRangeBytesThreshold(t *testing.T) {
 	valueStr := strings.Repeat("0123456789", 1024)
 	var value roachpb.Value
 	value.SetString(valueStr) // 10KiB
-	halfFull := clearRangeBytesThreshold / (2 * len(valueStr))
-	overFull := clearRangeBytesThreshold/len(valueStr) + 1
+	halfFull := ClearRangeBytesThreshold / (2 * len(valueStr))
+	overFull := ClearRangeBytesThreshold/len(valueStr) + 1
 	tests := []struct {
 		keyCount           int
 		expClearCount      int
@@ -110,7 +106,7 @@ func TestCmdClearRangeBytesThreshold(t *testing.T) {
 			cArgs := CommandArgs{Header: h}
 			cArgs.EvalCtx = &mockEvalCtx{desc: &desc, clock: hlc.NewClock(hlc.UnixNano, time.Nanosecond), stats: stats}
 			cArgs.Args = &roachpb.ClearRangeRequest{
-				Span: roachpb.Span{
+				RequestHeader: roachpb.RequestHeader{
 					Key:    startKey,
 					EndKey: endKey,
 				},
@@ -143,8 +139,7 @@ func TestCmdClearRangeBytesThreshold(t *testing.T) {
 			if err := batch.Commit(true /* commit */); err != nil {
 				t.Fatal(err)
 			}
-			if err := eng.Iterate(
-				engine.MVCCKey{Key: startKey}, engine.MVCCKey{Key: endKey},
+			if err := eng.Iterate(startKey, endKey,
 				func(kv engine.MVCCKeyValue) (bool, error) {
 					return true, errors.New("expected no data in underlying engine")
 				},

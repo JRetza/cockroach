@@ -1,6 +1,16 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import _ from "lodash";
 import { hashHistory } from "react-router";
-import { syncHistoryWithStore, routerReducer, RouterState } from "react-router-redux";
+import { syncHistoryWithStore, routerMiddleware, routerReducer, RouterState } from "react-router-redux";
 import { createStore, combineReducers, applyMiddleware, compose, GenericStoreEnhancer, Store } from "redux";
 import createSagaMiddleware from "redux-saga";
 import thunk from "redux-thunk";
@@ -44,17 +54,19 @@ export function createAdminUIStore() {
       login: loginReducer,
     }),
     compose(
-      applyMiddleware(thunk, sagaMiddleware),
+      applyMiddleware(thunk, sagaMiddleware, routerMiddleware(hashHistory)),
       // Support for redux dev tools
       // https://chrome.google.com/webstore/detail/redux-devtools/lmhkpmbekcpmknklioeibfkpmmfibljd
       (window as any).devToolsExtension ? (window as any).devToolsExtension({
-        // TODO(maxlang): implement {,de}serializeAction.
-        // TODO(maxlang): implement deserializeState.
-        serializeState: (_key: string, value: any): Object => {
-          if (value && value.toRaw) {
-            return value.toRaw();
-          }
-          return value;
+        serialize: {
+          options: {
+            function: (_key: string, value: any): Object => {
+              if (value && value.toRaw) {
+                return value.toRaw();
+              }
+              return value;
+            },
+          },
         },
       }) : _.identity,
     ) as GenericStoreEnhancer,

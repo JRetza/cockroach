@@ -1,38 +1,38 @@
-# LogicTest: default opt parallel-stmts distsql distsql-metadata
-
 statement ok
 CREATE TABLE with_no_column_refs (
   a INT,
   b INT,
-  c INT AS (3) STORED
+  c INT AS (3) STORED,
+  FAMILY "primary" (a, b, c, rowid)
 )
 
 query TT
 SHOW CREATE TABLE with_no_column_refs
 ----
-with_no_column_refs CREATE TABLE with_no_column_refs (
-                      a INT NULL,
-                      b INT NULL,
-                      c INT NULL AS (3) STORED,
-                      FAMILY "primary" (a, b, c, rowid)
-                    )
+with_no_column_refs  CREATE TABLE with_no_column_refs (
+                     a INT8 NULL,
+                     b INT8 NULL,
+                     c INT8 NULL AS (3) STORED,
+                     FAMILY "primary" (a, b, c, rowid)
+)
 
 statement ok
 CREATE TABLE extra_parens (
   a INT,
   b INT,
-  c INT AS ((3)) STORED
+  c INT AS ((3)) STORED,
+  FAMILY "primary" (a, b, c, rowid)
 )
 
 query TT
 SHOW CREATE TABLE extra_parens
 ----
-extra_parens CREATE TABLE extra_parens (
-                a INT NULL,
-                b INT NULL,
-                c INT NULL AS ((3)) STORED,
-                FAMILY "primary" (a, b, c, rowid)
-              )
+extra_parens  CREATE TABLE extra_parens (
+              a INT8 NULL,
+              b INT8 NULL,
+              c INT8 NULL AS ((3)) STORED,
+              FAMILY "primary" (a, b, c, rowid)
+)
 
 
 statement error cannot write directly to computed column "c"
@@ -73,19 +73,30 @@ CREATE TABLE x (
   a INT DEFAULT 3,
   b INT DEFAULT 7,
   c INT AS (a) STORED,
-  d INT AS (a + b) STORED
+  d INT AS (a + b) STORED,
+  FAMILY "primary" (a, b, c, d, rowid)
 )
 
 query TT
 SHOW CREATE TABLE x
 ----
-x CREATE TABLE x (
-    a INT NULL DEFAULT 3:::INT,
-    b INT NULL DEFAULT 7:::INT,
-    c INT NULL AS (a) STORED,
-    d INT NULL AS (a + b) STORED,
-    FAMILY "primary" (a, b, c, d, rowid)
-  )
+x  CREATE TABLE x (
+   a INT8 NULL DEFAULT 3:::INT8,
+   b INT8 NULL DEFAULT 7:::INT8,
+   c INT8 NULL AS (a) STORED,
+   d INT8 NULL AS (a + b) STORED,
+   FAMILY "primary" (a, b, c, d, rowid)
+)
+
+query TTBTTTB colnames
+SHOW COLUMNS FROM x
+----
+column_name  data_type  is_nullable  column_default  generation_expression  indices    is_hidden
+a            INT8       true         3:::INT8        ·                      {}         false
+b            INT8       true         7:::INT8        ·                      {}         false
+c            INT8       true         NULL            a                      {}         false
+d            INT8       true         NULL            a + b                  {}         false
+rowid        INT8       false        unique_rowid()  ·                      {primary}  true
 
 statement error cannot write directly to computed column "c"
 INSERT INTO x (c) VALUES (1)
@@ -260,7 +271,7 @@ CREATE TABLE y (
   a INT AS (3)
 )
 
-statement error unimplemented at or near "virtual"
+statement error at or near "virtual": syntax error: unimplemented
 CREATE TABLE y (
   a INT AS (3) VIRTUAL
 )
@@ -278,14 +289,14 @@ CREATE TABLE y (
   b INT AS (a) STORED
 )
 
-statement error computed column "a" contains impure functions: now\(\)
+statement error impure functions are not allowed in computed column
 CREATE TABLE y (
   a TIMESTAMP AS (now()) STORED
 )
 
-statement error computed column "a" contains impure functions: now\(\), uuid_v4\(\)
+statement error impure functions are not allowed in computed column
 CREATE TABLE y (
-  a STRING AS (CONCAT(now()::STRING, uuid_v4()::STRING)) STORED
+  a STRING AS (concat(now()::STRING, uuid_v4()::STRING)) STORED
 )
 
 statement error computed columns cannot reference other computed columns
@@ -294,14 +305,14 @@ CREATE TABLE y (
   b INT AS (a) STORED
 )
 
-statement error column name "a" not found
+statement error column "a" does not exist
 CREATE TABLE y (
   b INT AS (a) STORED
 )
 
-statement error aggregate functions are not allowed in computed column expressions
+statement error aggregate functions are not allowed in computed column
 CREATE TABLE y (
-  b INT AS (COUNT(1)) STORED
+  b INT AS (count(1)) STORED
 )
 
 statement error computed columns cannot have default values
@@ -341,6 +352,16 @@ CREATE TABLE y (
   r INT AS (1) STORED REFERENCES x
 )
 
+# Regression test for #36036.
+statement ok
+CREATE TABLE tt (i INT8 AS (1) STORED)
+
+statement error variable sub-expressions are not allowed in computed column
+ALTER TABLE tt ADD COLUMN c STRING AS ((SELECT NULL)) STORED
+
+statement error computed columns cannot reference other computed columns
+ALTER TABLE tt ADD COLUMN c INT8 AS (i) STORED
+
 # Composite FK.
 
 statement ok
@@ -379,7 +400,7 @@ ALTER TABLE y ADD FOREIGN KEY (r) REFERENCES x (a)
 statement ok
 DROP TABLE y
 
-statement error computed column expression '\(SELECT 1\)' may not contain variable sub-expressions
+statement error variable sub-expressions are not allowed in computed column
 CREATE TABLE y (
   r INT AS ((SELECT 1)) STORED
 )
@@ -423,7 +444,7 @@ CREATE TABLE x (
   k INT PRIMARY KEY,
   a JSON,
   b TEXT AS (a->>'q') STORED,
-  INDEX (b) STORING (k)
+  INDEX (b)
 )
 
 statement error cannot write directly to computed column
@@ -490,7 +511,7 @@ create table y (
 statement ok
 INSERT INTO y VALUES (5)
 
-statement error foreign key violation
+statement error foreign key
 INSERT INTO y VALUES (100)
 
 statement ok
@@ -581,17 +602,18 @@ DROP TABLE x
 statement ok
 CREATE TABLE x (
   a INT,
-  b INT as (x.a) STORED
+  b INT as (x.a) STORED,
+  FAMILY "primary" (a, b, rowid)
 )
 
 query TT
 SHOW CREATE TABLE x
 ----
-x CREATE TABLE x (
-    a INT NULL,
-    b INT NULL AS (a) STORED,
-    FAMILY "primary" (a, b, rowid)
-  )
+x  CREATE TABLE x (
+   a INT8 NULL,
+   b INT8 NULL AS (a) STORED,
+   FAMILY "primary" (a, b, rowid)
+)
 
 statement ok
 DROP TABLE x
@@ -600,7 +622,8 @@ DROP TABLE x
 statement ok
 CREATE TABLE x (
   a INT,
-  b INT AS (a) STORED
+  b INT AS (a) STORED,
+  FAMILY "primary" (a, b, rowid)
 )
 
 statement ok
@@ -609,11 +632,11 @@ ALTER TABLE x RENAME COLUMN a TO c
 query TT
 SHOW CREATE TABLE x
 ----
-x CREATE TABLE x (
-    c INT NULL,
-    b INT NULL AS (c) STORED,
-    FAMILY "primary" (c, b, rowid)
-  )
+x  CREATE TABLE x (
+   c INT8 NULL,
+   b INT8 NULL AS (c) STORED,
+   FAMILY "primary" (c, b, rowid)
+)
 
 statement ok
 DROP TABLE x
@@ -621,7 +644,8 @@ DROP TABLE x
 statement ok
 CREATE TABLE x (
   a INT,
-  b INT AS (a * 2) STORED
+  b INT AS (a * 2) STORED,
+  FAMILY "primary" (a, b, rowid)
 )
 
 query T colnames
@@ -632,26 +656,26 @@ generation_expression
 a * 2
 
 query I
-SELECT COUNT(*) FROM information_schema.columns
+SELECT count(*) FROM information_schema.columns
 WHERE table_name = 'x' and generation_expression = ''
 ----
-1
+2
 
 statement ok
 INSERT INTO x VALUES (3)
 
 # Verify computed columns work.
 statement ok
-ALTER TABLE x ADD COLUMN c INT AS (a + 4) STORED
+ALTER TABLE x ADD COLUMN c INT NOT NULL AS (a + 4) STORED
 
 query TT
 SHOW CREATE TABLE x
 ----
 x  CREATE TABLE x (
-    a INT NULL,
-    b INT NULL AS (a * 2) STORED,
-    c INT NULL AS (a + 4) STORED,
-    FAMILY "primary" (a, b, rowid, c)
+   a INT8 NULL,
+   b INT8 NULL AS (a * 2) STORED,
+   c INT8 NOT NULL AS (a + 4) STORED,
+   FAMILY "primary" (a, b, rowid, c)
 )
 
 statement ok
@@ -663,12 +687,8 @@ SELECT * FROM x ORDER BY a
 3 6 7
 6 12 10
 
-# Verify error if a default and computed column are added at the same time.
-statement error column name "d" not found
-ALTER TABLE x ADD COLUMN d INT DEFAULT 15, ADD COLUMN e INT AS (d + a) STORED
-
 # Verify a bad statement fails.
-statement error could not parse "a" as type int
+statement error unsupported binary operator: <int> \+ <string> \(desired <int>\)
 ALTER TABLE x ADD COLUMN d INT AS (a + 'a') STORED
 
 statement error could not parse "a" as type int
@@ -708,3 +728,51 @@ INSERT INTO x (a) SELECT 1
 
 statement ok
 DROP TABLE x
+
+# Verify errors emitted from computed columns contain the column name
+statement ok
+CREATE TABLE error_check (k INT PRIMARY KEY, s STRING, i INT AS (s::INT) STORED)
+
+statement ok
+INSERT INTO error_check VALUES(1, '1')
+
+statement error could not parse "foo" as type int: strconv.ParseInt
+INSERT INTO error_check VALUES(2, 'foo')
+
+statement error could not parse "foo" as type int: strconv.ParseInt: parsing "foo": invalid syntax
+UPDATE error_check SET s = 'foo' WHERE k = 1
+
+# Upsert -> update
+# NOTE: The CBO cannot show the name of the computed column in the error message
+# because the computation is part of an overall SQL statement.
+statement error could not parse "foo" as type int: strconv.ParseInt: parsing "foo": invalid syntax
+UPSERT INTO error_check VALUES (1, 'foo')
+
+# Upsert -> insert
+statement error could not parse "foo" as type int: strconv.ParseInt: parsing "foo": invalid syntax
+UPSERT INTO error_check VALUES (3, 'foo')
+
+statement ok
+CREATE TABLE x (
+  a INT PRIMARY KEY,
+  b INT AS (a+1) STORED
+)
+
+query error value type decimal doesn't match type int of column "a"
+INSERT INTO x VALUES(1.4)
+
+# Regression test for #34901: verify that builtins can be used in computed
+# column expressions without a "memory budget exceeded" error while backfilling
+statement ok
+CREATE TABLE t34901 (x STRING)
+
+statement ok
+INSERT INTO t34901 VALUES ('a')
+
+statement ok
+ALTER TABLE t34901 ADD COLUMN y STRING AS (concat(x, 'b')) STORED
+
+query TT
+SELECT * FROM t34901
+----
+a  ab

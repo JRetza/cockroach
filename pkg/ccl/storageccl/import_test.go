@@ -27,7 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/batcheval"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -35,7 +35,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/pkg/errors"
 )
 
@@ -83,7 +82,7 @@ func slurpSSTablesLatestKey(
 		if err := sst.IngestExternalFile(fileContents); err != nil {
 			t.Fatalf("%+v", err)
 		}
-		if err := sst.Iterate(start, end, func(kv engine.MVCCKeyValue) (bool, error) {
+		if err := sst.Iterate(start.Key, end.Key, func(kv engine.MVCCKeyValue) (bool, error) {
 			var ok bool
 			kv.Key.Key, ok = kr.rewriteKey(kv.Key.Key)
 			if !ok {
@@ -102,7 +101,7 @@ func slurpSSTablesLatestKey(
 	}
 
 	var kvs []engine.MVCCKeyValue
-	it := batch.NewIterator(engine.IterOptions{})
+	it := batch.NewIterator(engine.IterOptions{UpperBound: roachpb.KeyMax})
 	defer it.Close()
 	for it.Seek(start); ; it.NextKey() {
 		if ok, err := it.Valid(); err != nil {
@@ -155,7 +154,20 @@ func runTestImport(t *testing.T, init func(*cluster.Settings)) {
 		t.Fatal(err)
 	}
 
-	writeSST := func(keys ...[]byte) string {
+	const (
+		oldID   = 51
+		indexID = 1
+	)
+
+	srcPrefix := makeKeyRewriterPrefixIgnoringInterleaved(oldID, indexID)
+	var keys []roachpb.Key
+	for i := 0; i < 8; i++ {
+		key := append([]byte(nil), srcPrefix...)
+		key = encoding.EncodeStringAscending(key, fmt.Sprintf("k%d", i))
+		keys = append(keys, key)
+	}
+
+	writeSST := func(t *testing.T, offsets []int) string {
 		path := strconv.FormatInt(hlc.UnixNano(), 10)
 
 		sst, err := engine.MakeRocksDBSstFileWriter()
@@ -165,11 +177,11 @@ func runTestImport(t *testing.T, init func(*cluster.Settings)) {
 		defer sst.Close()
 		ts := hlc.NewClock(hlc.UnixNano, time.Nanosecond).Now()
 		value := roachpb.MakeValueFromString("bar")
-		for _, key := range keys {
+		for _, idx := range offsets {
+			key := keys[idx]
 			value.ClearChecksum()
 			value.InitChecksum(key)
-			kv := engine.MVCCKeyValue{Key: engine.MVCCKey{Key: key, Timestamp: ts}, Value: value.RawBytes}
-			if err := sst.Add(kv); err != nil {
+			if err := sst.Put(engine.MVCCKey{Key: key, Timestamp: ts}, value.RawBytes); err != nil {
 				t.Fatalf("%+v", err)
 			}
 		}
@@ -183,57 +195,12 @@ func runTestImport(t *testing.T, init func(*cluster.Settings)) {
 		return path
 	}
 
-	const (
-		oldID   = 51
-		newID   = 100
-		indexID = 1
-	)
-
-	kr := prefixRewriter{
-		{OldPrefix: makeKeyRewriterPrefixIgnoringInterleaved(oldID, indexID), NewPrefix: makeKeyRewriterPrefixIgnoringInterleaved(newID, indexID)},
-	}
-	var keys [][]byte
-	for i := 0; i < 4; i++ {
-		key := append([]byte(nil), kr[0].OldPrefix...)
-		key = encoding.EncodeStringAscending(key, fmt.Sprintf("foo%d", i))
-		keys = append(keys, key)
-	}
-
-	rekeys := []roachpb.ImportRequest_TableRekey{
-		{
-			OldID: oldID,
-			NewDesc: mustMarshalDesc(t, &sqlbase.TableDescriptor{
-				ID: newID,
-				PrimaryIndex: sqlbase.IndexDescriptor{
-					ID: indexID,
-				},
-			}),
-		},
-	}
-
-	files := []string{
-		writeSST(keys[2], keys[3]),
-		writeSST(keys[0], keys[1]),
-		writeSST(keys[2], keys[3]),
-	}
-
-	dataStartKey := roachpb.Key(keys[0])
-	dataEndKey := roachpb.Key(keys[3]).PrefixEnd()
-	reqStartKey, ok := kr.rewriteKey(append([]byte(nil), dataStartKey...))
-	if !ok {
-		t.Fatalf("failed to rewrite key: %s", reqStartKey)
-	}
-	reqEndKey, ok := kr.rewriteKey(append([]byte(nil), dataEndKey...))
-	if !ok {
-		t.Fatalf("failed to rewrite key: %s", reqEndKey)
-	}
-
 	// Make the first few WriteBatch/AddSSTable calls return
 	// AmbiguousResultError. Import should be resilient to this.
 	const initialAmbiguousSubReqs = 3
 	remainingAmbiguousSubReqs := int64(initialAmbiguousSubReqs)
 	knobs := base.TestingKnobs{Store: &storage.StoreTestingKnobs{
-		EvalKnobs: batcheval.TestingKnobs{
+		EvalKnobs: storagebase.BatchEvalTestingKnobs{
 			TestingEvalFilter: func(filterArgs storagebase.FilterArgs) *roachpb.Error {
 				switch filterArgs.Req.(type) {
 				case *roachpb.WriteBatchRequest, *roachpb.AddSSTableRequest:
@@ -259,32 +226,124 @@ func runTestImport(t *testing.T, init func(*cluster.Settings)) {
 	args.StoreSpecs = []base.StoreSpec{{InMemory: false, Path: filepath.Join(dir, "testserver")}}
 	s, _, kvDB := serverutils.StartServer(t, args)
 	defer s.Stopper().Stop(ctx)
-
 	init(s.ClusterSettings())
 
-	storage, err := ExportStorageConfFromURI("nodelocal:///foo")
+	storage, err := cloud.ExternalStorageConfFromURI("nodelocal:///foo")
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
 
-	for i := 1; i <= len(files); i++ {
-		t.Run(strconv.Itoa(i), func(t *testing.T) {
+	const splitKey1, splitKey2 = 3, 5
+	// Each test case consists of some number of batches of keys, represented as
+	// ints [0, 8). Splits are at 3 and 5.
+	for i, testCase := range [][][]int{
+		// Simple cases, no spanning splits, try first, last, middle, etc in each.
+		// r1
+		{{0}},
+		{{1}},
+		{{2}},
+		{{0, 1, 2}},
+		{{0}, {1}, {2}},
+
+		// r2
+		{{3}},
+		{{4}},
+		{{3, 4}},
+		{{3}, {4}},
+
+		// r3
+		{{5}},
+		{{5, 6, 7}},
+		{{6}},
+
+		// batches exactly matching spans.
+		{{0, 1, 2}, {3, 4}, {5, 6, 7}},
+
+		// every key, in its own batch.
+		{{0}, {1}, {2}, {3}, {4}, {5}, {6}, {7}},
+
+		// every key in one big batch.
+		{{0, 1, 2, 3, 4, 5, 6, 7}},
+
+		// Look for off-by-ones on and around the splits.
+		{{2, 3}},
+		{{1, 3}},
+		{{2, 4}},
+		{{1, 4}},
+		{{1, 5}},
+		{{2, 5}},
+
+		// Mixture of split-aligned and non-aligned batches.
+		{{1}, {5}, {6}},
+		{{1, 2, 3}, {4, 5}, {6, 7}},
+		{{0}, {2, 3, 5}, {7}},
+		{{0, 4}, {5, 7}},
+		{{0, 3}, {4}},
+	} {
+		t.Run(fmt.Sprintf("%d-%v", i, testCase), func(t *testing.T) {
+			newID := sqlbase.ID(100 + i)
+			kr := prefixRewriter{{
+				OldPrefix: srcPrefix,
+				NewPrefix: makeKeyRewriterPrefixIgnoringInterleaved(newID, indexID),
+			}}
+			rekeys := []roachpb.ImportRequest_TableRekey{
+				{
+					OldID: oldID,
+					NewDesc: mustMarshalDesc(t, &sqlbase.TableDescriptor{
+						ID: newID,
+						PrimaryIndex: sqlbase.IndexDescriptor{
+							ID: indexID,
+						},
+					}),
+				},
+			}
+
+			first := keys[testCase[0][0]]
+			last := keys[testCase[len(testCase)-1][len(testCase[len(testCase)-1])-1]]
+
+			reqStartKey, ok := kr.rewriteKey(append([]byte(nil), keys[0]...))
+			if !ok {
+				t.Fatalf("failed to rewrite key: %s", reqStartKey)
+			}
+			reqEndKey, ok := kr.rewriteKey(append([]byte(nil), keys[len(keys)-1].PrefixEnd()...))
+			if !ok {
+				t.Fatalf("failed to rewrite key: %s", reqEndKey)
+			}
+			reqMidKey1, ok := kr.rewriteKey(append([]byte(nil), keys[splitKey1]...))
+			if !ok {
+				t.Fatalf("failed to rewrite key: %s", reqMidKey1)
+			}
+			reqMidKey2, ok := kr.rewriteKey(append([]byte(nil), keys[splitKey2]...))
+			if !ok {
+				t.Fatalf("failed to rewrite key: %s", reqMidKey2)
+			}
+
+			if err := kvDB.AdminSplit(ctx, reqMidKey1, reqMidKey1, hlc.MaxTimestamp /* expirationTime */); err != nil {
+				t.Fatal(err)
+			}
+			if err := kvDB.AdminSplit(ctx, reqMidKey2, reqMidKey2, hlc.MaxTimestamp /* expirationTime */); err != nil {
+				t.Fatal(err)
+			}
+
 			atomic.StoreInt64(&remainingAmbiguousSubReqs, initialAmbiguousSubReqs)
 
 			req := &roachpb.ImportRequest{
-				Span:     roachpb.Span{Key: reqStartKey},
-				DataSpan: roachpb.Span{Key: dataStartKey, EndKey: dataEndKey},
-				Rekeys:   rekeys,
+				RequestHeader: roachpb.RequestHeader{Key: reqStartKey},
+				DataSpan:      roachpb.Span{Key: first, EndKey: last.PrefixEnd()},
+				Rekeys:        rekeys,
 			}
 
-			for _, f := range files[:i] {
+			var slurp []string
+			for ks := range testCase {
+				f := writeSST(t, testCase[ks])
+				slurp = append(slurp, f)
 				req.Files = append(req.Files, roachpb.ImportRequest_File{Dir: storage, Path: f})
 			}
-			expectedKVs := slurpSSTablesLatestKey(t, filepath.Join(dir, "foo"), files[:i], kr)
+			expectedKVs := slurpSSTablesLatestKey(t, filepath.Join(dir, "foo"), slurp, kr)
 
 			// Import may be retried by DistSender if it takes too long to return, so
 			// make sure it's idempotent.
-			for j := 0; j < 1; j++ {
+			for j := 0; j < 2; j++ {
 				b := &client.Batch{}
 				b.AddRawRequest(req)
 				if err := kvDB.Run(ctx, b); err != nil {
@@ -297,8 +356,13 @@ func runTestImport(t *testing.T, init func(*cluster.Settings)) {
 				kvs := clientKVsToEngineKVs(clientKVs)
 
 				if !reflect.DeepEqual(kvs, expectedKVs) {
-					for _, kv := range append(kvs, expectedKVs...) {
-						log.Info(ctx, kv)
+					for i := 0; i < len(kvs) || i < len(expectedKVs); i++ {
+						if i < len(expectedKVs) {
+							t.Logf("expected %d\t%v\t%v", i, expectedKVs[i].Key, expectedKVs[i].Value)
+						}
+						if i < len(kvs) {
+							t.Logf("got      %d\t%v\t%v", i, kvs[i].Key, kvs[i].Value)
+						}
 					}
 					t.Fatalf("got %+v expected %+v", kvs, expectedKVs)
 				}

@@ -1,5 +1,3 @@
-# LogicTest: default opt parallel-stmts
-
 statement ok
 CREATE TABLE kv (
   k INT PRIMARY KEY,
@@ -73,22 +71,7 @@ query II
 SELECT * FROM kv
 ----
 
-query T
-SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM kv]
- WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
-----
-
-query T
-SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM kv@foo]
- WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
-----
-
-query T
-SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM kv@bar]
- WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
-----
-
-statement error column name "nonexistent" not found
+statement error column "nonexistent" does not exist
 DELETE FROM kv WHERE nonexistent = 1
 
 statement count 2
@@ -139,18 +122,15 @@ k v
 5 6
 7 8
 
-# Check that EXPLAIN does not destroy data (#6613)
-query TTT colnames
-EXPLAIN DELETE FROM unindexed
-----
-Tree                 Field  Description
-count                ·      ·
- └── delete          ·      ·
-      │              from   unindexed
-      └── render     ·      ·
-           └── scan  ·      ·
-·                    table  unindexed@primary
-·                    spans  ALL
+statement count 4
+DELETE FROM unindexed
+
+# Delete of range with limit.
+statement count 4
+INSERT INTO unindexed VALUES (1, 2), (3, 4), (5, 6), (7, 8)
+
+statement count 1
+DELETE FROM unindexed WHERE k >= 4 ORDER BY k LIMIT 1
 
 query II colnames,rowsort
 SELECT k, v FROM unindexed
@@ -158,10 +138,9 @@ SELECT k, v FROM unindexed
 k v
 1 2
 3 4
-5 6
 7 8
 
-statement count 4
+statement count 3
 DELETE FROM unindexed
 
 query II colnames
@@ -180,26 +159,14 @@ DELETE FROM indexed WHERE value = 5
 statement ok
 INSERT INTO unindexed VALUES (1, 9), (8, 2), (3, 7), (6, 4)
 
-query TTT
-EXPLAIN DELETE FROM unindexed WHERE v = 7 ORDER BY v
-----
-count                ·      ·
- └── delete          ·      ·
-      │              from   unindexed
-      └── nosort     ·      ·
-           │         order  +v
-           └── scan  ·      ·
-·                    table  unindexed@primary
-·                    spans  ALL
-
 query II
-DELETE FROM unindexed WHERE k > 1 AND v < 7 ORDER BY v DESC RETURNING v,k
+DELETE FROM unindexed WHERE k > 1 AND v < 7 ORDER BY v DESC LIMIT 2 RETURNING v,k
 ----
 4  6
 2  8
 
 query II
-DELETE FROM unindexed ORDER BY v RETURNING k,v
+DELETE FROM unindexed ORDER BY v LIMIT 2 RETURNING k,v
 ----
 3  7
 1  9
@@ -209,71 +176,107 @@ DELETE FROM unindexed ORDER BY v RETURNING k,v
 statement count 4
 INSERT INTO unindexed VALUES (1, 2), (3, 4), (5, 6), (7, 8)
 
-query TTT
-EXPLAIN DELETE FROM unindexed WHERE v = 5 LIMIT 10
-----
-count                     ·      ·
- └── delete               ·      ·
-      │                   from   unindexed
-      └── limit           ·      ·
-           └── render     ·      ·
-                └── scan  ·      ·
-·                         table  unindexed@primary
-·                         spans  ALL
-
 query I
-SELECT COUNT(*) FROM [DELETE FROM unindexed LIMIT 2 RETURNING v]
+SELECT count(*) FROM [DELETE FROM unindexed LIMIT 2 RETURNING v]
 ----
 2
 
 query I
-SELECT COUNT(*) FROM [DELETE FROM unindexed LIMIT 1 RETURNING v]
+SELECT count(*) FROM [DELETE FROM unindexed LIMIT 1 RETURNING v]
 ----
 1
 
 query I
-SELECT COUNT(*) FROM [DELETE FROM unindexed LIMIT 5 RETURNING v]
+SELECT count(*) FROM [DELETE FROM unindexed LIMIT 5 RETURNING v]
 ----
 1
 
-query TTT
-EXPLAIN DELETE FROM indexed WHERE value = 5 LIMIT 10
-----
-count                     ·      ·
- └── delete               ·      ·
-      │                   from   indexed
-      └── limit           ·      ·
-           └── render     ·      ·
-                └── scan  ·      ·
-·                         table  indexed@indexed_value_idx
-·                         spans  /5-/6
-·                         limit  10
+subtest regression_29494
 
-query TTT
-EXPLAIN DELETE FROM indexed LIMIT 10
-----
-count                     ·      ·
- └── delete               ·      ·
-      │                   from   indexed
-      └── limit           ·      ·
-           └── render     ·      ·
-                └── scan  ·      ·
-·                         table  indexed@primary
-·                         spans  ALL
-·                         limit  10
+statement ok
+CREATE TABLE t29494(x INT PRIMARY KEY); INSERT INTO t29494 VALUES (12)
 
-query TTT
-EXPLAIN DELETE FROM indexed WHERE value = 5 LIMIT 10 RETURNING id
+statement ok
+BEGIN; ALTER TABLE t29494 ADD COLUMN y INT NOT NULL DEFAULT 123
+
+# Check that the new column is not visible
+query T
+SELECT create_statement FROM [SHOW CREATE t29494]
 ----
-render                          ·      ·
- └── run                        ·      ·
-      └── delete                ·      ·
-           │                    from   indexed
-           └── limit            ·      ·
-                └── index-join  ·      ·
-                     ├── scan   ·      ·
-                     │          table  indexed@indexed_value_idx
-                     │          spans  /5-/6
-                     │          limit  10
-                     └── scan   ·      ·
-·                               table  indexed@primary
+CREATE TABLE t29494 (
+   x INT8 NOT NULL,
+   CONSTRAINT "primary" PRIMARY KEY (x ASC),
+   FAMILY "primary" (x)
+)
+
+# Check that the new column is not usable in RETURNING
+statement error column "y" does not exist
+DELETE FROM t29494 RETURNING y
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN; ALTER TABLE t29494 ADD COLUMN y INT NOT NULL DEFAULT 123
+
+query I
+DELETE FROM t29494 RETURNING *
+----
+12
+
+statement ok
+COMMIT
+
+subtest regression_33361
+
+# Disable automatic stats to avoid flakiness (sometimes causes retry errors).
+statement ok
+SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false
+
+statement ok
+CREATE TABLE t33361(x INT PRIMARY KEY, y INT UNIQUE, z INT); INSERT INTO t33361 VALUES (1, 2, 3)
+
+statement ok
+BEGIN; ALTER TABLE t33361 DROP COLUMN y
+
+statement error column "y" does not exist
+DELETE FROM t33361 RETURNING y
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN; ALTER TABLE t33361 DROP COLUMN y
+
+query II
+DELETE FROM t33361 RETURNING *; COMMIT
+----
+1 3
+
+# Test that delete works with column families (no indexes, so fast path).
+statement ok
+CREATE TABLE family (
+    x INT PRIMARY KEY,
+    y INT,
+    FAMILY (x),
+    FAMILY (y)
+);
+INSERT INTO family VALUES (1, 1), (2, 2), (3, 3)
+
+statement ok
+BEGIN; ALTER TABLE family ADD COLUMN z INT CREATE FAMILY
+
+statement ok
+DELETE FROM family WHERE x=2
+
+statement ok
+COMMIT
+
+query III rowsort
+SELECT x, y, z FROM family
+----
+1  1  NULL
+3  3  NULL
+
+statement error at or near "where": syntax error: unimplemented: this syntax
+DELETE FROM family USING family, other_table WHERE x=2

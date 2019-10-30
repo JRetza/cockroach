@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 /**
  * This module maintains a globally-available time window, currently used by all
  * metrics graphs in the ui.
@@ -72,6 +82,11 @@ export let availableTimeScales: TimeScaleCollection = _.mapValues(
     },
     "1 day": {
       windowSize: moment.duration(1, "day"),
+      windowValid: moment.duration(10, "minutes"),
+      sampleSize: moment.duration(5, "minutes"),
+    },
+    "2 days": {
+      windowSize: moment.duration(2, "day"),
       windowValid: moment.duration(10, "minutes"),
       sampleSize: moment.duration(5, "minutes"),
     },

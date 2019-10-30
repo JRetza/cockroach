@@ -11,15 +11,15 @@ package baseccl
 import (
 	"bytes"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
-
-	"github.com/pkg/errors"
-	"github.com/spf13/pflag"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/cliccl/cliflagsccl"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/pkg/errors"
+	"github.com/spf13/pflag"
 )
 
 // DefaultRotationPeriod is the rotation period used if not specified.
@@ -219,4 +219,25 @@ func PopulateStoreSpecWithEncryption(
 		}
 	}
 	return nil
+}
+
+// EncryptionOptionsForStore takes a store directory and returns its ExtraOptions
+// if a matching entry if found in the StoreEncryptionSpecList.
+// The caller should appropriately set UseFileRegistry on a non-nil result.
+func EncryptionOptionsForStore(
+	dir string, encryptionSpecs StoreEncryptionSpecList,
+) ([]byte, error) {
+	// We need an absolute path, but the input may have come in relative.
+	path, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, errors.Wrapf(err, "could not find absolute path for %s ", dir)
+	}
+
+	for _, es := range encryptionSpecs.Specs {
+		if es.Path == path {
+			return es.toEncryptionOptions()
+		}
+	}
+
+	return nil, nil
 }

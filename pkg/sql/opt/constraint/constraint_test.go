@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package constraint
 
@@ -19,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
@@ -192,13 +189,13 @@ func TestConstraintContainsSpan(t *testing.T) {
 		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
 			c := ParseConstraint(&evalCtx, tc.constraint)
 
-			spans := parseSpans(tc.containedSpans)
+			spans := parseSpans(&evalCtx, tc.containedSpans)
 			for i := 0; i < spans.Count(); i++ {
 				if sp := spans.Get(i); !c.ContainsSpan(&evalCtx, sp) {
 					t.Errorf("%s should contain span %s", c, sp)
 				}
 			}
-			spans = parseSpans(tc.notContainedSpans)
+			spans = parseSpans(&evalCtx, tc.notContainedSpans)
 			for i := 0; i < spans.Count(); i++ {
 				if sp := spans.Get(i); c.ContainsSpan(&evalCtx, sp) {
 					t.Errorf("%s should not contain span %s", c, sp)
@@ -261,6 +258,8 @@ func TestConstraintCombine(t *testing.T) {
 
 func TestConsolidateSpans(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	st := cluster.MakeTestingClusterSettings()
+	evalCtx := tree.MakeTestingEvalContext(st)
 
 	testData := []struct {
 		s string
@@ -299,12 +298,18 @@ func TestConsolidateSpans(t *testing.T) {
 			s: "[/1 - /2] [/3 - /4] [/5 - /6] [/8 - /9] [/10 - /11] [/12 - /13] [/15 - /16]",
 			e: "[/1 - /6] [/8 - /13] [/15 - /16]",
 		},
+		{
+			// Test that consolidating two spans preserves the correct type of ending
+			// boundary (#38878).
+			s: "[/1 - /2] [/3 - /5)",
+			e: "[/1 - /5)",
+		},
 	}
 
 	kc := testKeyContext(1, 2, -3)
 	for i, tc := range testData {
 		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
-			spans := parseSpans(tc.s)
+			spans := parseSpans(&evalCtx, tc.s)
 			var c Constraint
 			c.Init(kc, &spans)
 			c.ConsolidateSpans(kc.EvalCtx)
@@ -317,6 +322,8 @@ func TestConsolidateSpans(t *testing.T) {
 
 func TestExactPrefix(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	st := cluster.MakeTestingClusterSettings()
+	evalCtx := tree.MakeTestingEvalContext(st)
 
 	testData := []struct {
 		s string
@@ -348,6 +355,10 @@ func TestExactPrefix(t *testing.T) {
 			e: 1,
 		},
 		{
+			s: "[/1/2/3 - /1/2/3] [/1/3/3 - /1/3/3]",
+			e: 1,
+		},
+		{
 			s: "[/1/2/3 - /1/2/3] [/3 - /4]",
 			e: 0,
 		},
@@ -360,7 +371,7 @@ func TestExactPrefix(t *testing.T) {
 	kc := testKeyContext(1, 2, 3)
 	for i, tc := range testData {
 		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
-			spans := parseSpans(tc.s)
+			spans := parseSpans(&evalCtx, tc.s)
 			var c Constraint
 			c.Init(kc, &spans)
 			if res := c.ExactPrefix(kc.EvalCtx); res != tc.e {
@@ -448,4 +459,85 @@ func newConstraintTestData(evalCtx *tree.EvalContext) *constraintTestData {
 	data.mangoStrawberry.InitSingleSpan(kc12, &span)
 
 	return data
+}
+
+func TestExtractNotNullCols(t *testing.T) {
+	st := cluster.MakeTestingClusterSettings()
+	evalCtx := tree.MakeTestingEvalContext(st)
+
+	testData := []struct {
+		c string
+		e []opt.ColumnID
+	}{
+		{ // 0
+			c: "/1: [/2 - ]",
+			e: []opt.ColumnID{1},
+		},
+		{ // 1
+			c: "/1: [ - /2]",
+			e: []opt.ColumnID{},
+		},
+		{ // 2
+			c: "/1: [/NULL - /4]",
+			e: []opt.ColumnID{},
+		},
+		{ // 3
+			c: "/1: (/NULL - /4]",
+			e: []opt.ColumnID{1},
+		},
+		{ // 4
+			c: "/-1: [ - /2]",
+			e: []opt.ColumnID{1},
+		},
+		{ // 5
+			c: "/-1: [/2 - ]",
+			e: []opt.ColumnID{},
+		},
+		{ // 6
+			c: "/-1: [/4 - /NULL]",
+			e: []opt.ColumnID{},
+		},
+		{ // 7
+			c: "/-1: [/4 - /NULL)",
+			e: []opt.ColumnID{1},
+		},
+		{ // 8
+			c: "/1/2/3: [/1/1/1 - /1/1/2] [/3/3/3 - /3/3/4]",
+			e: []opt.ColumnID{1, 2, 3},
+		},
+		{ // 9
+			c: "/1/2/3/4: [/1/1/1/1 - /1/1/2/1] [/3/3/3/1 - /3/3/4/1]",
+			e: []opt.ColumnID{1, 2, 3},
+		},
+		{ // 10
+			c: "/1/2/3: [/1/1 - /1/1/2] [/3/3/3 - /3/3/4]",
+			e: []opt.ColumnID{1, 2},
+		},
+		{ // 11
+			c: "/1/-2/-3: [/1/1/2 - /1/1] [/3/3/4 - /3/3/3]",
+			e: []opt.ColumnID{1, 2},
+		},
+		{ // 12
+			c: "/1/2/3: [/1/1/1 - /1/1/2] [/3/3/3 - /3/3/4] [/4/4/1 - /5]",
+			e: []opt.ColumnID{1},
+		},
+		{ // 13
+			c: "/1/2/3: [/1/1/NULL - /1/1/2] [/3/3/3 - /3/3/4]",
+			e: []opt.ColumnID{1, 2},
+		},
+		{ // 13
+			c: "/1/2/3: [/1/1/1 - /1/1/1] [/2/NULL/2 - /2/NULL/3]",
+			e: []opt.ColumnID{1, 3},
+		},
+	}
+
+	for i, tc := range testData {
+		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+			c := ParseConstraint(&evalCtx, tc.c)
+			cols := c.ExtractNotNullCols(&evalCtx)
+			if exp := opt.MakeColSet(tc.e...); !cols.Equals(exp) {
+				t.Errorf("expected %s; got %s", exp, cols)
+			}
+		})
+	}
 }

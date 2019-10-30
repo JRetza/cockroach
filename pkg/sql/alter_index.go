@@ -1,40 +1,35 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
 	"context"
-	"fmt"
-
-	"github.com/gogo/protobuf/proto"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/errors"
+	"github.com/gogo/protobuf/proto"
 )
 
 type alterIndexNode struct {
 	n         *tree.AlterIndex
-	tableDesc *sqlbase.TableDescriptor
+	tableDesc *sqlbase.MutableTableDescriptor
 	indexDesc *sqlbase.IndexDescriptor
 }
 
 // AlterIndex applies a schema change on an index.
 // Privileges: CREATE on table.
 func (p *planner) AlterIndex(ctx context.Context, n *tree.AlterIndex) (planNode, error) {
-	tableDesc, indexDesc, err := p.getTableAndIndex(ctx, &n.Index.Table, n.Index, privilege.CREATE)
+	tableDesc, indexDesc, err := p.getTableAndIndex(ctx, &n.Index, privilege.CREATE)
 	if err != nil {
 		return nil, err
 	}
@@ -72,7 +67,7 @@ func (n *alterIndexNode) startExec(params runParams) error {
 			)
 			err = deleteRemovedPartitionZoneConfigs(
 				params.ctx, params.p.txn,
-				n.tableDesc, n.indexDesc,
+				n.tableDesc.TableDesc(), n.indexDesc,
 				&n.indexDesc.Partitioning, &partitioning,
 				params.extendedEvalCtx.ExecCfg,
 			)
@@ -81,7 +76,8 @@ func (n *alterIndexNode) startExec(params runParams) error {
 			}
 			n.indexDesc.Partitioning = partitioning
 		default:
-			return fmt.Errorf("unsupported alter command: %T", cmd)
+			return errors.AssertionFailedf(
+				"unsupported alter command: %T", cmd)
 		}
 	}
 
@@ -93,23 +89,25 @@ func (n *alterIndexNode) startExec(params runParams) error {
 	mutationID := sqlbase.InvalidMutationID
 	var err error
 	if addedMutations {
-		mutationID, err = params.p.createSchemaChangeJob(params.ctx, n.tableDesc,
-			tree.AsStringWithFlags(n.n, tree.FmtAlwaysQualifyTableNames))
-	} else if descriptorChanged {
-		err = n.tableDesc.SetUpVersion()
+		mutationID, err = params.p.createOrUpdateSchemaChangeJob(
+			params.ctx, n.tableDesc, tree.AsStringWithFQNames(n.n, params.Ann()),
+		)
+	} else if !descriptorChanged {
+		// Nothing to be done
+		return nil
 	}
 	if err != nil {
 		return err
 	}
 
-	if err := params.p.writeTableDesc(params.ctx, n.tableDesc); err != nil {
+	if err := params.p.writeSchemaChange(params.ctx, n.tableDesc, mutationID); err != nil {
 		return err
 	}
 
 	// Record this index alteration in the event log. This is an auditable log
 	// event and is recorded in the same transaction as the table descriptor
 	// update.
-	if err := MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
+	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
 		params.ctx,
 		params.p.txn,
 		EventLogAlterIndex,
@@ -122,16 +120,10 @@ func (n *alterIndexNode) startExec(params runParams) error {
 			User       string
 			MutationID uint32
 		}{
-			n.n.Index.Table.TableName().FQString(), n.indexDesc.Name, n.n.String(),
+			n.n.Index.Table.FQString(), n.indexDesc.Name, n.n.String(),
 			params.SessionData().User, uint32(mutationID),
 		},
-	); err != nil {
-		return err
-	}
-
-	params.p.notifySchemaChange(n.tableDesc, mutationID)
-
-	return nil
+	)
 }
 
 func (n *alterIndexNode) Next(runParams) (bool, error) { return false, nil }

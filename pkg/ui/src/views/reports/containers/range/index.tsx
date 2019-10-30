@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import _ from "lodash";
 import Long from "long";
 import React from "react";
@@ -158,7 +168,7 @@ class Range extends React.Component<RangeProps, {}> {
 
     // Gather all replica IDs.
     const replicas = _.chain(infos)
-      .flatMap(info => info.state.state.desc.replicas)
+      .flatMap(info => info.state.state.desc.internal_replicas)
       .sortBy(rep => rep.replica_id)
       .sortedUniqBy(rep => rep.replica_id)
       .value();

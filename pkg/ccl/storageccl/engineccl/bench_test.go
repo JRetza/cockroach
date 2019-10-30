@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
@@ -52,8 +53,10 @@ func loadTestData(
 
 	eng, err := engine.NewRocksDB(
 		engine.RocksDBConfig{
-			Settings: cluster.MakeTestingClusterSettings(),
-			Dir:      dir,
+			StorageConfig: base.StorageConfig{
+				Settings: cluster.MakeTestingClusterSettings(),
+				Dir:      dir,
+			},
 		},
 		engine.RocksDBCache{},
 	)
@@ -168,12 +171,16 @@ func BenchmarkTimeBoundIterate(b *testing.B) {
 		b.Run(fmt.Sprintf("LoadFactor=%.2f", loadFactor), func(b *testing.B) {
 			b.Run("NormalIterator", func(b *testing.B) {
 				runIterate(b, loadFactor, func(e engine.Engine, _, _ hlc.Timestamp) engine.Iterator {
-					return e.NewIterator(engine.IterOptions{})
+					return e.NewIterator(engine.IterOptions{UpperBound: roachpb.KeyMax})
 				})
 			})
 			b.Run("TimeBoundIterator", func(b *testing.B) {
 				runIterate(b, loadFactor, func(e engine.Engine, startTime, endTime hlc.Timestamp) engine.Iterator {
-					return e.NewTimeBoundIterator(startTime, endTime, false)
+					return e.NewIterator(engine.IterOptions{
+						MinTimestampHint: startTime,
+						MaxTimestampHint: endTime,
+						UpperBound:       roachpb.KeyMax,
+					})
 				})
 			})
 		})

@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package security_test
 
@@ -21,10 +17,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 )
 
 // Construct a fake tls.ConnectionState object with one peer certificate
@@ -84,47 +78,42 @@ func TestGetCertificateUser(t *testing.T) {
 
 func TestAuthenticationHook(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	// Proto that does not implement GetUser.
-	badRequest := &roachpb.GetResponse{}
-	goodRequest := &roachpb.BatchRequest{}
 
 	testCases := []struct {
 		insecure           bool
 		tls                *tls.ConnectionState
-		request            protoutil.Message
+		username           string
 		buildHookSuccess   bool
 		publicHookSuccess  bool
 		privateHookSuccess bool
 	}{
-		// Insecure mode, nil request.
-		{true, nil, nil, true, false, false},
-		// Insecure mode, bad request.
-		{true, nil, badRequest, true, false, false},
-		// Insecure mode, good request.
-		{true, nil, goodRequest, true, true, true},
+		// Insecure mode, empty username.
+		{true, nil, "", true, false, false},
+		// Insecure mode, non-empty username.
+		{true, nil, "foo", true, true, false},
 		// Secure mode, no TLS state.
-		{false, nil, nil, false, false, false},
+		{false, nil, "", false, false, false},
 		// Secure mode, bad user.
-		{false, makeFakeTLSState([]string{"foo"}, []int{1}), goodRequest, true, false, false},
+		{false, makeFakeTLSState([]string{"foo"}, []int{1}), "node", true, false, false},
 		// Secure mode, node user.
-		{false, makeFakeTLSState([]string{security.NodeUser}, []int{1}), goodRequest, true, true, true},
+		{false, makeFakeTLSState([]string{security.NodeUser}, []int{1}), "node", true, true, true},
 		// Secure mode, root user.
-		{false, makeFakeTLSState([]string{security.RootUser}, []int{1}), goodRequest, true, false, false},
+		{false, makeFakeTLSState([]string{security.RootUser}, []int{1}), "node", true, false, false},
 	}
 
 	for tcNum, tc := range testCases {
-		hook, err := security.ProtoAuthHook(tc.insecure, tc.tls)
+		hook, err := security.UserAuthCertHook(tc.insecure, tc.tls)
 		if (err == nil) != tc.buildHookSuccess {
 			t.Fatalf("#%d: expected success=%t, got err=%v", tcNum, tc.buildHookSuccess, err)
 		}
 		if err != nil {
 			continue
 		}
-		err = hook(tc.request, true /*public*/)
+		err = hook(tc.username, true /*public*/)
 		if (err == nil) != tc.publicHookSuccess {
 			t.Fatalf("#%d: expected success=%t, got err=%v", tcNum, tc.publicHookSuccess, err)
 		}
-		err = hook(tc.request, false /*not public*/)
+		err = hook(tc.username, false /*not public*/)
 		if (err == nil) != tc.privateHookSuccess {
 			t.Fatalf("#%d: expected success=%t, got err=%v", tcNum, tc.privateHookSuccess, err)
 		}

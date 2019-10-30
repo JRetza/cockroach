@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package batcheval
 
@@ -26,14 +22,16 @@ import (
 
 // A Command is the implementation of a single request within a BatchRequest.
 type Command struct {
-	// DeclareKeys adds all keys this command touches to the given spanSet.
-	DeclareKeys func(roachpb.RangeDescriptor, roachpb.Header, roachpb.Request, *spanset.SpanSet)
+	// DeclareKeys adds all keys this command touches to the given SpanSet.
+	// TODO(nvanbenschoten): rationalize this RangeDescriptor. Can it change
+	// between key declaration and cmd evaluation?
+	DeclareKeys func(*roachpb.RangeDescriptor, roachpb.Header, roachpb.Request, *spanset.SpanSet)
 
-	// Eval evaluates a command on the given engine. It should populate
-	// the supplied response (always a non-nil pointer to the correct
-	// type) and return special side effects (if any) in the Result.
-	// If it writes to the engine it should also update
-	// *CommandArgs.Stats.
+	// Eval evaluates a command on the given engine. It should populate the
+	// supplied response (always a non-nil pointer to the correct type) and
+	// return special side effects (if any) in the Result. If it writes to the
+	// engine it should also update *CommandArgs.Stats. It should treat the
+	// provided request as immutable.
 	Eval func(context.Context, engine.ReadWriter, CommandArgs, roachpb.Response) (result.Result, error)
 }
 
@@ -43,7 +41,7 @@ var cmds = make(map[roachpb.Method]Command)
 // called before any evaluation takes place.
 func RegisterCommand(
 	method roachpb.Method,
-	declare func(roachpb.RangeDescriptor, roachpb.Header, roachpb.Request, *spanset.SpanSet),
+	declare func(*roachpb.RangeDescriptor, roachpb.Header, roachpb.Request, *spanset.SpanSet),
 	impl func(context.Context, engine.ReadWriter, CommandArgs, roachpb.Response) (result.Result, error),
 ) {
 	if _, ok := cmds[method]; ok {

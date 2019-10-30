@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package keys
 
@@ -71,11 +67,15 @@ var (
 	// been down without needing to retrieve liveness records from the cluster.
 	localStoreLastUpSuffix = []byte("uptm")
 	// localHLCUpperBoundSuffix stores an upper bound to the wall time used by
-	// the HLC
+	// the HLC.
 	localHLCUpperBoundSuffix = []byte("hlcu")
 	// localStoreSuggestedCompactionSuffix stores suggested compactions to
 	// be aggregated and processed on the store.
 	localStoreSuggestedCompactionSuffix = []byte("comp")
+
+	// localRemovedLeakedRaftEntriesSuffix is DEPRECATED and remains to prevent reuse.
+	localRemovedLeakedRaftEntriesSuffix = []byte("dlre")
+	_                                   = localRemovedLeakedRaftEntriesSuffix
 
 	// LocalStoreSuggestedCompactionsMin is the start of the span of
 	// possible suggested compaction keys for a store.
@@ -117,8 +117,9 @@ var (
 	LocalRaftAppliedIndexLegacySuffix = []byte("rfta")
 	// LocalRaftTombstoneSuffix is the suffix for the raft tombstone.
 	LocalRaftTombstoneSuffix = []byte("rftb")
-	// LocalRaftTruncatedStateSuffix is the suffix for the RaftTruncatedState.
-	LocalRaftTruncatedStateSuffix = []byte("rftt")
+	// LocalRaftTruncatedStateLegacySuffix is the suffix for the legacy RaftTruncatedState.
+	// See VersionUnreplicatedRaftTruncatedState.
+	LocalRaftTruncatedStateLegacySuffix = []byte("rftt")
 	// LocalRangeLeaseSuffix is the suffix for a range lease.
 	LocalRangeLeaseSuffix = []byte("rll-")
 	// LocalLeaseAppliedIndexLegacySuffix is the suffix for the applied lease index.
@@ -127,6 +128,7 @@ var (
 	LocalRangeStatsLegacySuffix = []byte("stat")
 	// LocalTxnSpanGCThresholdSuffix is the suffix for the last txn span GC's
 	// threshold.
+	// No longer used; exists only to reserve the key so we don't use it.
 	LocalTxnSpanGCThresholdSuffix = []byte("tst-")
 
 	// localRangeIDUnreplicatedInfix is the post-Range ID specifier for all
@@ -148,10 +150,6 @@ var (
 	// last verification timestamp (for checking integrity of on-disk data).
 	// Note: DEPRECATED.
 	LocalRangeLastVerificationTimestampSuffixDeprecated = []byte("rlvt")
-	// LocalRangeReplicaDestroyedErrorSuffix is the suffix for a range's replica
-	// destroyed error (for marking replicas as dead).
-	LocalRangeReplicaDestroyedErrorSuffix = []byte("rrde")
-
 	// LocalRangePrefix is the prefix identifying per-range data indexed
 	// by range key (either start key, or some key in the range). The
 	// key is appended to this prefix, encoded using EncodeBytes. The
@@ -166,6 +164,11 @@ var (
 	// LocalRangeDescriptorSuffix is the suffix for keys storing
 	// range descriptors. The value is a struct of type RangeDescriptor.
 	LocalRangeDescriptorSuffix = roachpb.RKey("rdsc")
+	// LocalRangeDescriptorJointSuffix is the suffix for keys storing
+	// range descriptors. The value is a struct of type RangeDescriptor.
+	//
+	// TODO(tbg): decide what to actually store here. This is still unused.
+	LocalRangeDescriptorJointSuffix = roachpb.RKey("rdjt")
 	// LocalTransactionSuffix specifies the key suffix for
 	// transaction records. The additional detail is the transaction id.
 	// NOTE: if this value changes, it must be updated in C++
@@ -286,9 +289,6 @@ const (
 	// clusters (default databases).
 	MinNonPredefinedUserDescID = MinUserDescID + 2
 
-	// VirtualDescriptorID is the ID used by all virtual descriptors.
-	VirtualDescriptorID = math.MaxUint32
-
 	// RootNamespaceID is the ID of the root namespace.
 	RootNamespaceID = 0
 
@@ -306,22 +306,40 @@ const (
 	// avoid introducing a dependency on sql/sqlbase throughout the codebase.
 	ZonesTablePrimaryIndexID = 1
 	ZonesTableConfigColumnID = 2
+	ZonesTableConfigColFamID = 2
 
 	// Reserved IDs for other system tables. Note that some of these IDs refer
 	// to "Ranges" instead of a Table - these IDs are needed to store custom
 	// configuration for non-table ranges (e.g. Zone Configs).
 	// NOTE: IDs must be <= MaxReservedDescID.
-	LeaseTableID           = 11
-	EventLogTableID        = 12
-	RangeEventTableID      = 13
-	UITableID              = 14
-	JobsTableID            = 15
-	MetaRangesID           = 16
-	SystemRangesID         = 17
-	TimeseriesRangesID     = 18
-	WebSessionsTableID     = 19
-	TableStatisticsTableID = 20
-	LocationsTableID       = 21
-	LivenessRangesID       = 22
-	RoleMembersTableID     = 23
+	LeaseTableID                         = 11
+	EventLogTableID                      = 12
+	RangeEventTableID                    = 13
+	UITableID                            = 14
+	JobsTableID                          = 15
+	MetaRangesID                         = 16
+	SystemRangesID                       = 17
+	TimeseriesRangesID                   = 18
+	WebSessionsTableID                   = 19
+	TableStatisticsTableID               = 20
+	LocationsTableID                     = 21
+	LivenessRangesID                     = 22
+	RoleMembersTableID                   = 23
+	CommentsTableID                      = 24
+	ReplicationConstraintStatsTableID    = 25
+	ReplicationCriticalLocalitiesTableID = 26
+	ReplicationStatsTableID              = 27
+	ReportsMetaTableID                   = 28
+
+	// CommentType is type for system.comments
+	DatabaseCommentType = 0
+	TableCommentType    = 1
+	ColumnCommentType   = 2
+	IndexCommentType    = 3
 )
+
+// PseudoTableIDs is the list of ids from above that are not real tables (i.e.
+// there's no table descriptor). They're grouped here because the cluster
+// bootstrap process needs to create splits for them; splits for the tables
+// happen separately.
+var PseudoTableIDs = []uint32{MetaRangesID, SystemRangesID, TimeseriesRangesID, LivenessRangesID}

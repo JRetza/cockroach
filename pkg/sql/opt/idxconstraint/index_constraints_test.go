@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package idxconstraint_test
 
@@ -29,11 +25,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/optbuilder"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/optgen/exprgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
-	"github.com/cockroachdb/cockroach/pkg/testutils/datadriven"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/datadriven"
 )
 
 // The test files support only one command:
@@ -71,11 +68,11 @@ func TestIndexConstraints(t *testing.T) {
 
 	datadriven.Walk(t, "testdata", func(t *testing.T, path string) {
 		ctx := context.Background()
-		semaCtx := tree.MakeSemaContext(false /* privileged */)
+		semaCtx := tree.MakeSemaContext()
 		evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 
 		datadriven.RunTest(t, path, func(d *datadriven.TestData) string {
-			var varTypes []types.T
+			var varTypes []*types.T
 			var indexCols []opt.OrderingColumn
 			var notNullCols opt.ColSet
 			var iVarHelper tree.IndexedVarHelper
@@ -83,14 +80,15 @@ func TestIndexConstraints(t *testing.T) {
 			var normalizeTypedExpr bool
 			var err error
 
-			f := norm.NewFactory(&evalCtx)
+			var f norm.Factory
+			f.Init(&evalCtx)
 			md := f.Metadata()
 
 			for _, arg := range d.CmdArgs {
 				key, vals := arg.Key, arg.Vals
 				switch key {
 				case "vars":
-					varTypes, err = testutils.ParseTypes(vals)
+					varTypes, err = exprgen.ParseTypes(vals)
 					if err != nil {
 						d.Fatalf(t, "%v", err)
 					}
@@ -142,25 +140,28 @@ func TestIndexConstraints(t *testing.T) {
 				for i := range varNames {
 					varNames[i] = fmt.Sprintf("@%d", i+1)
 				}
-				b := optbuilder.NewScalar(ctx, &semaCtx, &evalCtx, f)
+				b := optbuilder.NewScalar(ctx, &semaCtx, &evalCtx, &f)
 				b.AllowUnsupportedExpr = true
-				group, err := b.Build(typedExpr)
+				err = b.Build(typedExpr)
 				if err != nil {
 					return fmt.Sprintf("error: %v\n", err)
 				}
-				ev := memo.MakeNormExprView(f.Memo(), group)
+				root := f.Memo().RootExpr().(opt.ScalarExpr)
+				filters := memo.FiltersExpr{{Condition: root}}
+				if _, ok := root.(*memo.TrueExpr); ok {
+					filters = memo.TrueFilter
+				}
 
 				var ic idxconstraint.Instance
-				ic.Init(ev, indexCols, notNullCols, invertedIndex, &evalCtx, f)
+				ic.Init(filters, indexCols, notNullCols, invertedIndex, &evalCtx, &f)
 				result := ic.Constraint()
 				var buf bytes.Buffer
 				for i := 0; i < result.Spans.Count(); i++ {
 					fmt.Fprintf(&buf, "%s\n", result.Spans.Get(i))
 				}
-				remainingFilter := ic.RemainingFilter()
-				remEv := memo.MakeNormExprView(f.Memo(), remainingFilter)
-				if remEv.Operator() != opt.TrueOp {
-					execBld := execbuilder.New(nil /* execFactory */, remEv)
+				remainingFilter := ic.RemainingFilters()
+				if !remainingFilter.IsTrue() {
+					execBld := execbuilder.New(nil /* execFactory */, f.Memo(), nil /* catalog */, &remainingFilter, &evalCtx)
 					expr, err := execBld.BuildScalar(&iVarHelper)
 					if err != nil {
 						return fmt.Sprintf("error: %v\n", err)
@@ -231,13 +232,16 @@ func BenchmarkIndexConstraints(b *testing.B) {
 		testCases = append(testCases, tc)
 	}
 
+	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+
 	for _, tc := range testCases {
 		b.Run(tc.name, func(b *testing.B) {
-			varTypes, err := testutils.ParseTypes(strings.Split(tc.varTypes, ", "))
+			varTypes, err := exprgen.ParseTypes(strings.Split(tc.varTypes, ", "))
 			if err != nil {
 				b.Fatal(err)
 			}
-			f := norm.NewFactory(nil /* evalCtx */)
+			var f norm.Factory
+			f.Init(&evalCtx)
 			md := f.Metadata()
 			for i, typ := range varTypes {
 				md.AddColumn(fmt.Sprintf("@%d", i+1), typ)
@@ -250,21 +254,23 @@ func BenchmarkIndexConstraints(b *testing.B) {
 				b.Fatal(err)
 			}
 
-			semaCtx := tree.MakeSemaContext(false /* privileged */)
+			semaCtx := tree.MakeSemaContext()
 			evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
-			bld := optbuilder.NewScalar(context.Background(), &semaCtx, &evalCtx, f)
+			bld := optbuilder.NewScalar(context.Background(), &semaCtx, &evalCtx, &f)
 
-			group, err := bld.Build(typedExpr)
+			err = bld.Build(typedExpr)
 			if err != nil {
 				b.Fatal(err)
 			}
-			ev := memo.MakeNormExprView(f.Memo(), group)
+			nd := f.Memo().RootExpr()
+			filters := memo.FiltersExpr{{Condition: nd.(opt.ScalarExpr)}}
+
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				var ic idxconstraint.Instance
-				ic.Init(ev, indexCols, notNullCols, false /*isInverted */, &evalCtx, f)
+				ic.Init(filters, indexCols, notNullCols, false /*isInverted */, &evalCtx, &f)
 				_ = ic.Constraint()
-				_ = ic.RemainingFilter()
+				_ = ic.RemainingFilters()
 			}
 		})
 	}
@@ -301,7 +307,7 @@ func parseIndexColumns(
 				if len(fields) < 2 || strings.ToLower(fields[1]) != "null" {
 					tb.Fatalf("unknown column attribute %s", fields)
 				}
-				notNullCols.Add(id)
+				notNullCols.Add(opt.ColumnID(id))
 				fields = fields[2:]
 			default:
 				tb.Fatalf("unknown column attribute %s", fields)

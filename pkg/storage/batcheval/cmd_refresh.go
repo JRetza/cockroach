@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package batcheval
 
@@ -44,29 +40,30 @@ func Refresh(
 	// Get the most recent committed value and return any intent by
 	// specifying consistent=false. Note that we include tombstones,
 	// which must be considered as updates on refresh.
-	log.VEventf(ctx, 2, "refresh %s @[%s-%s]", args.Header(), h.Txn.OrigTimestamp, h.Txn.Timestamp)
-	val, intents, err := engine.MVCCGetWithTombstone(
-		ctx, batch, args.Key, h.Txn.Timestamp, false /* consistent */, nil, /* txn */
-	)
+	log.VEventf(ctx, 2, "refresh %s @[%s-%s]", args.Span(), h.Txn.OrigTimestamp, h.Txn.Timestamp)
+	val, intent, err := engine.MVCCGet(ctx, batch, args.Key, h.Txn.Timestamp, engine.MVCCGetOptions{
+		Inconsistent: true,
+		Tombstones:   true,
+	})
 
 	if err != nil {
 		return result.Result{}, err
 	} else if val != nil {
+		// TODO(nvanbenschoten): This is pessimistic. We only need to check
+		//   !ts.Less(h.Txn.PrevRefreshTimestamp)
+		// This could avoid failed refreshes due to requests performed after
+		// earlier refreshes (which read at the refresh ts) that already
+		// observed writes between the orig ts and the refresh ts.
 		if ts := val.Timestamp; !ts.Less(h.Txn.OrigTimestamp) {
 			return result.Result{}, errors.Errorf("encountered recently written key %s @%s", args.Key, ts)
 		}
 	}
 
-	// Now, check intents slice for any which were written earlier than
-	// the command's timestamp, not owned by this transaction.
-	for _, i := range intents {
-		// Ignore our own intents.
-		if i.Txn.ID == h.Txn.ID {
-			continue
-		}
-		// Return an error if an intent was written to the span.
+	// Check if an intent which is not owned by this transaction was written
+	// at or beneath the refresh timestamp.
+	if intent != nil && intent.Txn.ID != h.Txn.ID {
 		return result.Result{}, errors.Errorf("encountered recently written intent %s @%s",
-			i.Span.Key, i.Txn.Timestamp)
+			intent.Span.Key, intent.Txn.Timestamp)
 	}
 
 	return result.Result{}, nil

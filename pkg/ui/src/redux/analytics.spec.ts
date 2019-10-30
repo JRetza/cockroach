@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import { assert } from "chai";
 import * as sinon from "sinon";
 
@@ -172,6 +182,11 @@ describe("analytics listener", function() {
         "login redirect URL parameters",
         "/login?redirectTo=%2Fdatabase%2Ffoobar%2Ftable%2Fbaz",
         "/login?redirectTo=%2Fdatabase%2F%5Bdb%5D%2Ftable%2F%5Btbl%5D",
+      ),
+      testRedaction(
+        "statement details page",
+        "/statement/SELECT * FROM database.table",
+        "/statement/[statement]",
       ),
     ]).map(function ({ title, input, expected }) {
       it(`applies a redaction for ${title}`, function () {

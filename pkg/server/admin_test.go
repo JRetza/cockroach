@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package server
 
@@ -30,11 +26,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
-	"github.com/pkg/errors"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/debug"
@@ -42,9 +38,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/jobs"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -54,6 +51,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/gogo/protobuf/proto"
+	"github.com/pkg/errors"
+	"github.com/stretchr/testify/assert"
 )
 
 func getAdminJSONProto(
@@ -312,7 +312,7 @@ func TestAdminAPIDatabases(t *testing.T) {
 	}
 
 	// Verify Descriptor ID.
-	path, err := ts.admin.queryDescriptorIDPath(ctx, sql.SessionArgs{User: security.RootUser}, []string{testdb})
+	path, err := ts.admin.queryDescriptorIDPath(ctx, security.RootUser, []string{testdb})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,10 +339,115 @@ func TestAdminAPIDatabaseSQLInjection(t *testing.T) {
 
 	const fakedb = "system;DROP DATABASE system;"
 	const path = "databases/" + fakedb
-	const errPattern = `database \\"` + fakedb + `\\" does not exist`
+	const errPattern = `target database or schema does not exist`
 	if err := getAdminJSONProto(s, path, nil); !testutils.IsError(err, errPattern) {
 		t.Fatalf("unexpected error: %v\nexpected: %s", err, errPattern)
 	}
+}
+
+func TestAdminAPINonTableStats(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	testCluster := serverutils.StartTestCluster(t, 3, base.TestClusterArgs{})
+	defer testCluster.Stopper().Stop(context.Background())
+	s := testCluster.Server(0)
+
+	// Skip TableStatsResponse.Stats comparison, since it includes data which
+	// aren't consistent (time, bytes).
+	expectedResponse := serverpb.NonTableStatsResponse{
+		TimeSeriesStats: &serverpb.TableStatsResponse{
+			RangeCount:   1,
+			ReplicaCount: 3,
+			NodeCount:    3,
+		},
+		InternalUseStats: &serverpb.TableStatsResponse{
+			RangeCount:   8,
+			ReplicaCount: 12,
+			NodeCount:    3,
+		},
+	}
+
+	var resp serverpb.NonTableStatsResponse
+	if err := getAdminJSONProto(s, "nontablestats", &resp); err != nil {
+		t.Fatal(err)
+	}
+
+	assertExpectedStatsResponse := func(expected, actual *serverpb.TableStatsResponse) {
+		assert.Equal(t, expected.RangeCount, actual.RangeCount)
+		assert.Equal(t, expected.ReplicaCount, actual.ReplicaCount)
+		assert.Equal(t, expected.NodeCount, actual.NodeCount)
+	}
+
+	assertExpectedStatsResponse(expectedResponse.TimeSeriesStats, resp.TimeSeriesStats)
+	assertExpectedStatsResponse(expectedResponse.InternalUseStats, resp.InternalUseStats)
+}
+
+// TODO(celia): I expect all the ranges listed on the Database page to equal
+// the RangeCount returned from doing a span on [LocalMax, MaxKey). For a cluster
+// with no user data, all the ranges on the Databases page consist of:
+// 1) the total ranges listed for the system database
+// 2) the total ranges listed for the Non-Table data
+func TestRangeCount_MissingOneRange(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	testCluster := serverutils.StartTestCluster(t, 3, base.TestClusterArgs{})
+	defer testCluster.Stopper().Stop(context.Background())
+	s := testCluster.Server(0)
+
+	// Sum up ranges for non-table parts of the system returned
+	// from the "nontablestats" enpoint.
+	getNonTableRangeCount := func() int64 {
+		var resp serverpb.NonTableStatsResponse
+		if err := getAdminJSONProto(s, "nontablestats", &resp); err != nil {
+			t.Fatal(err)
+		}
+		return resp.TimeSeriesStats.RangeCount + resp.InternalUseStats.RangeCount
+	}
+
+	// Sum up ranges from system database tables returned
+	// from the "databases/system/tables/{table}" endpoints.
+	getSystemTableRangeCount := func() int64 {
+		var systemTableRangeCount int64
+		var dbResp serverpb.DatabaseDetailsResponse
+		if err := getAdminJSONProto(s, "databases/system", &dbResp); err != nil {
+			t.Fatal(err)
+		}
+		for _, tableName := range dbResp.TableNames {
+			var tblResp serverpb.TableStatsResponse
+			path := "databases/system/tables/" + tableName + "/stats"
+			if err := getAdminJSONProto(s, path, &tblResp); err != nil {
+				t.Fatal(err)
+			}
+			systemTableRangeCount += tblResp.RangeCount
+		}
+		return systemTableRangeCount
+	}
+
+	getRangeCountFromFullSpan := func() int64 {
+		adminServer := s.(*TestServer).Server.admin
+		stats, err := adminServer.statsForSpan(context.Background(), roachpb.Span{
+			Key:    keys.LocalMax,
+			EndKey: keys.MaxKey,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return stats.RangeCount
+	}
+
+	totalRangeCount := getRangeCountFromFullSpan()
+	nonTableRangeCount := getNonTableRangeCount()
+	systemTableRangeCount := getSystemTableRangeCount()
+
+	// expected: expectedRangeCount == nonTableRangeCount+systemTableRangeCount
+	// actual: expectedRangeCount > nonTableRangeCount+systemTableRangeCount
+	if totalRangeCount == nonTableRangeCount+systemTableRangeCount {
+		t.Fail()
+	}
+
+	// TODO(celia): We're missing 1 range -- where is it?
+	expectedMissingRangeCount := int64(1)
+	assert.Equal(t,
+		totalRangeCount,
+		nonTableRangeCount+systemTableRangeCount+expectedMissingRangeCount)
 }
 
 func TestAdminAPITableDoesNotExist(t *testing.T) {
@@ -402,16 +507,16 @@ func TestAdminAPITableDetails(t *testing.T) {
 			setupQueries := []string{
 				fmt.Sprintf("CREATE DATABASE %s", escDBName),
 				fmt.Sprintf(`CREATE TABLE %s.%s (
-							nulls_allowed INT,
-							nulls_not_allowed INT NOT NULL DEFAULT 1000,
-							default2 INT DEFAULT 2,
-							string_default STRING DEFAULT 'default_string'
+							nulls_allowed INT8,
+							nulls_not_allowed INT8 NOT NULL DEFAULT 1000,
+							default2 INT8 DEFAULT 2,
+							string_default STRING DEFAULT 'default_string',
+						  INDEX descidx (default2 DESC)
 						)`, escDBName, escTblName),
 				fmt.Sprintf("CREATE USER readonly"),
 				fmt.Sprintf("CREATE USER app"),
 				fmt.Sprintf("GRANT SELECT ON %s.%s TO readonly", escDBName, escTblName),
 				fmt.Sprintf("GRANT SELECT,UPDATE,DELETE ON %s.%s TO app", escDBName, escTblName),
-				fmt.Sprintf("CREATE INDEX descidx ON %s.%s (default2 DESC)", escDBName, escTblName),
 			}
 
 			for _, q := range setupQueries {
@@ -429,10 +534,11 @@ func TestAdminAPITableDetails(t *testing.T) {
 
 			// Verify columns.
 			expColumns := []serverpb.TableDetailsResponse_Column{
-				{Name: "nulls_allowed", Type: "INT", Nullable: true, DefaultValue: ""},
-				{Name: "nulls_not_allowed", Type: "INT", Nullable: false, DefaultValue: "1000:::INT"},
-				{Name: "default2", Type: "INT", Nullable: true, DefaultValue: "2:::INT"},
+				{Name: "nulls_allowed", Type: "INT8", Nullable: true, DefaultValue: ""},
+				{Name: "nulls_not_allowed", Type: "INT8", Nullable: false, DefaultValue: "1000:::INT8"},
+				{Name: "default2", Type: "INT8", Nullable: true, DefaultValue: "2:::INT8"},
 				{Name: "string_default", Type: "STRING", Nullable: true, DefaultValue: "'default_string':::STRING"},
+				{Name: "rowid", Type: "INT8", Nullable: false, DefaultValue: "unique_rowid()", Hidden: true},
 			}
 			testutils.SortStructs(expColumns, "Name")
 			testutils.SortStructs(resp.Columns, "Name")
@@ -506,9 +612,8 @@ func TestAdminAPITableDetails(t *testing.T) {
 			}
 
 			// Verify Descriptor ID.
-			path, err := ts.admin.queryDescriptorIDPath(
-				ctx, sql.SessionArgs{User: security.RootUser}, []string{tc.dbName, tc.tblName},
-			)
+			path, err := ts.admin.queryDescriptorIDPath(ctx,
+				security.RootUser, []string{tc.dbName, tc.tblName})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -594,21 +699,19 @@ func TestAdminAPIZoneDetails(t *testing.T) {
 	}
 
 	// Verify zone matches cluster default.
-	verifyDbZone(config.DefaultZoneConfig(), serverpb.ZoneConfigurationLevel_CLUSTER)
-	verifyTblZone(config.DefaultZoneConfig(), serverpb.ZoneConfigurationLevel_CLUSTER)
+	verifyDbZone(s.(*TestServer).Cfg.DefaultZoneConfig, serverpb.ZoneConfigurationLevel_CLUSTER)
+	verifyTblZone(s.(*TestServer).Cfg.DefaultZoneConfig, serverpb.ZoneConfigurationLevel_CLUSTER)
 
 	// Get ID path for table. This will be an array of three IDs, containing the ID of the root namespace,
 	// the database, and the table (in that order).
-	idPath, err := ts.admin.queryDescriptorIDPath(
-		ctx, sql.SessionArgs{User: security.RootUser}, []string{"test", "tbl"},
-	)
+	idPath, err := ts.admin.queryDescriptorIDPath(ctx, security.RootUser, []string{"test", "tbl"})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Apply zone configuration to database and check again.
 	dbZone := config.ZoneConfig{
-		RangeMinBytes: 456,
+		RangeMinBytes: proto.Int64(456),
 	}
 	setZone(dbZone, idPath[1])
 	verifyDbZone(dbZone, serverpb.ZoneConfigurationLevel_DATABASE)
@@ -616,7 +719,7 @@ func TestAdminAPIZoneDetails(t *testing.T) {
 
 	// Apply zone configuration to table and check again.
 	tblZone := config.ZoneConfig{
-		RangeMinBytes: 789,
+		RangeMinBytes: proto.Int64(789),
 	}
 	setZone(tblZone, idPath[2])
 	verifyDbZone(dbZone, serverpb.ZoneConfigurationLevel_DATABASE)
@@ -692,7 +795,7 @@ func TestAdminAPIEvents(t *testing.T) {
 		{sql.EventLogCreateDatabase, false, 0, 3},
 		{sql.EventLogDropTable, false, 0, 2},
 		{sql.EventLogCreateTable, false, 0, 3},
-		{sql.EventLogSetClusterSetting, false, 0, 5},
+		{sql.EventLogSetClusterSetting, false, 0, 4},
 		{sql.EventLogCreateTable, true, 0, 3},
 		{sql.EventLogCreateTable, true, -1, 3},
 		{sql.EventLogCreateTable, true, 2, 2},
@@ -1064,7 +1167,7 @@ func TestHealthAPI(t *testing.T) {
 
 // getSystemJobIDs queries the jobs table for all jobs IDs. Sorted by decreasing creation time.
 func getSystemJobIDs(t testing.TB, db *sqlutils.SQLRunner) []int64 {
-	rows := db.Query(t, `SELECT id FROM crdb_internal.jobs ORDER BY created DESC;`)
+	rows := db.Query(t, `SELECT job_id FROM crdb_internal.jobs ORDER BY created DESC;`)
 	defer rows.Close()
 
 	res := []int64{}
@@ -1089,23 +1192,43 @@ func TestAdminAPIJobs(t *testing.T) {
 	existingIDs := getSystemJobIDs(t, sqlDB)
 
 	testJobs := []struct {
-		id      int64
-		status  jobs.Status
-		details jobs.Details
+		id       int64
+		status   jobs.Status
+		details  jobspb.Details
+		progress jobspb.ProgressDetails
 	}{
-		{1, jobs.StatusRunning, jobs.RestoreDetails{}},
-		{2, jobs.StatusRunning, jobs.BackupDetails{}},
-		{3, jobs.StatusSucceeded, jobs.BackupDetails{}},
+		{1, jobs.StatusRunning, jobspb.RestoreDetails{}, jobspb.RestoreProgress{}},
+		{2, jobs.StatusRunning, jobspb.BackupDetails{}, jobspb.BackupProgress{}},
+		{3, jobs.StatusSucceeded, jobspb.BackupDetails{}, jobspb.BackupProgress{}},
+		{4, jobs.StatusRunning, jobspb.ChangefeedDetails{}, jobspb.ChangefeedProgress{}},
 	}
 	for _, job := range testJobs {
-		payload := jobs.Payload{Details: jobs.WrapPayloadDetails(job.details)}
+		payload := jobspb.Payload{Details: jobspb.WrapPayloadDetails(job.details)}
 		payloadBytes, err := protoutil.Marshal(&payload)
 		if err != nil {
 			t.Fatal(err)
 		}
+
+		progress := jobspb.Progress{Details: jobspb.WrapProgressDetails(job.progress)}
+		// Populate progress.Progress field with a specific progress type based on
+		// the job type.
+		if _, ok := job.progress.(jobspb.ChangefeedProgress); ok {
+			progress.Progress = &jobspb.Progress_HighWater{
+				HighWater: &hlc.Timestamp{},
+			}
+		} else {
+			progress.Progress = &jobspb.Progress_FractionCompleted{
+				FractionCompleted: 1.0,
+			}
+		}
+
+		progressBytes, err := protoutil.Marshal(&progress)
+		if err != nil {
+			t.Fatal(err)
+		}
 		sqlDB.Exec(t,
-			`INSERT INTO system.jobs (id, status, payload) VALUES ($1, $2, $3)`,
-			job.id, job.status, payloadBytes,
+			`INSERT INTO system.jobs (id, status, payload, progress) VALUES ($1, $2, $3, $4)`,
+			job.id, job.status, payloadBytes, progressBytes,
 		)
 	}
 
@@ -1115,16 +1238,16 @@ func TestAdminAPIJobs(t *testing.T) {
 		uri         string
 		expectedIDs []int64
 	}{
-		{"jobs", append([]int64{3, 2, 1}, existingIDs...)},
-		{"jobs?limit=1", []int64{3}},
-		{"jobs?status=running", []int64{2, 1}},
+		{"jobs", append([]int64{4, 3, 2, 1}, existingIDs...)},
+		{"jobs?limit=1", []int64{4}},
+		{"jobs?status=running", []int64{4, 2, 1}},
 		{"jobs?status=succeeded", append([]int64{3}, existingIDs...)},
 		{"jobs?status=pending", []int64{}},
 		{"jobs?status=garbage", []int64{}},
-		{fmt.Sprintf("jobs?type=%d", jobs.TypeBackup), []int64{3, 2}},
-		{fmt.Sprintf("jobs?type=%d", jobs.TypeRestore), []int64{1}},
+		{fmt.Sprintf("jobs?type=%d", jobspb.TypeBackup), []int64{3, 2}},
+		{fmt.Sprintf("jobs?type=%d", jobspb.TypeRestore), []int64{1}},
 		{fmt.Sprintf("jobs?type=%d", invalidJobType), []int64{}},
-		{fmt.Sprintf("jobs?status=running&type=%d", jobs.TypeBackup), []int64{2}},
+		{fmt.Sprintf("jobs?status=running&type=%d", jobspb.TypeBackup), []int64{2}},
 	}
 	for i, testCase := range testCases {
 		var res serverpb.JobsResponse
@@ -1197,7 +1320,7 @@ func TestAdminAPIQueryPlan(t *testing.T) {
 		exp   []string
 	}{
 		{"SELECT sum(id) FROM api_test.t1", []string{"nodeNames\":[\"1\"]", "Out: @1"}},
-		{"SELECT sum(1) FROM api_test.t1 JOIN api_test.t2 on t1.id = t2.id", []string{"nodeNames\":[\"1\"]", "Out: @1", "MergeJoiner"}},
+		{"SELECT sum(1) FROM api_test.t1 JOIN api_test.t2 on t1.id = t2.id", []string{"nodeNames\":[\"1\"]", "Out: @1"}},
 	}
 	for i, testCase := range testCases {
 		var res serverpb.QueryPlanResponse
@@ -1208,29 +1331,46 @@ func TestAdminAPIQueryPlan(t *testing.T) {
 
 		for _, exp := range testCase.exp {
 			if !strings.Contains(res.DistSQLPhysicalQueryPlan, exp) {
-				t.Errorf("%d: expected response %s to contain %s", i, res, exp)
+				t.Errorf("%d: expected response %v to contain %s", i, res, exp)
 			}
 		}
 	}
 
 }
 
-func TestAdminAPIRangeLog(t *testing.T) {
+func TestAdminAPIRangeLogByRangeID(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 
+	rangeID := 654321
 	testCases := []struct {
 		rangeID  int
 		hasLimit bool
 		limit    int
 		expected int
 	}{
-		{1, false, 0, 1},
-		{2, false, 0, 2},
-		{2, true, 0, 2},
-		{2, true, -1, 2},
-		{2, true, 1, 1},
+		{rangeID, true, 0, 2},
+		{rangeID, true, -1, 2},
+		{rangeID, true, 1, 1},
+		{rangeID, false, 0, 2},
+		// We'll create one event that has rangeID+1 as the otherRangeID.
+		{rangeID + 1, false, 0, 1},
+	}
+
+	for _, otherRangeID := range []int{rangeID + 1, rangeID + 2} {
+		if _, err := db.Exec(
+			`INSERT INTO system.rangelog (
+             timestamp, "rangeID", "otherRangeID", "storeID", "eventType"
+           ) VALUES (
+             now(), $1, $2, $3, $4
+          )`,
+			rangeID, otherRangeID,
+			1, // storeID
+			storagepb.RangeLogEventType_add.String(),
+		); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	for _, tc := range testCases {
@@ -1249,26 +1389,62 @@ func TestAdminAPIRangeLog(t *testing.T) {
 			}
 
 			for _, event := range resp.Events {
-				if event.Event.RangeID != roachpb.RangeID(tc.rangeID) &&
-					event.Event.OtherRangeID != roachpb.RangeID(tc.rangeID) {
-					t.Errorf("expected rangeID or otherRangeID to be r%d, got r%d and r%d",
-						tc.rangeID, event.Event.RangeID, event.Event.OtherRangeID)
+				expID := roachpb.RangeID(tc.rangeID)
+				if event.Event.RangeID != expID && event.Event.OtherRangeID != expID {
+					t.Errorf("expected rangeID or otherRangeID to be %d, got %d and r%d",
+						expID, event.Event.RangeID, event.Event.OtherRangeID)
 				}
 			}
 		})
 	}
 }
 
+// Test the range log API when queries are not filtered by a range ID (like in
+// TestAdminAPIRangeLogByRangeID).
 func TestAdminAPIFullRangeLog(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s, _, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	s, db, _ := serverutils.StartServer(t,
+		base.TestServerArgs{
+			Knobs: base.TestingKnobs{
+				Store: &storage.StoreTestingKnobs{
+					DisableSplitQueue: true,
+				},
+			},
+		})
 	defer s.Stopper().Stop(context.Background())
 
-	expectedRanges, err := ExpectedInitialRangeCount(kvDB)
+	// Insert something in the rangelog table, otherwise it's empty for new
+	// clusters.
+	rows, err := db.Query(`SELECT count(1) FROM system.rangelog`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	expectedEvents := expectedRanges - 1 // one for each split
+	if !rows.Next() {
+		t.Fatal("missing row")
+	}
+	var cnt int
+	if err := rows.Scan(&cnt); err != nil {
+		t.Fatal(err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if cnt != 0 {
+		t.Fatalf("expected 0 rows in system.rangelog, found: %d", cnt)
+	}
+	const rangeID = 100
+	for i := 0; i < 10; i++ {
+		if _, err := db.Exec(
+			`INSERT INTO system.rangelog (
+             timestamp, "rangeID", "storeID", "eventType"
+           ) VALUES (now(), $1, 1, $2)`,
+			rangeID,
+			storagepb.RangeLogEventType_add.String(),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	expectedEvents := 10
 
 	testCases := []struct {
 		hasLimit bool
@@ -1291,17 +1467,20 @@ func TestAdminAPIFullRangeLog(t *testing.T) {
 			if err := getAdminJSONProto(s, url, &resp); err != nil {
 				t.Fatal(err)
 			}
-			if e, a := tc.expected, len(resp.Events); e != a {
-				t.Fatalf("expected %d events, got %d", e, a)
+			events := resp.Events
+			if e, a := tc.expected, len(events); e != a {
+				var sb strings.Builder
+				for _, ev := range events {
+					sb.WriteString(ev.String() + "\n")
+				}
+				t.Fatalf("expected %d events, got %d:\n%s", e, a, sb.String())
 			}
 		})
 	}
 }
 
-func TestAdminAPIReplicaMatrix(t *testing.T) {
+func TestAdminAPIDataDistribution(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-
-	t.Skip("#24802")
 
 	testCluster := serverutils.StartTestCluster(t, 3, base.TestClusterArgs{})
 	defer testCluster.Stopper().Stop(context.Background())
@@ -1321,12 +1500,12 @@ func TestAdminAPIReplicaMatrix(t *testing.T) {
 	sqlDB.Exec(t, `CREATE DATABASE "sp'ec\ch""ars"`)
 	sqlDB.Exec(t, `CREATE TABLE "sp'ec\ch""ars"."more\spec'chars" (id INT PRIMARY KEY)`)
 
-	// Verify that we see their replicas in the ReplicaMatrix response, evenly spread
+	// Verify that we see their replicas in the DataDistribution response, evenly spread
 	// across the test cluster's three nodes.
 
-	expectedResp := map[string]serverpb.ReplicaMatrixResponse_DatabaseInfo{
+	expectedDatabaseInfo := map[string]serverpb.DataDistributionResponse_DatabaseInfo{
 		"roachblog": {
-			TableInfo: map[string]serverpb.ReplicaMatrixResponse_TableInfo{
+			TableInfo: map[string]serverpb.DataDistributionResponse_TableInfo{
 				"posts": {
 					ReplicaCountByNodeId: map[roachpb.NodeID]int64{
 						1: 1,
@@ -1344,7 +1523,7 @@ func TestAdminAPIReplicaMatrix(t *testing.T) {
 			},
 		},
 		`sp'ec\ch"ars`: {
-			TableInfo: map[string]serverpb.ReplicaMatrixResponse_TableInfo{
+			TableInfo: map[string]serverpb.DataDistributionResponse_TableInfo{
 				`more\spec'chars`: {
 					ReplicaCountByNodeId: map[roachpb.NodeID]int64{
 						1: 1,
@@ -1358,14 +1537,14 @@ func TestAdminAPIReplicaMatrix(t *testing.T) {
 
 	// Wait for the new tables' ranges to be created and replicated.
 	testutils.SucceedsSoon(t, func() error {
-		var resp serverpb.ReplicaMatrixResponse
-		if err := getAdminJSONProto(firstServer, "replica_matrix", &resp); err != nil {
+		var resp serverpb.DataDistributionResponse
+		if err := getAdminJSONProto(firstServer, "data_distribution", &resp); err != nil {
 			t.Fatal(err)
 		}
 
 		delete(resp.DatabaseInfo, "system") // delete results for system database.
-		if !reflect.DeepEqual(resp.DatabaseInfo, expectedResp) {
-			return fmt.Errorf("expected %v; got %v", expectedResp, resp.DatabaseInfo)
+		if !reflect.DeepEqual(resp.DatabaseInfo, expectedDatabaseInfo) {
+			return fmt.Errorf("expected %v; got %v", expectedDatabaseInfo, resp.DatabaseInfo)
 		}
 
 		// Don't test anything about the zone configs for now; just verify that something is there.
@@ -1376,52 +1555,31 @@ func TestAdminAPIReplicaMatrix(t *testing.T) {
 		return nil
 	})
 
-	// Add a zone config.
-	sqlDB.Exec(t, `ALTER TABLE roachblog.posts EXPERIMENTAL CONFIGURE ZONE 'num_replicas: 1'`)
+	// Verify that the request still works after a table has been dropped,
+	// and that dropped_at is set on the dropped table.
+	sqlDB.Exec(t, `DROP TABLE roachblog.comments`)
 
-	expectedNewZoneConfigID := int64(51)
-	sqlDB.CheckQueryResults(
-		t,
-		`SELECT id
-		FROM [EXPERIMENTAL SHOW ALL ZONE CONFIGURATIONS]
-		WHERE cli_specifier = 'roachblog.posts'`,
-		[][]string{
-			{fmt.Sprintf("%d", expectedNewZoneConfigID)},
-		},
-	)
+	var resp serverpb.DataDistributionResponse
+	if err := getAdminJSONProto(firstServer, "data_distribution", &resp); err != nil {
+		t.Fatal(err)
+	}
 
-	// Verify that we see the zone config and its effects.
-	testutils.SucceedsSoon(t, func() error {
-		var resp serverpb.ReplicaMatrixResponse
-		if err := getAdminJSONProto(firstServer, "replica_matrix", &resp); err != nil {
-			t.Fatal(err)
-		}
+	if resp.DatabaseInfo["roachblog"].TableInfo["comments"].DroppedAt == nil {
+		t.Fatal("expected roachblog.comments to have dropped_at set but it's nil")
+	}
 
-		postsTableInfo := resp.DatabaseInfo["roachblog"].TableInfo["posts"]
+	// Verify that the request still works after a database has been dropped.
+	sqlDB.Exec(t, `DROP DATABASE roachblog CASCADE`)
 
-		// Verify that the TableInfo for roachblog.posts points at the new zone config.
-		if postsTableInfo.ZoneConfigId != expectedNewZoneConfigID {
-			t.Fatalf(
-				"expected roachblog.posts to have zone config id %d; had %d",
-				expectedNewZoneConfigID, postsTableInfo.ZoneConfigId,
-			)
-		}
-
-		// Verify that the num_replicas setting has taken effect.
-		numPostsReplicas := int64(0)
-		for _, count := range postsTableInfo.ReplicaCountByNodeId {
-			numPostsReplicas += count
-		}
-
-		if numPostsReplicas != 1 {
-			return fmt.Errorf("expected 1 replica; got %d", numPostsReplicas)
-		}
-
-		return nil
-	})
+	if err := getAdminJSONProto(firstServer, "data_distribution", &resp); err != nil {
+		t.Fatal(err)
+	}
 }
 
-func BenchmarkAdminAPIReplicaMatrix(b *testing.B) {
+func BenchmarkAdminAPIDataDistribution(b *testing.B) {
+	if testing.Short() {
+		b.Skip("TODO: fix benchmark")
+	}
 	testCluster := serverutils.StartTestCluster(b, 3, base.TestClusterArgs{})
 	defer testCluster.Stopper().Stop(context.Background())
 
@@ -1441,10 +1599,121 @@ func BenchmarkAdminAPIReplicaMatrix(b *testing.B) {
 
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		var resp serverpb.ReplicaMatrixResponse
-		if err := getAdminJSONProto(firstServer, "replica_matrix", &resp); err != nil {
+		var resp serverpb.DataDistributionResponse
+		if err := getAdminJSONProto(firstServer, "data_distribution", &resp); err != nil {
 			b.Fatal(err)
 		}
 	}
 	b.StopTimer()
+}
+
+func TestEnqueueRange(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	testCluster := serverutils.StartTestCluster(t, 3, base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual,
+	})
+	defer testCluster.Stopper().Stop(context.Background())
+
+	// Up-replicate r1 to all 3 nodes. We use manual replication to avoid lease
+	// transfers causing temporary conditions in which no store is the
+	// leaseholder, which can break the the tests below.
+	_, err := testCluster.AddReplicas(roachpb.KeyMin, testCluster.Target(1), testCluster.Target(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// RangeID being queued
+	const realRangeID = 1
+	const fakeRangeID = 999
+
+	// Who we expect responses from.
+	const none = 0
+	const leaseholder = 1
+	const allReplicas = 3
+
+	testCases := []struct {
+		nodeID            roachpb.NodeID
+		queue             string
+		rangeID           roachpb.RangeID
+		expectedDetails   int
+		expectedNonErrors int
+	}{
+		// Success cases
+		{0, "gc", realRangeID, allReplicas, leaseholder},
+		{0, "split", realRangeID, allReplicas, leaseholder},
+		{0, "replicaGC", realRangeID, allReplicas, allReplicas},
+		{0, "RaFtLoG", realRangeID, allReplicas, allReplicas},
+		{0, "RAFTSNAPSHOT", realRangeID, allReplicas, allReplicas},
+		{0, "consistencyChecker", realRangeID, allReplicas, leaseholder},
+		{0, "TIMESERIESmaintenance", realRangeID, allReplicas, leaseholder},
+		{1, "raftlog", realRangeID, leaseholder, leaseholder},
+		{2, "raftlog", realRangeID, leaseholder, 1},
+		{3, "raftlog", realRangeID, leaseholder, 1},
+		// Error cases
+		{0, "gv", realRangeID, allReplicas, none},
+		{0, "GC", fakeRangeID, allReplicas, none},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.queue, func(t *testing.T) {
+			req := &serverpb.EnqueueRangeRequest{
+				NodeID:  tc.nodeID,
+				Queue:   tc.queue,
+				RangeID: tc.rangeID,
+			}
+			var resp serverpb.EnqueueRangeResponse
+			if err := postAdminJSONProto(testCluster.Server(0), "enqueue_range", req, &resp); err != nil {
+				t.Fatal(err)
+			}
+			if e, a := tc.expectedDetails, len(resp.Details); e != a {
+				t.Errorf("expected %d details; got %d: %+v", e, a, resp)
+			}
+			var numNonErrors int
+			for _, details := range resp.Details {
+				if len(details.Events) > 0 && details.Error == "" {
+					numNonErrors++
+				}
+			}
+			if tc.expectedNonErrors != numNonErrors {
+				t.Errorf("expected %d non-error details; got %d: %+v", tc.expectedNonErrors, numNonErrors, resp)
+			}
+		})
+	}
+
+	// Finally, test a few more basic error cases.
+	reqs := []*serverpb.EnqueueRangeRequest{
+		{NodeID: -1, Queue: "gc"},
+		{Queue: ""},
+		{RangeID: -1, Queue: "gc"},
+	}
+	for _, req := range reqs {
+		t.Run(fmt.Sprint(req), func(t *testing.T) {
+			var resp serverpb.EnqueueRangeResponse
+			err := postAdminJSONProto(testCluster.Server(0), "enqueue_range", req, &resp)
+			if err == nil {
+				t.Fatalf("unexpected success: %+v", resp)
+			}
+			if !testutils.IsError(err, "400 Bad Request") {
+				t.Fatalf("unexpected error type: %+v", err)
+			}
+		})
+	}
+}
+
+func TestStatsforSpanOnLocalMax(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	testCluster := serverutils.StartTestCluster(t, 3, base.TestClusterArgs{})
+	defer testCluster.Stopper().Stop(context.Background())
+	firstServer := testCluster.Server(0)
+	adminServer := firstServer.(*TestServer).Server.admin
+
+	underTest := roachpb.Span{
+		Key:    keys.LocalMax,
+		EndKey: keys.SystemPrefix,
+	}
+
+	_, err := adminServer.statsForSpan(context.Background(), underTest)
+	if err != nil {
+		t.Fatal(err)
+	}
 }

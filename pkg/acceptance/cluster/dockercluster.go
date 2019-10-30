@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cluster
 
@@ -34,15 +30,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/events"
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/pkg/stdcopy"
-	"github.com/docker/go-connections/nat"
-	"github.com/pkg/errors"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -53,6 +40,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/events"
+	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/stdcopy"
+	"github.com/docker/go-connections/nat"
+	"github.com/pkg/errors"
 )
 
 const (
@@ -71,11 +66,11 @@ const CockroachBinaryInContainer = "/cockroach/cockroach"
 var cockroachImage = flag.String("i", defaultImage, "the docker image to run")
 var cockroachEntry = flag.String("e", "", "the entry point for the image")
 var waitOnStop = flag.Bool("w", false, "wait for the user to interrupt before tearing down the cluster")
-var maxRangeBytes = config.DefaultZoneConfig().RangeMaxBytes
+var maxRangeBytes = *config.DefaultZoneConfig().RangeMaxBytes
 
 // CockroachBinary is the path to the host-side binary to use.
 var CockroachBinary = flag.String("b", func() string {
-	rootPkg, err := build.Import("github.com/cockroachdb/cockroach", "", 0)
+	rootPkg, err := build.Import("github.com/cockroachdb/cockroach", "", build.FindOnly)
 	if err != nil {
 		panic(err)
 	}
@@ -166,7 +161,7 @@ func CreateDocker(
 		log.Fatalf(ctx, "\"%s\": does not exist", *CockroachBinary)
 	}
 
-	cli, err := client.NewEnvClient()
+	cli, err := client.NewClientWithOpts(client.FromEnv)
 	maybePanic(err)
 
 	cli.NegotiateAPIVersion(ctx)
@@ -465,8 +460,8 @@ func (l *DockerCluster) startNode(ctx context.Context, node *testNode) {
 	cmd := []string{
 		"start",
 		"--certs-dir=/certs/",
-		"--host=" + node.nodeStr,
-		"--verbosity=1",
+		"--listen-addr=" + node.nodeStr,
+		"--vmodule=*=1",
 	}
 
 	// Forward the vmodule flag to the nodes.
@@ -495,7 +490,6 @@ func (l *DockerCluster) startNode(ctx context.Context, node *testNode) {
 		"--log-dir="+dockerLogDir)
 	env := []string{
 		"COCKROACH_SCAN_MAX_IDLE_TIME=200ms",
-		"COCKROACH_CONSISTENCY_CHECK_PANIC_ON_FAILURE=true",
 		"COCKROACH_SKIP_UPDATE_CHECK=1",
 		"COCKROACH_CRASH_REPORTS=",
 	}
@@ -510,7 +504,7 @@ func (l *DockerCluster) startNode(ctx context.Context, node *testNode) {
   pprof:     docker exec -it %[4]s pprof https+insecure://$(hostname):%[5]s/debug/pprof/heap
   cockroach: %[6]s
 
-  cli-env:   COCKROACH_INSECURE=false COCKROACH_CERTS_DIR=%[7]s COCKROACH_HOST=%s COCKROACH_PORT=%d`,
+  cli-env:   COCKROACH_INSECURE=false COCKROACH_CERTS_DIR=%[7]s COCKROACH_HOST=%s:%d`,
 		node.Name(), "https://"+httpAddr.String(), localLogDir, node.Container.id[:5],
 		base.DefaultHTTPPort, cmd, certsDir, httpAddr.IP, httpAddr.Port)
 }

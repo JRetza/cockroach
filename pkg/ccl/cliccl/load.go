@@ -15,12 +15,12 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl"
-	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/cli"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 )
@@ -54,12 +54,20 @@ func runLoadShow(cmd *cobra.Command, args []string) error {
 	basepath := args[0]
 	if !strings.Contains(basepath, "://") {
 		var err error
-		basepath, err = storageccl.MakeLocalStorageURI(basepath)
+		basepath, err = cloud.MakeLocalStorageURI(basepath)
 		if err != nil {
 			return err
 		}
 	}
-	desc, err := backupccl.ReadBackupDescriptorFromURI(ctx, basepath, cluster.NoSettings)
+
+	externalStorageFromURI := func(ctx context.Context, uri string) (cloud.ExternalStorage, error) {
+		return cloud.ExternalStorageFromURI(ctx, uri, cluster.NoSettings)
+	}
+	// This reads the raw backup descriptor (with table descriptors possibly not
+	// upgraded from the old FK representation, or even older formats). If more
+	// fields are added to the output, the table descriptors may need to be
+	// upgraded.
+	desc, err := backupccl.ReadBackupDescriptorFromURI(ctx, basepath, externalStorageFromURI)
 	if err != nil {
 		return err
 	}
@@ -89,9 +97,11 @@ func runLoadShow(cmd *cobra.Command, args []string) error {
 		fmt.Printf("		IndexEntries: %d\n", f.EntryCounts.IndexEntries)
 		fmt.Printf("		SystemRecords: %d\n", f.EntryCounts.SystemRecords)
 	}
+	// Note that these descriptors could be from any past version of the cluster,
+	// in case more fields need to be added to the output.
 	fmt.Printf("Descriptors:\n")
 	for _, d := range desc.Descriptors {
-		if desc := d.GetTable(); desc != nil {
+		if desc := d.Table(hlc.Timestamp{}); desc != nil {
 			fmt.Printf("	%d: %s (table)\n", d.GetID(), d.GetName())
 		}
 		if desc := d.GetDatabase(); desc != nil {

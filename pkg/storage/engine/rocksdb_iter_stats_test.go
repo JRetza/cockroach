@@ -1,20 +1,17 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package engine
 
 import (
+	"math"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -41,10 +38,8 @@ func TestIterStats(t *testing.T) {
 	defer batch.Close()
 
 	testCases := []Iterator{
-		db.NewIterator(IterOptions{WithStats: true}),
-		db.NewTimeBoundIterator(hlc.Timestamp{}, hlc.Timestamp{WallTime: 999}, true /* withStats */),
-		batch.NewIterator(IterOptions{WithStats: true}),
-		batch.NewTimeBoundIterator(hlc.Timestamp{}, hlc.Timestamp{WallTime: 999}, true /* withStats */),
+		db.NewIterator(IterOptions{UpperBound: roachpb.KeyMax, WithStats: true}),
+		batch.NewIterator(IterOptions{UpperBound: roachpb.KeyMax, WithStats: true}),
 	}
 
 	defer func() {
@@ -66,8 +61,8 @@ func TestIterStats(t *testing.T) {
 			}
 			// Scanning a key range containing the tombstone sees it.
 			for i := 0; i < 10; i++ {
-				if _, _, _, err := iter.MVCCScan(
-					roachpb.KeyMin, roachpb.KeyMax, 0, hlc.Timestamp{}, nil, true, false, false,
+				if _, _, _, _, err := iter.MVCCScan(
+					roachpb.KeyMin, roachpb.KeyMax, math.MaxInt64, hlc.Timestamp{}, MVCCScanOptions{},
 				); err != nil {
 					t.Fatal(err)
 				}
@@ -79,9 +74,7 @@ func TestIterStats(t *testing.T) {
 
 			// Getting the key with the tombstone sees it.
 			for i := 0; i < 10; i++ {
-				if _, _, err := iter.MVCCGet(
-					k.Key, hlc.Timestamp{}, nil, true, false,
-				); err != nil {
+				if _, _, err := iter.MVCCGet(k.Key, hlc.Timestamp{}, MVCCGetOptions{}); err != nil {
 					t.Fatal(err)
 				}
 				stats := iter.Stats()
@@ -91,9 +84,7 @@ func TestIterStats(t *testing.T) {
 			}
 			// Getting KeyMax doesn't see it.
 			for i := 0; i < 10; i++ {
-				if _, _, err := iter.MVCCGet(
-					roachpb.KeyMax, hlc.Timestamp{}, nil, true, false,
-				); err != nil {
+				if _, _, err := iter.MVCCGet(roachpb.KeyMax, hlc.Timestamp{}, MVCCGetOptions{}); err != nil {
 					t.Fatal(err)
 				}
 				stats := iter.Stats()

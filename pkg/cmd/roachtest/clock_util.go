@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -31,7 +26,7 @@ func isAlive(db *gosql.DB) bool {
 // dbUnixEpoch returns the current time in db
 func dbUnixEpoch(db *gosql.DB) (float64, error) {
 	var epoch float64
-	if err := db.QueryRow("SELECT NOW()::DECIMAL").Scan(&epoch); err != nil {
+	if err := db.QueryRow("SELECT now()::DECIMAL").Scan(&epoch); err != nil {
 		return 0, err
 	}
 	return epoch, nil
@@ -44,21 +39,36 @@ type offsetInjector struct {
 }
 
 // deploy installs ntp and downloads / compiles bumptime used to create a clock offset
-func (oi *offsetInjector) deploy(ctx context.Context) {
-	if err := oi.c.RunE(ctx, oi.c.All(), "test -x ./bumptime"); err != nil {
-		oi.c.Install(ctx, oi.c.All(), "ntp")
-		oi.c.Install(ctx, oi.c.All(), "gcc")
-		oi.c.Run(ctx, oi.c.All(), "sudo", "service", "ntp", "stop")
-		oi.c.Run(ctx,
-			oi.c.All(),
-			"curl",
-			"-kO",
-			"https://raw.githubusercontent.com/cockroachdb/jepsen/master/cockroachdb/resources/bumptime.c",
-		)
-		oi.c.Run(ctx, oi.c.All(), "gcc", "bumptime.c", "-o", "bumptime", "&&", "rm bumptime.c")
+func (oi *offsetInjector) deploy(ctx context.Context, l *logger) error {
+	if err := oi.c.RunE(ctx, oi.c.All(), "test -x ./bumptime"); err == nil {
+		oi.deployed = true
+		return nil
 	}
 
+	if err := oi.c.Install(ctx, l, oi.c.All(), "ntp"); err != nil {
+		return err
+	}
+	if err := oi.c.Install(ctx, l, oi.c.All(), "gcc"); err != nil {
+		return err
+	}
+	if err := oi.c.RunL(ctx, l, oi.c.All(), "sudo", "service", "ntp", "stop"); err != nil {
+		return err
+	}
+	if err := oi.c.RunL(ctx, l,
+		oi.c.All(),
+		"curl",
+		"-kO",
+		"https://raw.githubusercontent.com/cockroachdb/jepsen/master/cockroachdb/resources/bumptime.c",
+	); err != nil {
+		return err
+	}
+	if err := oi.c.RunL(ctx, l,
+		oi.c.All(), "gcc", "bumptime.c", "-o", "bumptime", "&&", "rm bumptime.c",
+	); err != nil {
+		return err
+	}
 	oi.deployed = true
+	return nil
 }
 
 // offset injects a offset of s into the node with the given nodeID

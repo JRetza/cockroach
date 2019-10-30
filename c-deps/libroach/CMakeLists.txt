@@ -33,13 +33,19 @@ add_library(roach
   file_registry.cc
   getter.cc
   godefs.cc
+  incremental_iterator.cc
+  row_counter.cc
+  iterator.cc
   ldb.cc
   merge.cc
   mvcc.cc
   options.cc
   snapshot.cc
+  sst_dump.cc
+  table_props.cc
   utils.cc
   protos/roachpb/data.pb.cc
+  protos/roachpb/errors.pb.cc
   protos/roachpb/internal.pb.cc
   protos/roachpb/metadata.pb.cc
   protos/storage/engine/enginepb/mvcc.pb.cc
@@ -48,7 +54,10 @@ add_library(roach
   protos/storage/engine/enginepb/rocksdb.pb.cc
   protos/util/hlc/legacy_timestamp.pb.cc
   protos/util/hlc/timestamp.pb.cc
+  protos/util/log/log.pb.cc
   protos/util/unresolved_addr.pb.cc
+  protos/roachpb/api.pb.cc
+  protos/util/tracing/recorded_span.pb.cc
   rocksdbutils/env_encryption.cc
 )
 target_include_directories(roach
@@ -68,6 +77,7 @@ add_library(roachccl
   protosccl/ccl/storageccl/engineccl/enginepbccl/stats.pb.cc
 )
 target_include_directories(roachccl
+  PUBLIC ./ccl/include
   PRIVATE .. # CryptoPP headers are directly in the directory. Include .. to be able to include <cryptopp/....h>
   PRIVATE ../protobuf/src
   PRIVATE ../rocksdb/include
@@ -80,7 +90,7 @@ set_target_properties(roach roachccl PROPERTIES
   CXX_STANDARD 11
   CXX_STANDARD_REQUIRED YES
   CXX_EXTENSIONS NO
-  COMPILE_OPTIONS "-Werror;-Wall;-Wno-sign-compare"
+  COMPILE_OPTIONS "-Werror;-Wall;-Wno-sign-compare;-Wno-array-bounds"
 )
 
 enable_testing()
@@ -88,10 +98,14 @@ enable_testing()
 # List of tests to build and run. Tests in `ccl/` are linked against roachccl, all others
 # are linked against roach only.
 set(tests
+  chunked_buffer_test.cc
   db_test.cc
   encoding_test.cc
   file_registry_test.cc
+  merge_test.cc
+  ccl/crypto_utils_test.cc
   ccl/db_test.cc
+  ccl/encrypted_env_test.cc
   ccl/key_manager_test.cc
 )
 
@@ -120,17 +134,10 @@ foreach(tsrc ${tests})
     set(tname ${dirname}_${filename})
   endif()
 
-  # Add a new executable and set includes/libraries/properties.
-  add_executable(${tname} ${tsrc} testutils.cc)
-  target_include_directories(${tname}
-    PRIVATE ../googletest/googletest/include
-    PRIVATE ../protobuf/src
-    PRIVATE ../rocksdb/include
-    PRIVATE protos
-  )
-
-  # Link `ccl/` tests against roachccl and CryptoPP.
   if(${tsrc} MATCHES "^ccl/")
+    # Link `ccl/` tests against roachccl and CryptoPP.
+		# Use ccl/testutils.
+    add_executable(${tname} ${tsrc} testutils.cc ccl/testutils.cc)
     target_link_libraries(${tname}
       roachccl
       ${CRYPTOPP_LIB}
@@ -139,7 +146,18 @@ foreach(tsrc ${tests})
       PRIVATE .. # CryptoPP headers are directly in the directory. Include .. to be able to include <cryptopp/....h>
       PRIVATE protosccl
     )
+  else()
+		# Use testutils.
+    add_executable(${tname} ${tsrc} testutils.cc)
   endif()
+
+	# Set includes/libraries/properties.
+  target_include_directories(${tname}
+    PRIVATE ../googletest/googletest/include
+    PRIVATE ../protobuf/src
+    PRIVATE ../rocksdb/include
+    PRIVATE protos
+  )
 
   # Add all other libraries.
   target_link_libraries(${tname}
@@ -152,11 +170,15 @@ foreach(tsrc ${tests})
     ${SNAPPY_LIB}
   )
 
+  if(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
+    target_link_libraries(${tname} rt)
+  endif()
+
   set_target_properties(${tname} PROPERTIES
     CXX_STANDARD 11
     CXX_STANDARD_REQUIRED YES
     CXX_EXTENSIONS NO
-    COMPILE_OPTIONS "-Werror;-Wall;-Wno-sign-compare"
+    COMPILE_OPTIONS "-Werror;-Wall;-Wno-sign-compare;-Wno-array-bounds"
   )
 
   # Add the executable to the set of tests run by the "check" target.

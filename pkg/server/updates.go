@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package server
 
@@ -21,15 +17,14 @@ import (
 	"io"
 	"io/ioutil"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/url"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/mitchellh/reflectwalk"
-	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
@@ -37,14 +32,23 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/diagnosticspb"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util/cloudinfo"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/gogo/protobuf/proto"
+	"github.com/mitchellh/reflectwalk"
+	"github.com/pkg/errors"
+	"github.com/shirou/gopsutil/cpu"
+	"github.com/shirou/gopsutil/host"
+	"github.com/shirou/gopsutil/load"
+	"github.com/shirou/gopsutil/mem"
 )
 
 const baseUpdatesURL = `https://register.cockroachdb.com/api/clusters/updates`
@@ -67,8 +71,6 @@ func init() {
 		panic(err)
 	}
 }
-
-var envChannel = envutil.EnvOrDefaultString("COCKROACH_CHANNEL", "unknown")
 
 const (
 	updateCheckFrequency = time.Hour * 24
@@ -102,15 +104,14 @@ type versionInfo struct {
 func (s *Server) PeriodicallyCheckForUpdates(ctx context.Context) {
 	s.stopper.RunWorker(ctx, func(ctx context.Context) {
 		defer log.RecoverAndReportNonfatalPanic(ctx, &s.st.SV)
-		startup := timeutil.Now()
-		nextUpdateCheck := startup
-		nextDiagnosticReport := startup
+		nextUpdateCheck := s.startTime
+		nextDiagnosticReport := s.startTime
 
 		var timer timeutil.Timer
 		defer timer.Stop()
 		for {
 			now := timeutil.Now()
-			runningTime := now.Sub(startup)
+			runningTime := now.Sub(s.startTime)
 
 			nextUpdateCheck = s.maybeCheckForUpdates(ctx, now, nextUpdateCheck, runningTime)
 			nextDiagnosticReport = s.maybeReportDiagnostics(ctx, now, nextDiagnosticReport, runningTime)
@@ -163,26 +164,56 @@ func (s *Server) maybeCheckForUpdates(
 	return now.Add(updateCheckFrequency)
 }
 
-func addInfoToURL(ctx context.Context, url *url.URL, s *Server, runningTime time.Duration) {
+func addInfoToURL(ctx context.Context, url *url.URL, s *Server, n diagnosticspb.NodeInfo) {
+	internal := strings.Contains(sql.ClusterOrganization.Get(&s.st.SV), "Cockroach Labs")
 	q := url.Query()
-	b := build.GetInfo()
+	b := n.Build
 	q.Set("version", b.Tag)
 	q.Set("platform", b.Platform)
 	q.Set("uuid", s.ClusterID().String())
-	q.Set("nodeid", s.NodeID().String())
-	q.Set("uptime", strconv.Itoa(int(runningTime.Seconds())))
+	q.Set("nodeid", strconv.Itoa(int(n.NodeID)))
+	q.Set("uptime", strconv.Itoa(int(n.Uptime)))
 	q.Set("insecure", strconv.FormatBool(s.cfg.Insecure))
-	q.Set("internal",
-		strconv.FormatBool(strings.Contains(sql.ClusterOrganization.Get(&s.st.SV), "Cockroach Labs")))
+	q.Set("internal", strconv.FormatBool(internal))
 	q.Set("buildchannel", b.Channel)
-	q.Set("envchannel", envChannel)
-	licenseType, err := base.LicenseType(s.st)
-	if err == nil {
-		q.Set("licensetype", licenseType)
-	} else {
-		log.Errorf(ctx, "error retrieving license type: %s", err)
-	}
+	q.Set("envchannel", b.EnvChannel)
+	q.Set("licensetype", n.LicenseType)
 	url.RawQuery = q.Encode()
+}
+
+func fillHardwareInfo(ctx context.Context, n *diagnosticspb.NodeInfo) {
+	// Fill in hardware info (OS/CPU/Mem/etc).
+	if platform, family, version, err := host.PlatformInformation(); err == nil {
+		n.Os.Family = family
+		n.Os.Platform = platform
+		n.Os.Version = version
+	}
+
+	if virt, role, err := host.Virtualization(); err == nil && role == "guest" {
+		n.Hardware.Virtualization = virt
+	}
+
+	if m, err := mem.VirtualMemory(); err == nil {
+		n.Hardware.Mem.Available = m.Available
+		n.Hardware.Mem.Total = m.Total
+	}
+
+	n.Hardware.Cpu.Numcpu = int32(runtime.NumCPU())
+	if cpus, err := cpu.InfoWithContext(ctx); err == nil && len(cpus) > 0 {
+		n.Hardware.Cpu.Sockets = int32(len(cpus))
+		c := cpus[0]
+		n.Hardware.Cpu.Cores = c.Cores
+		n.Hardware.Cpu.Model = c.ModelName
+		n.Hardware.Cpu.Mhz = float32(c.Mhz)
+		n.Hardware.Cpu.Features = c.Flags
+	}
+
+	if l, err := load.AvgWithContext(ctx); err == nil {
+		n.Hardware.Loadavg15 = float32(l.Load15)
+	}
+
+	n.Hardware.Provider, n.Hardware.InstanceClass = cloudinfo.GetInstanceClass()
+	n.Topology.Provider, n.Topology.Region = cloudinfo.GetInstanceRegion()
 }
 
 // checkForUpdates calls home to check for new versions for the current platform
@@ -196,7 +227,9 @@ func (s *Server) checkForUpdates(ctx context.Context, runningTime time.Duration)
 	ctx, span := s.AnnotateCtxWithSpan(ctx, "checkForUpdates")
 	defer span.Finish()
 
-	addInfoToURL(ctx, updatesURL, s, runningTime)
+	nodeInfo := s.collectNodeInfo(ctx)
+
+	addInfoToURL(ctx, updatesURL, s, nodeInfo)
 
 	res, err := http.Get(updatesURL.String())
 	if err != nil {
@@ -247,18 +280,37 @@ func (s *Server) maybeReportDiagnostics(
 	// Consider something like rand.Float() > resetFreq/reportFreq here to sample
 	// stat reset periods for reporting.
 	if log.DiagnosticsReportingEnabled.Get(&s.st.SV) {
-		s.reportDiagnostics(ctx, running)
+		s.reportDiagnostics(ctx)
 	}
-	s.pgServer.SQLServer.ResetStatementStats(ctx)
-	s.pgServer.SQLServer.ResetErrorCounts()
+	s.pgServer.SQLServer.ResetSQLStats(ctx)
 
 	return scheduled.Add(diagnosticReportFrequency.Get(&s.st.SV))
 }
 
-func (s *Server) getReportingInfo(ctx context.Context) *diagnosticspb.DiagnosticReport {
+func (s *Server) collectNodeInfo(ctx context.Context) diagnosticspb.NodeInfo {
+	n := diagnosticspb.NodeInfo{
+		NodeID: s.node.Descriptor.NodeID,
+		Build:  build.GetInfo(),
+		Uptime: int64(timeutil.Now().Sub(s.startTime).Seconds()),
+	}
+
+	licenseType, err := base.LicenseType(s.st)
+	if err == nil {
+		n.LicenseType = licenseType
+	} else {
+		log.Errorf(ctx, "error retrieving license type: %s", err)
+	}
+
+	fillHardwareInfo(ctx, &n)
+	return n
+}
+
+func (s *Server) getReportingInfo(
+	ctx context.Context, reset telemetry.ResetCounters,
+) *diagnosticspb.DiagnosticReport {
 	info := diagnosticspb.DiagnosticReport{}
 	n := s.node.recorder.GenerateNodeStatus(ctx)
-	info.Node = diagnosticspb.NodeInfo{NodeID: s.node.Descriptor.NodeID}
+	info.Node = s.collectNodeInfo(ctx)
 
 	secret := sql.ClusterSecret.Get(&s.cfg.Settings.SV)
 	// Add in the localities.
@@ -274,12 +326,16 @@ func (s *Server) getReportingInfo(ctx context.Context) *diagnosticspb.Diagnostic
 		info.Stores[i].NodeID = r.Desc.Node.NodeID
 		info.Stores[i].StoreID = r.Desc.StoreID
 		info.Stores[i].KeyCount = int64(r.Metrics["keycount"])
+		info.Stores[i].Capacity = int64(r.Metrics["capacity"])
+		info.Stores[i].Available = int64(r.Metrics["capacity.available"])
+		info.Stores[i].Used = int64(r.Metrics["capacity.used"])
 		info.Node.KeyCount += info.Stores[i].KeyCount
 		info.Stores[i].RangeCount = int64(r.Metrics["replicas"])
 		info.Node.RangeCount += info.Stores[i].RangeCount
 		bytes := int64(r.Metrics["sysbytes"] + r.Metrics["intentbytes"] + r.Metrics["valbytes"] + r.Metrics["keybytes"])
 		info.Stores[i].Bytes = bytes
 		info.Node.Bytes += bytes
+		info.Stores[i].EncryptionAlgorithm = int64(r.Metrics["rocksdb.encryption.algorithm"])
 	}
 
 	schema, err := s.collectSchemaInfo(ctx)
@@ -288,13 +344,13 @@ func (s *Server) getReportingInfo(ctx context.Context) *diagnosticspb.Diagnostic
 		schema = nil
 	}
 	info.Schema = schema
-	info.ErrorCounts = make(map[string]int64)
-	info.UnimplementedErrors = make(map[string]int64)
+
+	info.FeatureUsage = telemetry.GetFeatureCounts(telemetry.Quantized, reset)
 
 	// Read the system.settings table to determine the settings for which we have
 	// explicitly set values -- the in-memory SV has the set and default values
 	// flattened for quick reads, but we'd rather only report the non-defaults.
-	if datums, _, err := s.internalExecutor.Query(
+	if datums, err := s.internalExecutor.Query(
 		ctx, "read-setting", nil /* txn */, "SELECT name FROM system.settings",
 	); err != nil {
 		log.Warningf(ctx, "failed to read settings: %s", err)
@@ -306,7 +362,7 @@ func (s *Server) getReportingInfo(ctx context.Context) *diagnosticspb.Diagnostic
 		}
 	}
 
-	if datums, _, err := s.internalExecutor.Query(
+	if datums, err := s.internalExecutor.Query(
 		ctx,
 		"read-zone-configs",
 		nil, /* txn */
@@ -333,15 +389,22 @@ func (s *Server) getReportingInfo(ctx context.Context) *diagnosticspb.Diagnostic
 	}
 
 	info.SqlStats = s.pgServer.SQLServer.GetScrubbedStmtStats()
-	s.pgServer.SQLServer.FillErrorCounts(info.ErrorCounts, info.UnimplementedErrors)
 	return &info
 }
 
 func anonymizeZoneConfig(dst *config.ZoneConfig, src config.ZoneConfig, secret string) {
-	dst.RangeMinBytes = src.RangeMinBytes
-	dst.RangeMaxBytes = src.RangeMaxBytes
-	dst.GC.TTLSeconds = src.GC.TTLSeconds
-	dst.NumReplicas = src.NumReplicas
+	if src.RangeMinBytes != nil {
+		dst.RangeMinBytes = proto.Int64(*src.RangeMinBytes)
+	}
+	if src.RangeMaxBytes != nil {
+		dst.RangeMaxBytes = proto.Int64(*src.RangeMaxBytes)
+	}
+	if src.GC != nil {
+		dst.GC = &config.GCPolicy{TTLSeconds: src.GC.TTLSeconds}
+	}
+	if src.NumReplicas != nil {
+		dst.NumReplicas = proto.Int32(*src.NumReplicas)
+	}
 	dst.Constraints = make([]config.Constraints, len(src.Constraints))
 	for i := range src.Constraints {
 		dst.Constraints[i].NumReplicas = src.Constraints[i].NumReplicas
@@ -377,21 +440,33 @@ func anonymizeZoneConfig(dst *config.ZoneConfig, src config.ZoneConfig, secret s
 	}
 }
 
-func (s *Server) reportDiagnostics(ctx context.Context, runningTime time.Duration) {
+func (s *Server) reportDiagnostics(ctx context.Context) {
 	if reportingURL == nil {
 		return
 	}
 	ctx, span := s.AnnotateCtxWithSpan(ctx, "usageReport")
 	defer span.Finish()
 
-	b, err := protoutil.Marshal(s.getReportingInfo(ctx))
+	report := s.getReportingInfo(ctx, telemetry.ResetCounts)
+	b, err := protoutil.Marshal(report)
 	if err != nil {
 		log.Warning(ctx, err)
 		return
 	}
+	addInfoToURL(ctx, reportingURL, s, report.Node)
 
-	addInfoToURL(ctx, reportingURL, s, runningTime)
-	res, err := http.Post(reportingURL.String(), "application/x-protobuf", bytes.NewReader(b))
+	const timeout = 3 * time.Second
+	client := &http.Client{
+		Transport: &http.Transport{
+			// Don't leak a goroutine on OSX (the TCP level timeout is probably
+			// much higher than on linux) when the connection fails in weird ways.
+			DialContext:       (&net.Dialer{Timeout: timeout}).DialContext,
+			DisableKeepAlives: true,
+		},
+		Timeout: timeout,
+	}
+
+	res, err := client.Post(reportingURL.String(), "application/x-protobuf", bytes.NewReader(b))
 	if err != nil {
 		if log.V(2) {
 			// This is probably going to be relatively common in production
@@ -401,9 +476,8 @@ func (s *Server) reportDiagnostics(ctx context.Context, runningTime time.Duratio
 		return
 	}
 	defer res.Body.Close()
-
-	if res.StatusCode != http.StatusOK {
-		b, err := ioutil.ReadAll(res.Body)
+	b, err = ioutil.ReadAll(res.Body)
+	if err != nil || res.StatusCode != http.StatusOK {
 		log.Warningf(ctx, "failed to report node usage metrics: status: %s, body: %s, "+
 			"error: %v", res.Status, b, err)
 	}
@@ -423,7 +497,7 @@ func (s *Server) collectSchemaInfo(ctx context.Context) ([]sqlbase.TableDescript
 		if err := kv.ValueProto(&desc); err != nil {
 			return nil, errors.Wrapf(err, "%s: unable to unmarshal SQL descriptor", kv.Key)
 		}
-		if t := desc.GetTable(); t != nil && t.ID > keys.MaxReservedDescID {
+		if t := desc.Table(kv.Value.Timestamp); t != nil && t.ID > keys.MaxReservedDescID {
 			if err := reflectwalk.Walk(t, redactor); err != nil {
 				panic(err) // stringRedactor never returns a non-nil err
 			}

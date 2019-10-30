@@ -1,28 +1,24 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package result
 
 import (
 	"context"
-
-	"github.com/kr/pretty"
-	"github.com/pkg/errors"
+	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/kr/pretty"
+	"github.com/pkg/errors"
 )
 
 // LocalResult is data belonging to an evaluated command that is
@@ -48,14 +44,9 @@ type LocalResult struct {
 	// commit fails, or we may accidentally make uncommitted values
 	// live.
 	EndTxns *[]EndTxnIntents
-	// Whether we successfully or non-successfully requested a lease.
-	//
-	// TODO(tschottdorf): Update this counter correctly with prop-eval'ed KV
-	// in the following case:
-	// - proposal does not fail fast and goes through Raft
-	// - downstream-of-Raft logic identifies a conflict and returns an error
-	// The downstream-of-Raft logic does not exist at time of writing.
-	LeaseMetricsResult *LeaseMetricsType
+	// Metrics contains counters which are to be passed to the
+	// metrics subsystem.
+	Metrics *Metrics
 
 	// When set (in which case we better be the first range), call
 	// GossipFirstRange if the Replica holds the lease.
@@ -66,11 +57,47 @@ type LocalResult struct {
 	MaybeAddToSplitQueue bool
 	// Call MaybeGossipNodeLiveness with the specified Span, if set.
 	MaybeGossipNodeLiveness *roachpb.Span
+	// Call maybeWatchForMerge.
+	MaybeWatchForMerge bool
 
 	// Set when transaction record(s) are updated, after calls to
 	// EndTransaction or PushTxn. This is a pointer to allow the zero
 	// (and as an unwelcome side effect, all) values to be compared.
 	UpdatedTxns *[]*roachpb.Transaction
+}
+
+func (lResult *LocalResult) String() string {
+	if lResult == nil {
+		return "LocalResult: nil"
+	}
+	var numIntents, numEndTxns, numUpdatedTxns int
+	if lResult.Intents != nil {
+		numIntents = len(*lResult.Intents)
+	}
+	if lResult.EndTxns != nil {
+		numEndTxns = len(*lResult.EndTxns)
+	}
+	if lResult.UpdatedTxns != nil {
+		numUpdatedTxns = len(*lResult.UpdatedTxns)
+	}
+	return fmt.Sprintf("LocalResult (reply: %v, #intents: %d, #endTxns: %d #updated txns: %d, "+
+		"GossipFirstRange:%t MaybeGossipSystemConfig:%t MaybeAddToSplitQueue:%t "+
+		"MaybeGossipNodeLiveness:%s MaybeWatchForMerge:%t",
+		lResult.Reply, numIntents, numEndTxns, numUpdatedTxns, lResult.GossipFirstRange,
+		lResult.MaybeGossipSystemConfig, lResult.MaybeAddToSplitQueue,
+		lResult.MaybeGossipNodeLiveness, lResult.MaybeWatchForMerge)
+}
+
+// DetachMaybeWatchForMerge returns and clears the MaybeWatchForMerge flag
+// from the local result.
+func (lResult *LocalResult) DetachMaybeWatchForMerge() bool {
+	if lResult == nil {
+		return false
+	} else if lResult.MaybeWatchForMerge {
+		lResult.MaybeWatchForMerge = false
+		return true
+	}
+	return false
 }
 
 // DetachIntents returns (and removes) those intents from the
@@ -98,9 +125,14 @@ func (lResult *LocalResult) DetachEndTxns(alwaysOnly bool) []EndTxnIntents {
 	}
 	var r []EndTxnIntents
 	if lResult.EndTxns != nil {
-		for _, eti := range *lResult.EndTxns {
-			if !alwaysOnly || eti.Always {
-				r = append(r, eti)
+		r = *lResult.EndTxns
+		if alwaysOnly {
+			// If alwaysOnly, filter away any !Always EndTxnIntents.
+			r = r[:0]
+			for _, eti := range *lResult.EndTxns {
+				if eti.Always {
+					r = append(r, eti)
+				}
 			}
 		}
 	}
@@ -118,9 +150,10 @@ func (lResult *LocalResult) DetachEndTxns(alwaysOnly bool) []EndTxnIntents {
 // c) data which isn't sent to the followers but the proposer needs for tasks
 //    it must run when the command has applied (such as resolving intents).
 type Result struct {
-	Local      LocalResult
-	Replicated storagebase.ReplicatedEvalResult
-	WriteBatch *storagebase.WriteBatch
+	Local        LocalResult
+	Replicated   storagepb.ReplicatedEvalResult
+	WriteBatch   *storagepb.WriteBatch
+	LogicalOpLog *storagepb.LogicalOpLog
 }
 
 // IsZero reports whether p is the zero value.
@@ -128,10 +161,13 @@ func (p *Result) IsZero() bool {
 	if p.Local != (LocalResult{}) {
 		return false
 	}
-	if !p.Replicated.Equal(storagebase.ReplicatedEvalResult{}) {
+	if !p.Replicated.Equal(storagepb.ReplicatedEvalResult{}) {
 		return false
 	}
 	if p.WriteBatch != nil {
+		return false
+	}
+	if p.LogicalOpLog != nil {
 		return false
 	}
 	return true
@@ -157,7 +193,7 @@ func (p *Result) MergeAndDestroy(q Result) error {
 			return errors.New("must not specify RaftApplyIndex")
 		}
 		if p.Replicated.State == nil {
-			p.Replicated.State = &storagebase.ReplicaState{}
+			p.Replicated.State = &storagepb.ReplicaState{}
 		}
 		if p.Replicated.State.Desc == nil {
 			p.Replicated.State.Desc = q.Replicated.State.Desc
@@ -188,21 +224,13 @@ func (p *Result) MergeAndDestroy(q Result) error {
 			}
 			q.Replicated.State.GCThreshold = nil
 		}
-		if q.Replicated.State.TxnSpanGCThreshold != nil {
-			if p.Replicated.State.TxnSpanGCThreshold == nil {
-				p.Replicated.State.TxnSpanGCThreshold = q.Replicated.State.TxnSpanGCThreshold
-			} else {
-				p.Replicated.State.TxnSpanGCThreshold.Forward(*q.Replicated.State.TxnSpanGCThreshold)
-			}
-			q.Replicated.State.TxnSpanGCThreshold = nil
-		}
 
 		if q.Replicated.State.Stats != nil {
 			return errors.New("must not specify Stats")
 		}
-		if (*q.Replicated.State != storagebase.ReplicaState{}) {
+		if (*q.Replicated.State != storagepb.ReplicaState{}) {
 			log.Fatalf(context.TODO(), "unhandled EvalResult: %s",
-				pretty.Diff(*q.Replicated.State, storagebase.ReplicaState{}))
+				pretty.Diff(*q.Replicated.State, storagepb.ReplicaState{}))
 		}
 		q.Replicated.State = nil
 	}
@@ -286,12 +314,12 @@ func (p *Result) MergeAndDestroy(q Result) error {
 	}
 	q.Local.EndTxns = nil
 
-	if p.Local.LeaseMetricsResult == nil {
-		p.Local.LeaseMetricsResult = q.Local.LeaseMetricsResult
-	} else if q.Local.LeaseMetricsResult != nil {
-		return errors.New("conflicting LeaseMetricsResult")
+	if p.Local.Metrics == nil {
+		p.Local.Metrics = q.Local.Metrics
+	} else if q.Local.Metrics != nil {
+		p.Local.Metrics.Add(*q.Local.Metrics)
 	}
-	q.Local.LeaseMetricsResult = nil
+	q.Local.Metrics = nil
 
 	if p.Local.MaybeGossipNodeLiveness == nil {
 		p.Local.MaybeGossipNodeLiveness = q.Local.MaybeGossipNodeLiveness
@@ -303,6 +331,7 @@ func (p *Result) MergeAndDestroy(q Result) error {
 	coalesceBool(&p.Local.GossipFirstRange, &q.Local.GossipFirstRange)
 	coalesceBool(&p.Local.MaybeGossipSystemConfig, &q.Local.MaybeGossipSystemConfig)
 	coalesceBool(&p.Local.MaybeAddToSplitQueue, &q.Local.MaybeAddToSplitQueue)
+	coalesceBool(&p.Local.MaybeWatchForMerge, &q.Local.MaybeWatchForMerge)
 
 	if q.Local.UpdatedTxns != nil {
 		if p.Local.UpdatedTxns == nil {
@@ -312,6 +341,15 @@ func (p *Result) MergeAndDestroy(q Result) error {
 		}
 	}
 	q.Local.UpdatedTxns = nil
+
+	if q.LogicalOpLog != nil {
+		if p.LogicalOpLog == nil {
+			p.LogicalOpLog = q.LogicalOpLog
+		} else {
+			p.LogicalOpLog.Ops = append(p.LogicalOpLog.Ops, q.LogicalOpLog.Ops...)
+		}
+	}
+	q.LogicalOpLog = nil
 
 	if !q.IsZero() {
 		log.Fatalf(context.TODO(), "unhandled EvalResult: %s", pretty.Diff(q, Result{}))

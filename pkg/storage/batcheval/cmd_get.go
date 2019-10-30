@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package batcheval
 
@@ -35,8 +31,18 @@ func Get(
 	h := cArgs.Header
 	reply := resp.(*roachpb.GetResponse)
 
-	val, intents, err := engine.MVCCGet(ctx, batch, args.Key, h.Timestamp,
-		h.ReadConsistency == roachpb.CONSISTENT, h.Txn)
+	val, intent, err := engine.MVCCGet(ctx, batch, args.Key, h.Timestamp, engine.MVCCGetOptions{
+		Inconsistent:   h.ReadConsistency != roachpb.CONSISTENT,
+		IgnoreSequence: shouldIgnoreSequenceNums(),
+		Txn:            h.Txn,
+	})
+	if err != nil {
+		return result.Result{}, err
+	}
+	var intents []roachpb.Intent
+	if intent != nil {
+		intents = append(intents, *intent)
+	}
 
 	reply.Value = val
 	if h.ReadConsistency == roachpb.READ_UNCOMMITTED {
@@ -53,4 +59,27 @@ func Get(
 		}
 	}
 	return result.FromIntents(intents, args), err
+}
+
+func shouldIgnoreSequenceNums() bool {
+	// NOTE: In version 19.1 and below this checked if a cluster version was
+	// active. This was because Versions 2.1 and below did not properly
+	// propagate sequence numbers to leaf TxnCoordSenders, which meant that we
+	// couldn't rely on sequence numbers being properly assigned by those nodes.
+	// Therefore, we gated the use of sequence numbers while scanning on the
+	// cluster version.
+	//
+	// Because we checked this during batcheval instead of when sending a
+	// get/scan request with an associated flag on the request itself, 19.2
+	// clients can't immediately start relying on the correct sequence number
+	// behavior. This is because it's possible that a 19.2 node joins the
+	// cluster before all 19.1 nodes realize that the cluster version has been
+	// upgraded to the version that instructs them to respect sequence numbers.
+	// Instead, they must wait until a new cluster version (19.2.X) is active
+	// which proves that all nodes the could be evaluating their request will
+	// respect sequence numbers.
+	//
+	// TODO(nvanbenschoten): Remove in 20.1. This serves only as documentation
+	// now.
+	return false
 }

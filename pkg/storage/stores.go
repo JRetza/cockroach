@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -108,7 +104,7 @@ func (ls *Stores) AddStore(s *Store) {
 	if ls.mu.biLatestTS != (hlc.Timestamp{}) {
 		if err := ls.updateBootstrapInfoLocked(ls.mu.latestBI); err != nil {
 			ctx := ls.AnnotateCtx(context.TODO())
-			log.Errorf(ctx, "failed to update bootstrap info on newly added store: %s", err)
+			log.Errorf(ctx, "failed to update bootstrap info on newly added store: %+v", err)
 		}
 	}
 }
@@ -157,7 +153,7 @@ func (ls *Stores) GetReplicaForRangeID(rangeID roachpb.RangeID) (*Replica, error
 		return nil, err
 	}
 	if replica == nil {
-		return nil, roachpb.NewRangeNotFoundError(rangeID)
+		return nil, roachpb.NewRangeNotFoundError(rangeID, 0)
 	}
 	return replica, nil
 }
@@ -189,6 +185,27 @@ func (ls *Stores) Send(
 	return br, pErr
 }
 
+// RangeFeed registers a rangefeed over the specified span. It sends updates to
+// the provided stream and returns with an optional error when the rangefeed is
+// complete.
+func (ls *Stores) RangeFeed(
+	args *roachpb.RangeFeedRequest, stream roachpb.Internal_RangeFeedServer,
+) *roachpb.Error {
+	ctx := stream.Context()
+	if args.RangeID == 0 {
+		log.Fatal(ctx, "rangefeed request missing range ID")
+	} else if args.Replica.StoreID == 0 {
+		log.Fatal(ctx, "rangefeed request missing store ID")
+	}
+
+	store, err := ls.GetStore(args.Replica.StoreID)
+	if err != nil {
+		return roachpb.NewError(err)
+	}
+
+	return store.RangeFeed(args, stream)
+}
+
 // ReadBootstrapInfo implements the gossip.Storage interface. Read
 // attempts to read gossip bootstrap info from every known store and
 // finds the most recent from all stores to initialize the bootstrap
@@ -206,7 +223,8 @@ func (ls *Stores) ReadBootstrapInfo(bi *gossip.BootstrapInfo) error {
 		s := (*Store)(v)
 		var storeBI gossip.BootstrapInfo
 		var ok bool
-		ok, err = engine.MVCCGetProto(ctx, s.engine, keys.StoreGossipKey(), hlc.Timestamp{}, true, nil, &storeBI)
+		ok, err = engine.MVCCGetProto(ctx, s.engine, keys.StoreGossipKey(), hlc.Timestamp{}, &storeBI,
+			engine.MVCCGetOptions{})
 		if err != nil {
 			return false
 		}
@@ -260,24 +278,15 @@ func (ls *Stores) updateBootstrapInfoLocked(bi *gossip.BootstrapInfo) error {
 	return err
 }
 
-// ReadVersionFromEngineOrDefault reads the persisted cluster version from the
-// engine, falling back to v1.0 if no version is specified on the engine.
-func ReadVersionFromEngineOrDefault(
+// ReadVersionFromEngineOrZero reads the persisted cluster version from the
+// engine, falling back to the zero value.
+func ReadVersionFromEngineOrZero(
 	ctx context.Context, e engine.Engine,
 ) (cluster.ClusterVersion, error) {
 	var cv cluster.ClusterVersion
 	cv, err := ReadClusterVersion(ctx, e)
 	if err != nil {
 		return cluster.ClusterVersion{}, err
-	}
-
-	// These values should always exist in 1.1-initialized clusters, but may
-	// not on 1.0.x; we synthesize the missing version.
-	if cv.UseVersion == (roachpb.Version{}) {
-		cv.UseVersion = cluster.VersionByKey(cluster.VersionBase)
-	}
-	if cv.MinimumVersion == (roachpb.Version{}) {
-		cv.MinimumVersion = cluster.VersionByKey(cluster.VersionBase)
 	}
 	return cv, nil
 }
@@ -305,15 +314,8 @@ func SynthesizeClusterVersionFromEngines(
 		origin string
 	}
 
-	// FIXME(tschottdorf): If we don't find anything, this should return v1.0, but
-	// we have to guarantee first that you always find something (should be OK).
-	maxMinVersion := originVersion{
-		Version: minSupportedVersion,
-		origin:  "(no store)",
-	}
-
 	maxPossibleVersion := roachpb.Version{Major: 999999} // sort above any real version
-	minUseVersion := originVersion{
+	minStoreVersion := originVersion{
 		Version: maxPossibleVersion,
 		origin:  "(no store)",
 	}
@@ -322,33 +324,32 @@ func SynthesizeClusterVersionFromEngines(
 	// can decide whether the node catches a version error. However, we also
 	// want to name at least one engine that violates the version
 	// constraints, which at the latest the second loop will achieve
-	// (because then minUseVersion and maxMinVersion don't change any more).
+	// (because then minStoreVersion don't change any more).
 	for _, eng := range engines {
 		var cv cluster.ClusterVersion
-		cv, err := ReadVersionFromEngineOrDefault(ctx, eng)
+		cv, err := ReadVersionFromEngineOrZero(ctx, eng)
 		if err != nil {
 			return cluster.ClusterVersion{}, err
+		}
+		if cv.Version == (roachpb.Version{}) {
+			// This is needed when a node first joins an existing cluster, in
+			// which case it won't know what version to use until the first
+			// Gossip update comes in.
+			cv.Version = minSupportedVersion
 		}
 
 		// Avoid running a binary with a store that is too new. For example,
 		// restarting into 1.1 after having upgraded to 1.2 doesn't work.
-		for _, v := range []roachpb.Version{cv.MinimumVersion, cv.UseVersion} {
-			if serverVersion.Less(v) {
-				return cluster.ClusterVersion{}, errors.Errorf("cockroach version v%s is incompatible with data in store %s; use version v%s or later",
-					serverVersion, eng, v)
-			}
+		if serverVersion.Less(cv.Version) {
+			return cluster.ClusterVersion{}, errors.Errorf(
+				"cockroach version v%s is incompatible with data in store %s; use version v%s or later",
+				serverVersion, eng, cv.Version)
 		}
 
-		// Track the highest minimum version encountered.
-		if maxMinVersion.Version.Less(cv.MinimumVersion) {
-			maxMinVersion.Version = cv.MinimumVersion
-			maxMinVersion.origin = fmt.Sprint(eng)
-
-		}
 		// Track smallest use version encountered.
-		if cv.UseVersion.Less(minUseVersion.Version) {
-			minUseVersion.Version = cv.UseVersion
-			minUseVersion.origin = fmt.Sprint(eng)
+		if cv.Version.Less(minStoreVersion.Version) {
+			minStoreVersion.Version = cv.Version
+			minStoreVersion.origin = fmt.Sprint(eng)
 		}
 	}
 
@@ -356,33 +357,30 @@ func SynthesizeClusterVersionFromEngines(
 	// minSupportedVersion. This is the case when a brand new node is
 	// joining an existing cluster (which may be on any older version
 	// this binary supports).
-	if minUseVersion.Version == maxPossibleVersion {
-		minUseVersion.Version = minSupportedVersion
+	if minStoreVersion.Version == maxPossibleVersion {
+		minStoreVersion.Version = minSupportedVersion
 	}
 
 	cv := cluster.ClusterVersion{
-		UseVersion:     minUseVersion.Version,
-		MinimumVersion: maxMinVersion.Version,
+		Version: minStoreVersion.Version,
 	}
 	log.Eventf(ctx, "read ClusterVersion %+v", cv)
 
-	for _, v := range []originVersion{minUseVersion, maxMinVersion} {
-		// Avoid running a binary too new for this store. This is what you'd catch
-		// if, say, you restarted directly from 1.0 into 1.2 (bumping the min
-		// version) without going through 1.1 first. It would also what you catch if
-		// you are starting 1.1 for the first time (after 1.0), but it crashes
-		// half-way through the startup sequence (so now some stores have 1.1, but
-		// some 1.0), in which case you are expected to run 1.1 again (hopefully
-		// without the crash this time) which would then rewrite all the stores.
-		//
-		// We only verify this now because as we iterate through the stores, we
-		// may not yet have picked up the final versions we're actually planning
-		// to use.
-		if v.Version.Less(minSupportedVersion) {
-			return cluster.ClusterVersion{}, errors.Errorf("store %s, last used with cockroach version v%s, "+
-				"is too old for running version v%s (which requires data from v%s or later)",
-				v.origin, v.Version, serverVersion, minSupportedVersion)
-		}
+	// Avoid running a binary too new for this store. This is what you'd catch
+	// if, say, you restarted directly from 1.0 into 1.2 (bumping the min
+	// version) without going through 1.1 first. It would also be what you catch if
+	// you are starting 1.1 for the first time (after 1.0), but it crashes
+	// half-way through the startup sequence (so now some stores have 1.1, but
+	// some 1.0), in which case you are expected to run 1.1 again (hopefully
+	// without the crash this time) which would then rewrite all the stores.
+	//
+	// We only verify this now because as we iterate through the stores, we
+	// may not yet have picked up the final versions we're actually planning
+	// to use.
+	if minStoreVersion.Version.Less(minSupportedVersion) {
+		return cluster.ClusterVersion{}, errors.Errorf("store %s, last used with cockroach version v%s, "+
+			"is too old for running version v%s (which requires data from v%s or later)",
+			minStoreVersion.origin, minStoreVersion.Version, serverVersion, minSupportedVersion)
 	}
 	// Write the "actual" version back to all stores. This is almost always a
 	// no-op, but will backfill the information for 1.0.x clusters, and also
@@ -395,12 +393,11 @@ func SynthesizeClusterVersionFromEngines(
 // (written to any of the configured stores (all of which are bootstrapped)).
 // The returned value is also replicated to all stores for consistency, in case
 // a new store was added or an old store re-configured. In case of non-identical
-// versions across the stores, returns a version that carries the largest
-// MinVersion and the smallest UseVersion.
+// versions across the stores, returns a version that carries the smallest
+// Version.
 //
-// If there aren't any stores, returns a ClusterVersion with MinSupportedVersion
-// and UseVersion set to the minimum supported version and server version of the
-// build, respectively.
+// If there aren't any stores, returns a ClusterVersion set to the minimum
+// supported version of the binary.
 func (ls *Stores) SynthesizeClusterVersion(ctx context.Context) (cluster.ClusterVersion, error) {
 	var engines []engine.Engine
 	ls.storeMap.Range(func(_ int64, v unsafe.Pointer) bool {
@@ -439,8 +436,36 @@ func (ls *Stores) engines() []engine.Engine {
 }
 
 // OnClusterVersionChange is invoked when the running node receives a notification
-// indicating that the cluster version has changed.
+// indicating that the cluster version has changed. It checks the currently persisted
+// version and updates if it is older than the provided update.
 func (ls *Stores) OnClusterVersionChange(ctx context.Context, cv cluster.ClusterVersion) error {
+	// Grab a lock to make sure that there aren't two interleaved invocations of
+	// this method that result in clobbering of an update.
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+
+	// We're going to read the cluster version from any engine - all the engines
+	// are always kept in sync so it doesn't matter which one we read from.
+	var someEngine engine.Engine
+	ls.storeMap.Range(func(_ int64, v unsafe.Pointer) bool {
+		someEngine = (*Store)(v).engine
+		return false // don't iterate any more
+	})
+	if someEngine == nil {
+		// If we haven't bootstrapped any engines yet, there's nothing for us to do.
+		return nil
+	}
+	synthCV, err := ReadClusterVersion(ctx, someEngine)
+	if err != nil {
+		return errors.Wrap(err, "error reading persisted cluster version")
+	}
+	// If the update downgrades the version, ignore it. Must be a
+	// reordering (this method is called from multiple goroutines via
+	// `(*Node).onClusterVersionChange)`). Note that we do carry out the upgrade if
+	// the MinVersion is identical, to backfill the engines that may still need it.
+	if cv.Version.Less(synthCV.Version) {
+		return nil
+	}
 	if err := ls.WriteClusterVersion(ctx, cv); err != nil {
 		return errors.Wrap(err, "writing cluster version")
 	}

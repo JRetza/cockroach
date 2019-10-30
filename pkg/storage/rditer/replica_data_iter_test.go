@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package rditer
 
@@ -23,6 +19,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/storage/spanset"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -83,7 +81,7 @@ func createRangeData(
 		{keys.RangeLastGCKey(desc.RangeID), ts0},
 		{keys.RangeAppliedStateKey(desc.RangeID), ts0},
 		{keys.RaftAppliedIndexLegacyKey(desc.RangeID), ts0},
-		{keys.RaftTruncatedStateKey(desc.RangeID), ts0},
+		{keys.RaftTruncatedStateLegacyKey(desc.RangeID), ts0},
 		{keys.RangeLeaseKey(desc.RangeID), ts0},
 		{keys.LeaseAppliedIndexLegacyKey(desc.RangeID), ts0},
 		{keys.RangeStatsLegacyKey(desc.RangeID), ts0},
@@ -119,6 +117,56 @@ func createRangeData(
 	return keys
 }
 
+func verifyRDIter(
+	t *testing.T,
+	desc *roachpb.RangeDescriptor,
+	eng engine.ReadWriter,
+	replicatedOnly bool,
+	expectedKeys []engine.MVCCKey,
+) {
+	t.Helper()
+	testutils.RunTrueAndFalse(t, "spanset", func(t *testing.T, useSpanSet bool) {
+		if useSpanSet {
+			var spans spanset.SpanSet
+			spans.Add(spanset.SpanReadOnly, roachpb.Span{
+				Key:    keys.MakeRangeIDPrefix(desc.RangeID),
+				EndKey: keys.MakeRangeIDPrefix(desc.RangeID).PrefixEnd(),
+			})
+			spans.Add(spanset.SpanReadOnly, roachpb.Span{
+				Key:    keys.MakeRangeKeyPrefix(desc.StartKey),
+				EndKey: keys.MakeRangeKeyPrefix(desc.EndKey),
+			})
+			spans.Add(spanset.SpanReadOnly, roachpb.Span{
+				Key:    desc.StartKey.AsRawKey(),
+				EndKey: desc.EndKey.AsRawKey(),
+			})
+			eng = spanset.NewReadWriter(eng, &spans)
+		}
+		iter := NewReplicaDataIterator(desc, eng, replicatedOnly)
+		defer iter.Close()
+		i := 0
+		for ; ; iter.Next() {
+			if ok, err := iter.Valid(); err != nil {
+				t.Fatal(err)
+			} else if !ok {
+				break
+			}
+			if i >= len(expectedKeys) {
+				t.Fatal("there are more keys in the iteration than expected")
+			}
+			if key := iter.Key(); !key.Equal(expectedKeys[i]) {
+				k1, ts1 := key.Key, key.Timestamp
+				k2, ts2 := expectedKeys[i].Key, expectedKeys[i].Timestamp
+				t.Errorf("%d: expected %q(%d); got %q(%d)", i, k2, ts2, k1, ts1)
+			}
+			i++
+		}
+		if i != len(expectedKeys) {
+			t.Fatal("there are fewer keys in the iteration than expected")
+		}
+	})
+}
+
 // TestReplicaDataIterator verifies correct operation of iterator if
 // a range contains no data and never has.
 func TestReplicaDataIteratorEmptyRange(t *testing.T) {
@@ -133,16 +181,7 @@ func TestReplicaDataIteratorEmptyRange(t *testing.T) {
 		EndKey:   roachpb.RKey("z"),
 	}
 
-	iter := NewReplicaDataIterator(desc, eng, false /* replicatedOnly */)
-	defer iter.Close()
-	for ; ; iter.Next() {
-		if ok, err := iter.Valid(); err != nil {
-			t.Fatal(err)
-		} else if !ok {
-			break
-		}
-		t.Errorf("unexpected: %s", iter.Key())
-	}
+	verifyRDIter(t, desc, eng, false /* replicatedOnly */, []engine.MVCCKey{})
 }
 
 // TestReplicaDataIterator creates three ranges {"a"-"b" (pre), "b"-"c"
@@ -179,32 +218,13 @@ func TestReplicaDataIterator(t *testing.T) {
 	postKeys := createRangeData(t, eng, descPost)
 
 	// Verify the contents of the "b"-"c" range.
-	iter := NewReplicaDataIterator(&desc, eng, false /* replicatedOnly */)
-	defer iter.Close()
-	i := 0
-	for ; ; iter.Next() {
-		if ok, err := iter.Valid(); err != nil {
-			t.Fatal(err)
-		} else if !ok {
-			break
-		}
-		if i >= len(curKeys) {
-			t.Fatal("there are more keys in the iteration than expected")
-		}
-		if key := iter.Key(); !key.Equal(curKeys[i]) {
-			k1, ts1 := key.Key, key.Timestamp
-			k2, ts2 := curKeys[i].Key, curKeys[i].Timestamp
-			t.Errorf("%d: expected %q(%d); got %q(%d)", i, k2, ts2, k1, ts1)
-		}
-		i++
-	}
-	if i != len(curKeys) {
-		t.Fatal("there are fewer keys in the iteration than expected")
-	}
+	t.Run("cur", func(t *testing.T) {
+		verifyRDIter(t, &desc, eng, false /* replicatedOnly */, curKeys)
+	})
 
 	// Verify that the replicated-only iterator ignores unreplicated keys.
 	unreplicatedPrefix := keys.MakeRangeIDUnreplicatedPrefix(desc.RangeID)
-	iter = NewReplicaDataIterator(&desc, eng, true /* replicatedOnly */)
+	iter := NewReplicaDataIterator(&desc, eng, true /* replicatedOnly */)
 	defer iter.Close()
 	for ; ; iter.Next() {
 		if ok, err := iter.Valid(); err != nil {
@@ -218,32 +238,16 @@ func TestReplicaDataIterator(t *testing.T) {
 	}
 
 	// Verify the keys in pre & post ranges.
-	for j, test := range []struct {
+	for _, test := range []struct {
+		name string
 		desc *roachpb.RangeDescriptor
 		keys []engine.MVCCKey
 	}{
-		{&descPre, preKeys},
-		{&descPost, postKeys},
+		{"pre", &descPre, preKeys},
+		{"post", &descPost, postKeys},
 	} {
-		iter = NewReplicaDataIterator(test.desc, eng, false /* replicatedOnly */)
-		defer iter.Close()
-		i = 0
-		for ; ; iter.Next() {
-			if ok, err := iter.Valid(); err != nil {
-				t.Fatal(err)
-			} else if !ok {
-				break
-			}
-
-			k1, ts1 := iter.Key().Key, iter.Key().Timestamp
-			if key := iter.Key(); !key.Equal(test.keys[i]) {
-				k2, ts2 := test.keys[i].Key, test.keys[i].Timestamp
-				t.Errorf("%d/%d: key mismatch %q(%d) != %q(%d) [%x]", j, i, k1, ts1, k2, ts2, []byte(k2))
-			}
-			i++
-		}
-		if i != len(curKeys) {
-			t.Fatal("there are fewer keys in the iteration than expected")
-		}
+		t.Run(test.name, func(t *testing.T) {
+			verifyRDIter(t, test.desc, eng, false /* replicatedOnly */, test.keys)
+		})
 	}
 }

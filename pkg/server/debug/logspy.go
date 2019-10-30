@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package debug
 
@@ -36,6 +32,7 @@ import (
 // JSON unmarshaling.
 type regexpAsString struct {
 	re *regexp.Regexp
+	i  int64 // optional, populated if the regexp is an integer to match on goroutine ID
 }
 
 func (r regexpAsString) String() string {
@@ -49,6 +46,11 @@ func (r *regexpAsString) UnmarshalJSON(data []byte) error {
 	var s string
 	if err := json.Unmarshal(data, &s); err != nil {
 		return err
+	}
+	if i, err := strconv.ParseInt(s, 10, 64); err != nil {
+		// Ignore.
+	} else {
+		r.i = i
 	}
 	var err error
 	(*r).re, err = regexp.Compile(s)
@@ -187,8 +189,14 @@ func (spy *logSpy) run(ctx context.Context, w io.Writer, opts logSpyOptions) (er
 	}
 
 	spy.setIntercept(ctx, func(entry log.Entry) {
-		if re := opts.Grep.re; re != nil && !re.MatchString(entry.Message) && !re.MatchString(entry.File) {
-			return
+		if re := opts.Grep.re; re != nil {
+			switch {
+			case re.MatchString(entry.Message):
+			case re.MatchString(entry.File):
+			case opts.Grep.i != 0 && opts.Grep.i == entry.Goroutine:
+			default:
+				return
+			}
 		}
 
 		select {

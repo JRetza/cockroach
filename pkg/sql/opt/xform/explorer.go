@@ -1,25 +1,19 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package xform
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/sql/opt"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/idxconstraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util"
 )
@@ -74,10 +68,10 @@ import (
 //    (InnerJoin
 //      $r
 //      $t
-//      (Filters (ConstructConditionsNotUsing $s $lowerOn $upperOn))
+//      (ConstructFiltersNotUsing $s $lowerOn $upperOn)
 //    )
 //    $s
-//    (Filters (ConstructConditionsUsing $s $lowerOn $upperOn))
+//    (ConstructFiltersUsing $s $lowerOn $upperOn)
 //  )
 //
 // In this example, if the upper and lower groups each contain two InnerJoin
@@ -86,20 +80,25 @@ import (
 // themselves match this same rule. However, adding their replace expressions to
 // the memo group will be a no-op, because they're already present.
 type explorer struct {
-	o       *Optimizer
-	mem     *memo.Memo
-	f       *norm.Factory
 	evalCtx *tree.EvalContext
+	o       *Optimizer
+	f       *norm.Factory
+	mem     *memo.Memo
 
-	// exprs is a buffer reused by custom replace functions.
-	exprs []memo.Expr
+	// funcs is the struct used to call all custom match and replace functions
+	// used by the exploration rules. It wraps an unnamed xfunc.CustomFuncs,
+	// so it provides a clean interface for calling functions from both the xform
+	// and xfunc packages using the same prefix.
+	funcs CustomFuncs
 }
 
+// init initializes the explorer for use (or reuse).
 func (e *explorer) init(o *Optimizer) {
-	e.o = o
-	e.mem = o.mem
-	e.f = o.f
 	e.evalCtx = o.evalCtx
+	e.o = o
+	e.f = o.Factory()
+	e.mem = o.mem
+	e.funcs.Init(e)
 }
 
 // exploreGroup generates alternate expressions that are logically equivalent
@@ -151,300 +150,60 @@ func (e *explorer) init(o *Optimizer) {
 //         if ordinal(e3) >= state.start:
 //           ... explore (e1, e2, e3) combo ...
 //
-func (e *explorer) exploreGroup(group memo.GroupID) *exploreState {
+func (e *explorer) exploreGroup(grp memo.RelExpr) *exploreState {
 	// Do nothing if this group has already been fully explored.
-	state := e.ensureExploreState(group)
+	state := e.ensureExploreState(grp)
 	if state.fullyExplored {
 		return state
 	}
 
-	// Update set of expressions that will be considered during this pass, by
-	// setting the start expression to be the end expression from last pass.
-	exprCount := e.mem.ExprCount(group)
+	// Update set of group members that will be considered during this pass, by
+	// setting the start member to be the end expression from last pass.
 	state.start = state.end
-	state.end = memo.ExprOrdinal(exprCount)
+	state.end = 0
+	for member := grp; member != nil; member = member.NextExpr() {
+		state.end++
+	}
 
+	var member memo.RelExpr
+	var i int
 	fullyExplored := true
-	for i := 0; i < exprCount; i++ {
-		ordinal := memo.ExprOrdinal(i)
-
-		// If expression was fully explored in previous passes, then nothing
-		// further to do.
-		if state.isExprFullyExplored(ordinal) {
+	for i, member = 0, grp; i < state.end; i, member = i+1, member.NextExpr() {
+		// If member was fully explored in previous passes, then nothing further
+		// to do.
+		if state.isMemberFullyExplored(i) {
 			continue
 		}
 
-		eid := memo.ExprID{Group: group, Expr: ordinal}
-		if e.exploreExpr(state, eid) {
+		if memberExplored := e.exploreGroupMember(state, member, i); memberExplored {
 			// No more rules can ever match this expression, so skip it in
 			// future passes.
-			state.markExprAsFullyExplored(ordinal)
+			state.markMemberAsFullyExplored(i)
 		} else {
-			// If even one expression is not fully explored, then the group is
-			// not fully explored.
+			// If even one member is not fully explored, then the group is not
+			// fully explored.
 			fullyExplored = false
 		}
 	}
 
-	// If all existing group expressions have been fully explored, and no new
-	// ones were added, then group can be skipped in future passes.
-	if fullyExplored && e.mem.ExprCount(group) == int(state.end) {
+	// If new group members were added by the explorer, then the group has not
+	// yet been fully explored.
+	if fullyExplored && member == nil {
 		state.fullyExplored = true
 	}
 	return state
 }
 
+// lookupExploreState returns the optState struct associated with the memo
+// group.
+func (e *explorer) lookupExploreState(grp memo.RelExpr) *exploreState {
+	return &e.o.lookupOptState(grp, physical.MinRequired).explore
+}
+
 // ensureExploreState allocates the exploration state in the optState struct
 // associated with the memo group, with respect to the min physical props.
-func (e *explorer) ensureExploreState(group memo.GroupID) *exploreState {
-	return &e.o.ensureOptState(group, memo.MinPhysPropsID).explore
-}
-
-// ----------------------------------------------------------------------
-//
-// Scan Rules
-//   Custom match and replace functions used with scan.opt rules.
-//
-// ----------------------------------------------------------------------
-
-// canGenerateIndexScans returns true if new index Scan operators can be
-// generated, based on the given ScanOpDef. Index scans should only be generated
-// from the original unaltered primary index Scan operator (i.e. unconstrained
-// and not limited).
-func (e *explorer) canGenerateIndexScans(def memo.PrivateID) bool {
-	scanOpDef := e.mem.LookupPrivate(def).(*memo.ScanOpDef)
-	return scanOpDef.Index == opt.PrimaryIndex &&
-		scanOpDef.Constraint == nil &&
-		scanOpDef.HardLimit == 0
-}
-
-// generateIndexScans enumerates all indexes on the scan operator's table and
-// generates an alternate scan operator for each index that includes the set of
-// needed columns.
-func (e *explorer) generateIndexScans(def memo.PrivateID) []memo.Expr {
-	e.exprs = e.exprs[:0]
-	scanOpDef := e.mem.LookupPrivate(def).(*memo.ScanOpDef)
-	md := e.mem.Metadata()
-	tab := md.Table(scanOpDef.Table)
-
-	pkCols := md.IndexColumns(scanOpDef.Table, 0)
-
-	// Iterate over all secondary indexes (index 0 is the primary index).
-	for i := 1; i < tab.IndexCount(); i++ {
-		indexCols := md.IndexColumns(scanOpDef.Table, i)
-
-		// If the alternate index includes the set of needed columns (def.Cols),
-		// then construct a new Scan operator using that index.
-		if scanOpDef.Cols.SubsetOf(indexCols) {
-			newDef := &memo.ScanOpDef{Table: scanOpDef.Table, Index: i, Cols: scanOpDef.Cols}
-			indexScan := memo.MakeScanExpr(e.mem.InternScanOpDef(newDef))
-			e.exprs = append(e.exprs, memo.Expr(indexScan))
-		} else {
-			// The alternate index was missing columns, so in order to satisfy the
-			// requirements, we need to perform an index join with the primary index.
-
-			indexScanOpDef := e.mem.InternScanOpDef(&memo.ScanOpDef{
-				Table: scanOpDef.Table,
-				Index: i,
-				Cols:  indexCols.Intersection(scanOpDef.Cols).Union(pkCols),
-			})
-
-			input := e.f.ConstructScan(indexScanOpDef)
-
-			def := e.mem.InternLookupJoinDef(&memo.LookupJoinDef{
-				Table: scanOpDef.Table,
-				Cols:  scanOpDef.Cols,
-			})
-
-			join := memo.MakeLookupJoinExpr(input, def)
-
-			e.exprs = append(e.exprs, memo.Expr(join))
-		}
-	}
-
-	return e.exprs
-}
-
-// ----------------------------------------------------------------------
-//
-// Select Rules
-//   Custom match and replace functions used with select.opt rules.
-//
-// ----------------------------------------------------------------------
-
-// canConstrainScan returns true if the given expression can have a constraint
-// applied to it. This is only possible when it has no constraints and when it
-// does not have a limit applied to it (since limit is applied after the
-// constraint).
-func (e *explorer) canConstrainScan(def memo.PrivateID) bool {
-	scanOpDef := e.mem.LookupPrivate(def).(*memo.ScanOpDef)
-	return scanOpDef.Constraint == nil && scanOpDef.HardLimit == 0
-}
-
-// constrainedScanOpDef tries to push a filter into a scanOpDef as a
-// constraint. If it cannot push the filter down (i.e. the resulting constraint
-// is unconstrained), then it returns ok = false in the third return value.
-func (e *explorer) constrainedScanOpDef(
-	filterGroup memo.GroupID, scanDef memo.PrivateID,
-) (newDef memo.ScanOpDef, remainingFilter memo.GroupID, ok bool) {
-	scanOpDef := e.mem.LookupPrivate(scanDef).(*memo.ScanOpDef)
-
-	// Fill out data structures needed to initialize the idxconstraint library.
-	md := e.mem.Metadata()
-	index := md.Table(scanOpDef.Table).Index(scanOpDef.Index)
-	columns := make([]opt.OrderingColumn, index.UniqueColumnCount())
-	var notNullCols opt.ColSet
-	for i := range columns {
-		col := index.Column(i)
-		colID := md.TableColumn(scanOpDef.Table, col.Ordinal)
-		columns[i] = opt.MakeOrderingColumn(colID, col.Descending)
-		if !col.Column.IsNullable() {
-			notNullCols.Add(int(colID))
-		}
-	}
-
-	// Generate index constraints.
-	var ic idxconstraint.Instance
-	filter := memo.MakeNormExprView(e.mem, filterGroup)
-	ic.Init(filter, columns, notNullCols, false /* isInverted */, e.evalCtx, e.f)
-	constraint := ic.Constraint()
-	if constraint.IsUnconstrained() {
-		return memo.ScanOpDef{}, 0, false
-	}
-	newDef = *scanOpDef
-	newDef.Constraint = constraint
-
-	remainingFilter = ic.RemainingFilter()
-	return newDef, remainingFilter, true
-}
-
-// constrainScan tries to push filters into Scan operations as constraints. It
-// is applied on a Select -> Scan pattern. The scan operation is assumed to have
-// no constraints.
-//
-// There are three cases:
-//
-//  - if the filter can be completely converted to constraints, we return a
-//    constrained scan expression (to be added to the same group as the select
-//    operator).
-//
-//  - if the filter can be partially converted to constraints, we construct the
-//    constrained scan and we return a select expression with the remaining
-//    filter (to be added to the same group as the select operator).
-//
-//  - if the filter cannot be converted to constraints, does and returns
-//    nothing.
-//
-func (e *explorer) constrainScan(filterGroup memo.GroupID, scanDef memo.PrivateID) []memo.Expr {
-	e.exprs = e.exprs[:0]
-
-	newDef, remainingFilter, ok := e.constrainedScanOpDef(filterGroup, scanDef)
-	if !ok {
-		return nil
-	}
-
-	if e.mem.NormExpr(remainingFilter).Operator() == opt.TrueOp {
-		// No remaining filter. Add the constrained scan node to select's group.
-		constrainedScan := memo.MakeScanExpr(e.mem.InternScanOpDef(&newDef))
-		e.exprs = append(e.exprs, memo.Expr(constrainedScan))
-	} else {
-		// We have a remaining filter. We create the constrained scan in a new group
-		// and create a select node in the same group with the original select.
-		constrainedScan := e.f.ConstructScan(e.mem.InternScanOpDef(&newDef))
-		newSelect := memo.MakeSelectExpr(constrainedScan, remainingFilter)
-		e.exprs = append(e.exprs, memo.Expr(newSelect))
-	}
-	return e.exprs
-}
-
-// constrainLookupJoinIndexScan tries to push filters into Lookup Join index
-// scan operations as constraints. It is applied on a Select -> LookupJoin ->
-// Scan pattern. The scan operation is assumed to have no constraints.
-//
-// There are three cases, similar to constrainScan:
-//
-//  - if the filter can be completely converted to constraints, we return a
-//    constrained scan expression wrapped in a lookup join (to be added to the
-//    same group as the select operator).
-//
-//  - if the filter can be partially converted to constraints, we construct the
-//    constrained scan wrapped in a lookup join, and we return a select
-//    expression with the remaining filter (to be added to the same group as
-//    the select operator).
-//
-//  - if the filter cannot be converted to constraints, does and returns
-//    nothing.
-//
-// TODO(rytaft): In the future we want to do the following:
-// 1. push constraints in the scan.
-// 2. put whatever part of the remaining filter that uses just index columns
-//    into a select above the index scan (and below the lookup join).
-// 3. put what is left of the filter on top of the lookup join.
-func (e *explorer) constrainLookupJoinIndexScan(
-	filterGroup memo.GroupID, scanDef, lookupJoinDef memo.PrivateID,
-) []memo.Expr {
-	e.exprs = e.exprs[:0]
-
-	newDef, remainingFilter, ok := e.constrainedScanOpDef(filterGroup, scanDef)
-	if !ok {
-		return nil
-	}
-	constrainedScan := e.f.ConstructScan(e.mem.InternScanOpDef(&newDef))
-
-	if e.mem.NormExpr(remainingFilter).Operator() == opt.TrueOp {
-		// No remaining filter. Add the constrained lookup join index scan node to
-		// select's group.
-		lookupJoin := memo.MakeLookupJoinExpr(constrainedScan, lookupJoinDef)
-		e.exprs = append(e.exprs, memo.Expr(lookupJoin))
-	} else {
-		// We have a remaining filter. We create the constrained lookup join index
-		// scan in a new group and create a select node in the same group with the
-		// original select.
-		lookupJoin := e.f.ConstructLookupJoin(constrainedScan, lookupJoinDef)
-		newSelect := memo.MakeSelectExpr(lookupJoin, remainingFilter)
-		e.exprs = append(e.exprs, memo.Expr(newSelect))
-	}
-	return e.exprs
-}
-
-// ----------------------------------------------------------------------
-//
-// Limit Rules
-//   Custom match and replace functions used with limit.opt rules.
-//
-// ----------------------------------------------------------------------
-
-// canLimitScan returns true if the given expression can have its output row
-// count limited. This is only possible when there is no existing limit and
-// when the required ordering of the rows to be limited can be satisfied by the
-// scan operator.
-func (e *explorer) canLimitScan(def, limit, ordering memo.PrivateID) bool {
-	limitVal := int64(*e.mem.LookupPrivate(limit).(*tree.DInt))
-	if limitVal <= 0 {
-		// Can't push limit into scan if it's zero or negative.
-		return false
-	}
-
-	scanOpDef := e.mem.LookupPrivate(def).(*memo.ScanOpDef)
-	if scanOpDef.HardLimit != 0 {
-		// Don't push limit into scan if scan is already limited. This should
-		// only happen when normalizations haven't run, as otherwise redundant
-		// Limit operators would be discarded.
-		return false
-	}
-
-	required := e.mem.LookupPrivate(ordering).(props.Ordering)
-	return scanOpDef.CanProvideOrdering(e.mem.Metadata(), required)
-}
-
-// limitScanDef constructs a new ScanOpDef private value that is based on the
-// given ScanOpDef. The new def's HardLimit is set to the given limit, which
-// must be a constant int datum value. The other fields are inherited from the
-// existing def.
-func (e *explorer) limitScanDef(def, limit memo.PrivateID) memo.PrivateID {
-	defCopy := *e.mem.LookupPrivate(def).(*memo.ScanOpDef)
-	defCopy.HardLimit = int64(*e.mem.LookupPrivate(limit).(*tree.DInt))
-	return e.mem.InternScanOpDef(&defCopy)
+func (e *explorer) ensureExploreState(grp memo.RelExpr) *exploreState {
+	return &e.o.ensureOptState(grp, physical.MinRequired).explore
 }
 
 // ----------------------------------------------------------------------
@@ -462,29 +221,31 @@ type exploreState struct {
 	// be explored in the current pass. Expressions < start have been partly
 	// explored during previous passes. Expressions >= end are new expressions
 	// added during the current pass.
-	start memo.ExprOrdinal
-	end   memo.ExprOrdinal
+	start int
+	end   int
 
-	// fullyExplored is set to true once all expressions in the group have been
-	// fully explored, and no new expressions will ever be added. Further
-	// exploration of the group can be skipped.
+	// fullyExplored is set to true once all members of the group have been fully
+	// explored, meaning that no new members will ever be added to the group, or
+	// to dependent child groups. Further exploration of the group can be skipped.
 	fullyExplored bool
 
-	// fullyExploredExprs is a set of memo.ExprOrdinal values. Once an
-	// expression has been fully explored, its ordinal is added to this set.
-	fullyExploredExprs util.FastIntSet
+	// fullyExploredMembers is a set of ordinal positions of members within the
+	// memo group. Once a member expression has been fully explored, its ordinal
+	// is added to this set.
+	fullyExploredMembers util.FastIntSet
 }
 
-// isExprFullyExplored is true if the given expression will never match an
-// additional rule, and can therefore be skipped in future exploration passes.
-func (e *exploreState) isExprFullyExplored(ordinal memo.ExprOrdinal) bool {
-	return e.fullyExploredExprs.Contains(int(ordinal))
+// isMemberFullyExplored is true if the member at the given ordinal position
+// within the group will never match an additional rule, and can therefore be
+// skipped in future exploration passes.
+func (e *exploreState) isMemberFullyExplored(ordinal int) bool {
+	return e.fullyExploredMembers.Contains(ordinal)
 }
 
-// markExprAsFullyExplored is called when all possible matching combinations
+// markMemberAsFullyExplored is called when all possible matching combinations
 // have been considered for the subtree rooted at the given expression. Even if
 // there are more exploration passes, this expression will never have new
 // children, grand-children, etc. that might cause it to match another rule.
-func (e *exploreState) markExprAsFullyExplored(ordinal memo.ExprOrdinal) {
-	e.fullyExploredExprs.Add(int(ordinal))
+func (e *exploreState) markMemberAsFullyExplored(ordinal int) {
+	e.fullyExploredMembers.Add(ordinal)
 }

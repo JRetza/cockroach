@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import _ from "lodash";
 import React from "react";
 import { Helmet } from "react-helmet";
@@ -9,7 +19,7 @@ import { CachedDataReducerState } from "src/redux/cachedDataReducer";
 import { AdminUIState } from "src/redux/state";
 import Loading from "src/views/shared/components/loading";
 
-import spinner from "assets/spinner.gif";
+import "./index.styl";
 
 interface SettingsOwnProps {
   settings: CachedDataReducerState<protos.cockroach.server.serverpb.SettingsResponse>;
@@ -66,33 +76,22 @@ class Settings extends React.Component<SettingsProps, {}> {
   }
 
   render() {
-    if (!_.isNil(this.props.settings.lastError)) {
-      return (
-        <div className="section">
-          <h1>Cluster Settings</h1>
-          <h2>Error loading Cluster Settings</h2>
-          {this.props.settings.lastError}
-        </div>
-      );
-    }
-
     return (
       <div className="section">
         <Helmet>
           <title>Cluster Settings | Debug</title>
         </Helmet>
         <h1>Cluster Settings</h1>
-        <h2></h2>
         <Loading
           loading={!this.props.settings.data}
-          className="loading-image loading-image__spinner-left loading-image__spinner-left__padded"
-          image={spinner}
-        >
-          <div>
-            <p>Note that some settings have been redacted for security purposes.</p>
-            {this.renderTable()}
-          </div>
-        </Loading>
+          error={this.props.settings.lastError}
+          render={() => (
+            <div>
+              <p className="settings-note">Note that some settings have been redacted for security purposes.</p>
+              {this.renderTable()}
+            </div>
+          )}
+        />
       </div>
     );
   }

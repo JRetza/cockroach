@@ -1,5 +1,3 @@
-# LogicTest: default opt distsql distsql-opt distsql-metadata
-
 statement ok
 CREATE TABLE foo(x INT)
 

@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package kv
 
@@ -24,11 +20,12 @@ import (
 	"testing"
 
 	"github.com/biogo/store/llrb"
-
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/gogo/protobuf/proto"
+	"github.com/pkg/errors"
 )
 
 type testDescriptorDB struct {
@@ -139,7 +136,7 @@ func (db *testDescriptorDB) simulateLookupScan(
 ) error {
 	metaKey := keys.RangeMetaKey(key)
 	for {
-		desc, _, err := db.cache.LookupRangeDescriptor(ctx, metaKey, nil, useReverseScan)
+		desc, _, err := db.cache.LookupRangeDescriptorWithEvictionToken(ctx, metaKey, nil, useReverseScan)
 		if err != nil {
 			return err
 		}
@@ -386,9 +383,12 @@ func TestRangeCache(t *testing.T) {
 	doLookup(ctx, t, db.cache, "vu")
 	db.assertLookupCountEq(t, 1, "vu")
 
-	// Evict clears one level 1 and one level 2 cache
-	//  Evicts [meta(min),meta(g)) and [d,e).
+	// Evicts [d,e).
 	if err := db.cache.EvictCachedRangeDescriptor(ctx, roachpb.RKey("da"), nil, false); err != nil {
+		t.Fatal(err)
+	}
+	// Evicts [meta(min),meta(g)).
+	if err := db.cache.EvictCachedRangeDescriptor(ctx, keys.RangeMetaKey(roachpb.RKey("da")), nil, false); err != nil {
 		t.Fatal(err)
 	}
 	doLookup(ctx, t, db.cache, "fa")
@@ -412,16 +412,16 @@ func TestRangeCache(t *testing.T) {
 	_, evictToken := doLookup(ctx, t, db.cache, "cz")
 	db.assertLookupCountEq(t, 0, "cz")
 	// Now evict with the actual descriptor. The cache should clear the
-	// descriptor and the cached meta key.
-	//  Evicts [meta(min),meta(g)) and [c,d).
+	// descriptor.
+	//  Evicts [c,d).
 	if err := evictToken.Evict(ctx); err != nil {
 		t.Fatal(err)
 	}
-	// Totally uncached range.
-	//  Retrieves [meta(min),meta(g)) and [c,d).
+	// Meta2 range is cached.
+	//  Retrieves [c,d).
 	//  Prefetches [c,e) and [e,f).
 	doLookup(ctx, t, db.cache, "cz")
-	db.assertLookupCountEq(t, 2, "cz")
+	db.assertLookupCountEq(t, 1, "cz")
 }
 
 // TestRangeCacheCoalescedRequests verifies that concurrent lookups for
@@ -493,7 +493,7 @@ func TestRangeCacheContextCancellation(t *testing.T) {
 	}
 
 	expectContextCancellation := func(t *testing.T, c <-chan error) {
-		if err := <-c; err.Error() != context.Canceled.Error() {
+		if err := <-c; errors.Cause(err) != context.Canceled {
 			t.Errorf("expected context cancellation error, found %v", err)
 		}
 	}
@@ -595,7 +595,7 @@ func TestRangeCacheDetectSplit(t *testing.T) {
 	if err := evictToken.EvictAndReplace(ctx, mismatchErrRange); err != nil {
 		t.Fatal(err)
 	}
-	pauseLookupResumeAndAssert("az", 2, evictToken)
+	pauseLookupResumeAndAssert("az", 1, evictToken)
 
 	// Both sides of the split are now correctly cached.
 	doLookup(ctx, t, db.cache, "aa")
@@ -660,7 +660,7 @@ func TestRangeCacheDetectSplitReverseScan(t *testing.T) {
 	waitJoin.Wait()
 	db.resumeRangeLookups()
 	wg.Wait()
-	db.assertLookupCount(t, 3, 4, "a and az")
+	db.assertLookupCount(t, 2, 3, "a and az")
 
 	// Both are now correctly cached.
 	doLookupWithToken(ctx, t, db.cache, "a", nil, useReverseScan, nil)
@@ -717,7 +717,7 @@ func testRangeCacheHandleDoubleSplit(t *testing.T, useReverseScan bool) {
 	//   + will lookup the meta2 desc
 	//   + will lookup the ["at"-"b") desc
 	// - "az" will get the right range back
-	// - "at" will make a second lookup
+	// - "ao" and "at" will make a second lookup
 	//   + will lookup the ["an"-"at") desc
 	//
 	// [non-reverse case]
@@ -768,7 +768,7 @@ func testRangeCacheHandleDoubleSplit(t *testing.T, useReverseScan bool) {
 	db.resumeRangeLookups()
 
 	wg.Wait()
-	db.assertLookupCountEq(t, 3, "an and az")
+	db.assertLookupCountEq(t, 2, "an and az")
 	if numRetries == 0 {
 		t.Error("expected retry on desc lookup")
 	}
@@ -946,73 +946,6 @@ func TestRangeCacheClearOverlappingMeta(t *testing.T) {
 	}()
 }
 
-// TestRangeCacheEvictMetaDescriptors tests that regardless of the eviction key
-// provided to EvictCachedRangeDescriptor, the meta ranges that store the key's
-// descriptor and its meta descriptors are properly evicted. This is related to
-// #18032.
-func TestRangeCacheEvictMetaDescriptors(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	ctx := context.TODO()
-
-	meta1Desc := roachpb.RangeDescriptor{
-		StartKey: roachpb.RKeyMin,
-		EndKey:   keys.MustAddr(keys.Meta2Prefix),
-	}
-	meta2LeftDesc := roachpb.RangeDescriptor{
-		StartKey: meta1Desc.EndKey,
-		EndKey:   keys.RangeMetaKey(roachpb.RKey("m")),
-	}
-	meta2RightDesc := roachpb.RangeDescriptor{
-		StartKey: meta2LeftDesc.EndKey,
-		EndKey:   keys.RangeMetaKey(roachpb.RKey("zzz")).Next(),
-	}
-	restDesc := roachpb.RangeDescriptor{
-		StartKey: meta2RightDesc.EndKey,
-		EndKey:   roachpb.RKey("zzz"),
-	}
-
-	testCases := []struct {
-		evictKey roachpb.RKey
-	}{
-		{evictKey: roachpb.RKey("a")},
-		{evictKey: roachpb.RKey("m")},
-		{evictKey: roachpb.RKey("z")},
-	}
-	for _, tc := range testCases {
-		t.Run(tc.evictKey.String(), func(t *testing.T) {
-			if !restDesc.ContainsKey(tc.evictKey) {
-				t.Fatalf("restDesc must contain evictKey, found %v", tc.evictKey)
-			}
-
-			st := cluster.MakeTestingClusterSettings()
-			cache := NewRangeDescriptorCache(st, nil, staticSize(2<<10))
-			err := cache.InsertRangeDescriptors(ctx, meta1Desc, meta2LeftDesc, meta2RightDesc, restDesc)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			// Evict the user-space descriptor. This should result in the metaRightDesc
-			// being evicted as well, because that is where restDesc is stored. This
-			// is true even if meta(tc.evictKey) addresses into metaLeftDesc. In addition,
-			// the meta1Desc will be evicted, leaving only the meta2RightDesc.
-			err = cache.EvictCachedRangeDescriptor(ctx, tc.evictKey, nil, false)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			exp := []roachpb.RangeDescriptor{meta2LeftDesc}
-			found := []roachpb.RangeDescriptor{}
-			cache.rangeCache.cache.Do(func(k, v interface{}) bool {
-				found = append(found, *v.(*roachpb.RangeDescriptor))
-				return false
-			})
-			if !reflect.DeepEqual(exp, found) {
-				t.Errorf("expected remaining descriptors %v, found %v", exp, found)
-			}
-		})
-	}
-}
-
 // TestGetCachedRangeDescriptorInverted verifies the correctness of the result
 // that is returned by getCachedRangeDescriptor with inverted=true.
 func TestGetCachedRangeDescriptorInverted(t *testing.T) {
@@ -1085,5 +1018,106 @@ func TestGetCachedRangeDescriptorInverted(t *testing.T) {
 		if !reflect.DeepEqual(cacheKey, test.cacheKey) {
 			t.Fatalf("expect cache key %v, actual get %v", test.cacheKey, cacheKey)
 		}
+	}
+}
+
+func TestRangeCacheGeneration(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.TODO()
+
+	descAM1 := &roachpb.RangeDescriptor{
+		StartKey:             roachpb.RKey("a"),
+		EndKey:               roachpb.RKey("m"),
+		Generation:           proto.Int64(1),
+		GenerationComparable: proto.Bool(true),
+	}
+	descMZ3 := &roachpb.RangeDescriptor{
+		StartKey:             roachpb.RKey("m"),
+		EndKey:               roachpb.RKey("z"),
+		Generation:           proto.Int64(3),
+		GenerationComparable: proto.Bool(true),
+	}
+
+	descBY0 := &roachpb.RangeDescriptor{
+		StartKey:             roachpb.RKey("b"),
+		EndKey:               roachpb.RKey("y"),
+		Generation:           proto.Int64(0),
+		GenerationComparable: proto.Bool(true),
+	}
+	descBY2 := &roachpb.RangeDescriptor{
+		StartKey:             roachpb.RKey("b"),
+		EndKey:               roachpb.RKey("y"),
+		Generation:           proto.Int64(2),
+		GenerationComparable: proto.Bool(true),
+	}
+	descBY4 := &roachpb.RangeDescriptor{
+		StartKey:             roachpb.RKey("b"),
+		EndKey:               roachpb.RKey("y"),
+		Generation:           proto.Int64(4),
+		GenerationComparable: proto.Bool(true),
+	}
+	descBYIncomparable := &roachpb.RangeDescriptor{
+		StartKey: roachpb.RKey("b"),
+		EndKey:   roachpb.RKey("y"),
+	}
+
+	testCases := []struct {
+		name         string
+		insertDesc   *roachpb.RangeDescriptor
+		queryKeys    []roachpb.RKey
+		expectedDesc []*roachpb.RangeDescriptor
+	}{
+		{
+			// descBY0 is ignored since the existing keyspace is covered by
+			// descriptors of generations 1 and 3, respectively.
+			name:         "generation comparable evict 0",
+			insertDesc:   descBY0,
+			queryKeys:    []roachpb.RKey{roachpb.RKey("b"), roachpb.RKey("y")},
+			expectedDesc: []*roachpb.RangeDescriptor{descAM1, descMZ3},
+		},
+		{
+			// descBY2 evicts descAM1, but not descMZ3 based on Generation. Since
+			// there is an overlapping descriptor with higher Generation (descMZ3),
+			// it is not inserted.
+			name:         "generation comparable evict 1",
+			insertDesc:   descBY2,
+			queryKeys:    []roachpb.RKey{roachpb.RKey("b"), roachpb.RKey("y")},
+			expectedDesc: []*roachpb.RangeDescriptor{nil, descMZ3},
+		},
+		{
+			// descBY4 replaces both existing descriptors and it is inserted.
+			name:         "generation comparable evict 2",
+			insertDesc:   descBY4,
+			queryKeys:    []roachpb.RKey{roachpb.RKey("b"), roachpb.RKey("y")},
+			expectedDesc: []*roachpb.RangeDescriptor{descBY4, nil},
+		},
+		{
+			// descBYIncomparable has an incomparable Generation, so it evicts all
+			// overlapping descriptors. This behavior is clearly less desirable in
+			// general, but there's no better option in this case.
+			name:         "generation incomparable evict 2",
+			insertDesc:   descBYIncomparable,
+			queryKeys:    []roachpb.RKey{roachpb.RKey("b"), roachpb.RKey("y")},
+			expectedDesc: []*roachpb.RangeDescriptor{descBYIncomparable, nil},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := cluster.MakeTestingClusterSettings()
+			cache := NewRangeDescriptorCache(st, nil, staticSize(2<<10))
+			err := cache.InsertRangeDescriptors(ctx, *descAM1, *descMZ3, *tc.insertDesc)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			for index, queryKey := range tc.queryKeys {
+				if actualDesc, err := cache.GetCachedRangeDescriptor(queryKey, false); err != nil {
+					t.Fatal(err)
+				} else if !tc.expectedDesc[index].Equal(actualDesc) {
+					t.Errorf("expected descriptor %s; got %s", tc.expectedDesc[index], actualDesc)
+				}
+			}
+		})
 	}
 }

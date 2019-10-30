@@ -1,9 +1,17 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import React from "react";
 import { Helmet } from "react-helmet";
 import { Link, RouterState } from "react-router";
 import { connect } from "react-redux";
-
-import "./sqlhighlight.styl";
 
 import * as protos from "src/js/protos";
 import { databaseNameAttr, tableNameAttr } from "src/util/constants";
@@ -16,9 +24,9 @@ import { SummaryBar, SummaryHeadlineStat } from "src/views/shared/components/sum
 import { TableInfo } from "src/views/databases/data/tableInfo";
 import { SortSetting } from "src/views/shared/components/sortabletable";
 import { SortedTable } from "src/views/shared/components/sortedtable";
-import * as hljs from "highlight.js";
+import { SqlBox } from "src/views/shared/components/sql/box";
 
-class GrantsSortedTable extends SortedTable<protos.cockroach.server.serverpb.TableDetailsResponse.Grant$Properties> {}
+class GrantsSortedTable extends SortedTable<protos.cockroach.server.serverpb.TableDetailsResponse.IGrant> {}
 
 const databaseTableGrantsSortSetting = new LocalSetting<AdminUIState, SortSetting>(
   "tableDetails/sort_setting/grants", (s) => s.localSettings,
@@ -55,8 +63,6 @@ type TableMainProps = TableMainData & TableMainActions & RouterState;
  * data table of all databases.
  */
 class TableMain extends React.Component<TableMainProps, {}> {
-  createStmtNode: Node;
-
   componentWillMount() {
     this.props.refreshTableDetails(new protos.cockroach.server.serverpb.TableDetailsRequest({
       database: this.props.params[databaseNameAttr],
@@ -66,14 +72,6 @@ class TableMain extends React.Component<TableMainProps, {}> {
       database: this.props.params[databaseNameAttr],
       table: this.props.params[tableNameAttr],
     }));
-  }
-
-  componentDidMount() {
-    hljs.highlightBlock(this.createStmtNode);
-  }
-
-  componentDidUpdate() {
-    hljs.highlightBlock(this.createStmtNode);
   }
 
   render() {
@@ -95,10 +93,7 @@ class TableMain extends React.Component<TableMainProps, {}> {
           </div>
           <div className="content l-columns">
             <div className="l-columns__left">
-              <pre className="sql-highlight" ref={(node) => this.createStmtNode = node}>
-                {/* TODO (mrtracy): format create table statement */}
-                {tableInfo.createStatement}
-              </pre>
+              <SqlBox value={ tableInfo.createStatement } />
               <div className="sql-table">
                 <GrantsSortedTable
                   data={tableInfo.grants}

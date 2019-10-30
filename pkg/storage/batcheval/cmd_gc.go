@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package batcheval
 
@@ -22,7 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/spanset"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
@@ -31,7 +27,7 @@ func init() {
 }
 
 func declareKeysGC(
-	desc roachpb.RangeDescriptor, header roachpb.Header, req roachpb.Request, spans *spanset.SpanSet,
+	desc *roachpb.RangeDescriptor, header roachpb.Header, req roachpb.Request, spans *spanset.SpanSet,
 ) {
 	// Intentionally don't call DefaultDeclareKeys: the key range in the header
 	// is usually the whole range (pending resolution of #7880).
@@ -44,17 +40,6 @@ func declareKeysGC(
 	// but can avoid declaring these keys below.
 	if gcr.Threshold != (hlc.Timestamp{}) {
 		spans.Add(spanset.SpanReadWrite, roachpb.Span{Key: keys.RangeLastGCKey(header.RangeID)})
-	}
-	if gcr.TxnSpanGCThreshold != (hlc.Timestamp{}) {
-		spans.Add(spanset.SpanReadWrite, roachpb.Span{
-			// TODO(bdarnell): since this must be checked by all
-			// reads, this should be factored out into a separate
-			// waiter which blocks only those reads far enough in the
-			// past to be affected by the in-flight GCRequest (i.e.
-			// normally none). This means this key would be special
-			// cased and not tracked by the command queue.
-			Key: keys.RangeTxnSpanGCThresholdKey(header.RangeID),
-		})
 	}
 	spans.Add(spanset.SpanReadOnly, roachpb.Span{Key: keys.RangeDescriptorKey(desc.StartKey)})
 }
@@ -98,13 +83,6 @@ func GC(
 		newThreshold.Forward(args.Threshold)
 	}
 
-	var newTxnSpanGCThreshold hlc.Timestamp
-	if args.TxnSpanGCThreshold != (hlc.Timestamp{}) {
-		oldTxnSpanGCThreshold := cArgs.EvalCtx.GetTxnSpanGCThreshold()
-		newTxnSpanGCThreshold = oldTxnSpanGCThreshold
-		newTxnSpanGCThreshold.Forward(args.TxnSpanGCThreshold)
-	}
-
 	var pd result.Result
 	stateLoader := MakeStateLoader(cArgs.EvalCtx)
 
@@ -112,7 +90,7 @@ func GC(
 	// keys unless we have to (to allow the GC queue to batch requests more
 	// efficiently), and we must honor what we declare.
 
-	var replState storagebase.ReplicaState
+	var replState storagepb.ReplicaState
 	if newThreshold != (hlc.Timestamp{}) {
 		replState.GCThreshold = &newThreshold
 		if err := stateLoader.SetGCThreshold(ctx, batch, cArgs.Stats, &newThreshold); err != nil {
@@ -120,17 +98,10 @@ func GC(
 		}
 	}
 
-	if newTxnSpanGCThreshold != (hlc.Timestamp{}) {
-		replState.TxnSpanGCThreshold = &newTxnSpanGCThreshold
-		if err := stateLoader.SetTxnSpanGCThreshold(ctx, batch, cArgs.Stats, &newTxnSpanGCThreshold); err != nil {
-			return result.Result{}, err
-		}
-	}
-
 	// Only set ReplicatedEvalResult.ReplicaState if at least one of the GC keys
 	// was written. Leaving the field nil to signify that no changes to the
 	// Replica state occurred allows replicas to perform less work beneath Raft.
-	if replState != (storagebase.ReplicaState{}) {
+	if replState != (storagepb.ReplicaState{}) {
 		pd.Replicated.State = &replState
 	}
 	return pd, nil

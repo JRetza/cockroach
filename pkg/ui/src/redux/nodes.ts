@@ -1,10 +1,20 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import _ from "lodash";
 import { createSelector } from "reselect";
 
 import * as protos from "src/js/protos";
 import { AdminUIState } from "./state";
 import { Pick } from "src/util/pick";
-import { NodeStatus$Properties, MetricConstants, BytesUsed } from "src/util/proto";
+import { INodeStatus, MetricConstants, BytesUsed } from "src/util/proto";
 import { nullOfReturnType } from "src/util/types";
 
 /**
@@ -108,12 +118,12 @@ const nodeIDsSelector = createSelector(
 );
 
 /**
- * nodeStatusByIDSelector returns a map from NodeID to a current NodeStatus$Properties.
+ * nodeStatusByIDSelector returns a map from NodeID to a current INodeStatus.
  */
 const nodeStatusByIDSelector = createSelector(
   nodeStatusesSelector,
   (nodeStatuses) => {
-    const statuses: {[s: string]: NodeStatus$Properties} = {};
+    const statuses: {[s: string]: INodeStatus} = {};
     _.each(nodeStatuses, (ns) => {
       statuses[ns.desc.node_id.toString()] = ns;
     });
@@ -132,7 +142,7 @@ const nodeSumsSelector = createSelector(
 );
 
 export function sumNodeStats(
-  nodeStatuses: NodeStatus$Properties[],
+  nodeStatuses: INodeStatus[],
   livenessStatusByNodeID: { [id: string]: LivenessStatus },
 ) {
   const result = {
@@ -201,7 +211,7 @@ export interface CapacityStats {
   available: number;
 }
 
-export function nodeCapacityStats(n: NodeStatus$Properties): CapacityStats {
+export function nodeCapacityStats(n: INodeStatus): CapacityStats {
   const used = n.metrics[MetricConstants.usedCapacity];
   const available = n.metrics[MetricConstants.availableCapacity];
   return {
@@ -211,7 +221,7 @@ export function nodeCapacityStats(n: NodeStatus$Properties): CapacityStats {
   };
 }
 
-export function getDisplayName(node: NodeStatus$Properties, livenessStatus = LivenessStatus.LIVE) {
+export function getDisplayName(node: INodeStatus, livenessStatus = LivenessStatus.LIVE) {
   const decommissionedString = livenessStatus === LivenessStatus.DECOMMISSIONED
     ? "[decommissioned] "
     : "";

@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -35,7 +31,7 @@ type inMemSideloadStorage struct {
 
 func mustNewInMemSideloadStorage(
 	rangeID roachpb.RangeID, replicaID roachpb.ReplicaID, baseDir string,
-) sideloadStorage {
+) SideloadStorage {
 	ss, err := newInMemSideloadStorage(cluster.MakeTestingClusterSettings(), rangeID, replicaID, baseDir, nil)
 	if err != nil {
 		panic(err)
@@ -49,7 +45,7 @@ func newInMemSideloadStorage(
 	replicaID roachpb.ReplicaID,
 	baseDir string,
 	eng engine.Engine,
-) (sideloadStorage, error) {
+) (SideloadStorage, error) {
 	return &inMemSideloadStorage{
 		prefix: filepath.Join(baseDir, fmt.Sprintf("%d.%d", rangeID, replicaID)),
 		m:      make(map[slKey][]byte),
@@ -85,13 +81,14 @@ func (ss *inMemSideloadStorage) Filename(_ context.Context, index, term uint64) 
 	return filepath.Join(ss.prefix, fmt.Sprintf("i%d.t%d", index, term)), nil
 }
 
-func (ss *inMemSideloadStorage) Purge(_ context.Context, index, term uint64) error {
+func (ss *inMemSideloadStorage) Purge(_ context.Context, index, term uint64) (int64, error) {
 	k := ss.key(index, term)
 	if _, ok := ss.m[k]; !ok {
-		return errSideloadedFileNotFound
+		return 0, errSideloadedFileNotFound
 	}
+	size := int64(len(ss.m[k]))
 	delete(ss.m, k)
-	return nil
+	return size, nil
 }
 
 func (ss *inMemSideloadStorage) Clear(_ context.Context) error {
@@ -99,12 +96,17 @@ func (ss *inMemSideloadStorage) Clear(_ context.Context) error {
 	return nil
 }
 
-func (ss *inMemSideloadStorage) TruncateTo(_ context.Context, index uint64) error {
+func (ss *inMemSideloadStorage) TruncateTo(
+	_ context.Context, index uint64,
+) (freed, retained int64, _ error) {
 	// Not efficient, but this storage is for testing purposes only anyway.
-	for k := range ss.m {
+	for k, v := range ss.m {
 		if k.index < index {
+			freed += int64(len(v))
 			delete(ss.m, k)
+		} else {
+			retained += int64(len(v))
 		}
 	}
-	return nil
+	return freed, retained, nil
 }

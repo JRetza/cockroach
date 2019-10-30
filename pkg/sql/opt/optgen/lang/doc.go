@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 /*
 Package lang implements a language called Optgen, short for "optimizer
@@ -152,9 +148,9 @@ and a "Const" node as its right child.
 
 Binding
 
-Child patterns within a node match pattern can be "bound" to a named variable.
-These variables can then be referenced later in the match pattern or in the
-replace pattern. This is a critical part of the Optgen language, since
+Child patterns within match and replace patterns can be "bound" to a named
+variable. These variables can then be referenced later in the match pattern or
+in the replace pattern. This is a critical part of the Optgen language, since
 virtually every pattern constructs its replacement pattern based on parts of
 the match pattern. For example:
 
@@ -200,16 +196,19 @@ This pattern matches "Eq", "Ne", "Lt", or "Gt" nodes.
 
 Matching Primitive Types
 
-Often, there are leaf nodes in the target expression tree that can be matched
-against primitive types, like simple strings. A literal string in a match
-pattern is interpreted as a "string matcher" and is tested for equality with
-the child node. For example:
+String and numeric constant nodes in the tree can be matched against literals.
+A literal string or number in a match pattern is interpreted as a matcher of
+that type, and will be tested for equality with the child node. For example:
 
   [EliminateConcat]
-  (Concat $left:* "") => $left
+  (Concat $left:* (Const "")) => $left
 
-If Concat's right operand is a literal string expression that's equal to the
-empty string, then the pattern matches.
+If Concat's right operand is a constant expression with the empty string as its
+value, then the pattern matches. Similarly, a constant numeric expression can be
+matched like this:
+
+  [LimitScan]
+  (Limit (Scan $def:*) (Const 1)) => (ScanOneRow $def)
 
 Matching Lists
 
@@ -338,11 +337,6 @@ case where the substitution node was already present in the match pattern:
   [EliminateAnd]
   (And $left:* (True)) => $left
 
-Literal strings can be part of a replace pattern, or even all of it, if the
-intent is to construct a constant string node:
-
-  (Concat "" "") => ""
-
 Custom Construction
 
 When Optgen syntax cannot easily produce a result, custom construction
@@ -390,9 +384,9 @@ invocations, or lists. Here is an example:
 
 Dynamic Construction
 
-Sometimes the name of a constructed node can be one of several choices, and may
-not even be known at compile-time. The built-in "OpName" function can be used
-to dynamically construct the right kind of node. For example:
+Sometimes the name of a constructed node can be one of several choices. The
+built-in "OpName" function can be used to dynamically construct the right kind
+of node. For example:
 
   [NormalizeVar]
   (Eq | Ne
@@ -456,6 +450,45 @@ name is passed as a parameter to two functions in this example:
   =>
   (ConstructBinary Minus $right $left)
 
+Type Inference
+
+Expressions in both the match and replace patterns are assigned a data type
+that describes the kind of data that will be returned by the expression. These
+types are inferred using a combination of top-down and bottom-up type inference
+rules. For example:
+
+  define Select {
+    Input  Expr
+    Filter Expr
+  }
+
+  (Select $input:(LeftJoin | RightJoin) $filter:*) => $input
+
+The type of $input is inferred as "LeftJoin | RightJoin" by bubbling up the type
+of the bound expression. That type is propagated to the $input reference in the
+replace pattern. By contrast, the type of the * expression is inferred to be
+"Expr" using a top-down type inference rule, since the second argument to the
+Select operator is known to have type "Expr".
+
+When multiple types are inferred for an expression using different type
+inference rules, the more restrictive type is assigned to the expression. For
+example:
+
+  (Select $input:* & (LeftJoin)) => $input
+
+Here, the left input to the And expression was inferred to have type "Expr" and
+the right input to have type "LeftJoin". Since "LeftJoin" is the more
+restrictive type, the And expression and the $input binding are typed as
+"LeftJoin".
+
+Type inference detects and reports type contradictions, which occur when
+multiple incompatible types are inferred for an expression. For example:
+
+  (Select $input:(InnerJoin) & (LeftJoin)) => $input
+
+Because the input cannot be both an InnerJoin and a LeftJoin, Optgen reports a
+type contradiction error.
+
 Syntax
 
 This section describes the Optgen language syntax in a variant of extended
@@ -464,47 +497,40 @@ terminals correspond to tokens returned by the scanner. Whitespace and
 comment tokens can be freely interleaved between other tokens in the
 grammar.
 
-  root                = tags (define | rule)
-  tags                = '[' IDENT (',' IDENT)* ']'
+  root         = tags (define | rule)
+  tags         = '[' IDENT (',' IDENT)* ']'
 
-  define              = 'define' define-name '{' define-field* '}'
-  define-name         = IDENT
-  define-field        = field-name field-type
-  field-name          = IDENT
-  field-type          = IDENT
+  define       = 'define' define-name '{' define-field* '}'
+  define-name  = IDENT
+  define-field = field-name field-type
+  field-name   = IDENT
+  field-type   = IDENT
 
-  rule                = match '=>' replace
-  match               = '(' match-names match-child* ')'
-  match-names         = name ('|' name)*
-  match-child         = bind | ref | match-and
-  bind                = '$' label ':' match-and
-  ref                 = '$' label
-  match-and           = match-item ('&' match-and)
-  match-item          = match | match-not | match-list | match-any | name |
-                        STRING
-  match-not           = '^' match-item
-  match-list          = match-list-any | match-list-first | match-list-last |
-                        match-list-single | match-list-empty
-  match-list-any      = '[' '...' match-child '...' ']'
-  match-list-first    = '[' match-child '...' ']'
-  match-list-last     = '[' '...' match-child ']'
-  match-list-single   = '[' match-child ']'
-  match-list-empty    = '[' ']'
-  match-any           = '*'
-
-  replace             = construct | construct-list | ref | STRING
-  construct           = '(' construct-name replace* ')'
-  construct-name      = name | construct
-  construct-list      = '[' replace* ']'
-
-  name                = IDENT
-  label               = IDENT
+  rule         = func '=>' replace
+  match        = func
+  replace      = func | ref
+  func         = '(' func-name arg* ')'
+  func-name    = names | func
+  names        = name ('|' name)*
+  arg          = bind and | ref | and
+  and          = expr ('&' and)
+  expr         = func | not | list | any | name | STRING | NUMBER
+  not          = '^' expr
+  list         = '[' list-child* ']'
+  list-child   = list-any | arg
+  list-any     = '...'
+  bind         = '$' label ':' and
+  ref          = '$' label
+  any          = '*'
+  name         = IDENT
+  label        = IDENT
 
 Here are the pseudo-regex definitions for the lexical tokens that aren't
 represented as single-quoted strings above:
 
   STRING     = " [^"\n]* "
-  IDENT      = UnicodeLetter (UnicodeLetter | UnicodeNumber)*
+  NUMBER     = UnicodeDigit+
+  IDENT      = (UnicodeLetter | '_') (UnicodeLetter | '_' | UnicodeNumber)*
   COMMENT    = '#' .* \n
   WHITESPACE = UnicodeSpace+
 

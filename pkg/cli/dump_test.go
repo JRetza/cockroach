@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cli
 
@@ -27,11 +23,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/spf13/pflag"
-
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/testutils/datadriven"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
@@ -39,7 +32,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/datadriven"
+	"github.com/spf13/pflag"
 )
 
 // TestDumpData uses the testdata/dump directory to execute SQL statements
@@ -122,7 +118,7 @@ func TestDumpBytes(t *testing.T) {
 	c := newCLITest(cliTestParams{t: t})
 	defer c.cleanup()
 
-	url, cleanup := sqlutils.PGUrl(t, c.ServingAddr(), t.Name(), url.User(security.RootUser))
+	url, cleanup := sqlutils.PGUrl(t, c.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
 	defer cleanup()
 
 	conn := makeSQLConn(url.String())
@@ -186,7 +182,7 @@ func TestDumpRandom(t *testing.T) {
 	c := newCLITest(cliTestParams{t: t})
 	defer c.cleanup()
 
-	url, cleanup := sqlutils.PGUrl(t, c.ServingAddr(), t.Name(), url.User(security.RootUser))
+	url, cleanup := sqlutils.PGUrl(t, c.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
 	defer cleanup()
 
 	conn := makeSQLConn(url.String())
@@ -198,9 +194,13 @@ func TestDumpRandom(t *testing.T) {
 		CREATE TABLE d.t (
 			rowid int,
 			i int,
+			si smallint,
+			bi bigint,
 			f float,
+			fr real,
 			d date,
 			m timestamp,
+			mtz timestamptz,
 			n interval,
 			o bool,
 			e decimal,
@@ -209,8 +209,9 @@ func TestDumpRandom(t *testing.T) {
 			u uuid,
 			ip inet,
 			j json,
-			PRIMARY KEY (rowid, i, f, d, m, n, o, e, s, b, u, ip)
+			PRIMARY KEY (rowid, i, si, bi, f, fr, d, m, mtz, n, o, e, s, b, u, ip)
 		);
+		SET extra_float_digits = 3;
 	`, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -231,14 +232,10 @@ func TestDumpRandom(t *testing.T) {
 			// Generate a random number of random inserts.
 			i := rnd.Int63()
 			f := rnd.Float64()
-			d := timeutil.Unix(0, rnd.Int63()).Round(time.Hour * 24)
+			d, _ := pgdate.MakeCompatibleDateFromDisk(rnd.Int63n(10000)).ToTime()
 			m := timeutil.Unix(0, rnd.Int63()).Round(time.Microsecond)
 			sign := 1 - rnd.Int63n(2)*2
-			dur := duration.Duration{
-				Months: sign * rnd.Int63n(1000),
-				Days:   sign * rnd.Int63n(1000),
-				Nanos:  sign * rnd.Int63(),
-			}
+			dur := duration.MakeDuration(sign*rnd.Int63(), sign*rnd.Int63n(1000), sign*rnd.Int63n(1000))
 			n := dur.String()
 			o := rnd.Intn(2) == 1
 			e := apd.New(rnd.Int63(), rnd.Int31n(20)-10).String()
@@ -277,8 +274,12 @@ func TestDumpRandom(t *testing.T) {
 			vals := []driver.Value{
 				_i,
 				i,
+				i & 0x7fff, // si
+				i,          // bi
 				f,
+				f, // fr
 				d,
+				m,
 				m,
 				[]byte(n), // intervals come out as `[]byte`s
 				o,
@@ -289,14 +290,14 @@ func TestDumpRandom(t *testing.T) {
 				[]byte(ip.String()),
 				[]byte(j.String()),
 			}
-			if err := conn.Exec("INSERT INTO d.t VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)", vals); err != nil {
+			if err := conn.Exec("INSERT INTO d.t VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)", vals); err != nil {
 				t.Fatal(err)
 			}
 			generatedRows = append(generatedRows, vals[1:])
 		}
 
 		check := func(table string) {
-			q := fmt.Sprintf("SELECT i, f, d, m, n, o, e, s, b, u, ip, j FROM %s ORDER BY rowid", table)
+			q := fmt.Sprintf("SELECT i, si, bi, f, fr, d, m, mtz, n, o, e, s, b, u, ip, j FROM %s ORDER BY rowid", table)
 			nrows, err := conn.Query(q, nil)
 			if err != nil {
 				t.Fatal(err)
@@ -368,9 +369,9 @@ func TestDumpAsOf(t *testing.T) {
 
 	const create = `
 	CREATE DATABASE d;
-	CREATE TABLE d.t (i int);
+	CREATE TABLE d.t (i int8);
 	INSERT INTO d.t VALUES (1);
-	SELECT NOW();
+	SELECT now();
 `
 
 	out, err := c.RunWithCaptureArgs([]string{"sql", "-e", create})
@@ -389,7 +390,7 @@ func TestDumpAsOf(t *testing.T) {
 
 	const want1 = `dump d t
 CREATE TABLE t (
-	i INT NULL,
+	i INT8 NULL,
 	FAMILY "primary" (i, rowid)
 );
 
@@ -401,7 +402,7 @@ INSERT INTO t (i) VALUES
 	}
 
 	c.RunWithArgs([]string{"sql", "-e", `
-		ALTER TABLE d.t ADD COLUMN j int DEFAULT 2;
+		ALTER TABLE d.t ADD COLUMN j int8 DEFAULT 2;
 		INSERT INTO d.t VALUES (3, 4);
 	`})
 
@@ -411,8 +412,8 @@ INSERT INTO t (i) VALUES
 	}
 	const want2 = `dump d t
 CREATE TABLE t (
-	i INT NULL,
-	j INT NULL DEFAULT 2:::INT,
+	i INT8 NULL,
+	j INT8 NULL DEFAULT 2:::INT8,
 	FAMILY "primary" (i, rowid, j)
 );
 
@@ -438,5 +439,54 @@ INSERT INTO t (i, j) VALUES
 		t.Fatal(err)
 	} else if !strings.Contains(out, `relation d.public.t does not exist`) {
 		t.Fatalf("unexpected output: %s", out)
+	}
+}
+
+func TestDumpInterleavedTables(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	c := newCLITest(cliTestParams{t: t})
+	defer c.cleanup()
+
+	const create = `
+CREATE DATABASE d;
+CREATE TABLE d.customers (id INT PRIMARY KEY, name STRING(50));
+CREATE TABLE d.orders (
+	customer INT,
+	id INT,
+	total DECIMAL(20, 5),
+	PRIMARY KEY (customer, id),
+	CONSTRAINT fk_customer FOREIGN KEY (customer) REFERENCES d.customers
+) INTERLEAVE IN PARENT d.customers (customer);
+`
+
+	_, err := c.RunWithCaptureArgs([]string{"sql", "-e", create})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dump1, err := c.RunWithCaptureArgs([]string{"dump", "d", "orders"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const want1 = `dump d orders
+CREATE TABLE orders (
+	customer INT8 NOT NULL,
+	id INT8 NOT NULL,
+	total DECIMAL(20,5) NULL,
+	CONSTRAINT "primary" PRIMARY KEY (customer ASC, id ASC),
+	FAMILY "primary" (customer, id, total)
+) INTERLEAVE IN PARENT customers (customer);
+
+ALTER TABLE orders ADD CONSTRAINT fk_customer FOREIGN KEY (customer) REFERENCES customers(id);
+CREATE UNIQUE INDEX "primary" ON orders (customer ASC, id ASC) INTERLEAVE IN PARENT customers (customer);
+
+-- Validate foreign key constraints. These can fail if there was unvalidated data during the dump.
+ALTER TABLE orders VALIDATE CONSTRAINT fk_customer;
+`
+
+	if dump1 != want1 {
+		t.Fatalf("expected: %s\ngot: %s", want1, dump1)
 	}
 }

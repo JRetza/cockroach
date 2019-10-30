@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 //
 // The parallel_test adds an orchestration layer on top of the logic_test code
 // with the capability of running multiple test data files in parallel.
@@ -32,8 +28,6 @@ import (
 	"strings"
 	"testing"
 
-	"gopkg.in/yaml.v2"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -46,6 +40,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/gogo/protobuf/proto"
+	yaml "gopkg.in/yaml.v2"
 )
 
 var (
@@ -73,7 +69,7 @@ func (t *parallelTest) processTestFile(path string, nodeIdx int, db *gosql.DB, c
 
 	// Set up a dummy logicTest structure to use that code.
 	l := &logicTest{
-		t:       t.T,
+		rootT:   t.T,
 		cluster: t.cluster,
 		nodeIdx: nodeIdx,
 		db:      db,
@@ -90,7 +86,7 @@ func (t *parallelTest) getClient(nodeIdx, clientIdx int) *gosql.DB {
 	for len(t.clients[nodeIdx]) <= clientIdx {
 		// Add a client.
 		pgURL, cleanupFunc := sqlutils.PGUrl(t.T,
-			t.cluster.Server(nodeIdx).ServingAddr(),
+			t.cluster.Server(nodeIdx).ServingSQLAddr(),
 			"TestParallel",
 			url.User(security.RootUser))
 		db, err := gosql.Open("postgres", pgURL.String())
@@ -183,16 +179,7 @@ func (t *parallelTest) setup(spec *parTestSpec) {
 		log.Infof(t.ctx, "Cluster Size: %d", spec.ClusterSize)
 	}
 
-	args := base.TestClusterArgs{
-		ServerArgs: base.TestServerArgs{
-			Knobs: base.TestingKnobs{
-				SQLExecutor: &sql.ExecutorTestingKnobs{
-					CheckStmtStringChange: true,
-				},
-			},
-		},
-	}
-	t.cluster = serverutils.StartTestCluster(t, spec.ClusterSize, args)
+	t.cluster = serverutils.StartTestCluster(t, spec.ClusterSize, base.TestClusterArgs{})
 
 	for i := 0; i < t.cluster.NumServers(); i++ {
 		server := t.cluster.Server(i)
@@ -213,8 +200,8 @@ func (t *parallelTest) setup(spec *parTestSpec) {
 			log.Infof(t.ctx, "Setting range split size: %d", spec.RangeSplitSize)
 		}
 		zoneCfg := config.DefaultZoneConfig()
-		zoneCfg.RangeMaxBytes = int64(spec.RangeSplitSize)
-		zoneCfg.RangeMinBytes = zoneCfg.RangeMaxBytes / 2
+		zoneCfg.RangeMaxBytes = proto.Int64(int64(spec.RangeSplitSize))
+		zoneCfg.RangeMinBytes = proto.Int64(*zoneCfg.RangeMaxBytes / 2)
 		buf, err := protoutil.Marshal(&zoneCfg)
 		if err != nil {
 			t.Fatal(err)

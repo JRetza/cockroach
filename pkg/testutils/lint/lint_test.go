@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 // +build lint
 
@@ -20,12 +16,7 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	"go/ast"
 	"go/build"
-	"go/parser"
-	"go/token"
-	"go/types"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -34,17 +25,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/cmd/urlcheck/lib/urlcheck"
-	sqlparser "github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
+	_ "github.com/cockroachdb/cockroach/pkg/testutils/buildutil"
 	"github.com/ghemawat/stream"
-	"github.com/kisielk/gotool"
 	"github.com/pkg/errors"
 	"golang.org/x/tools/go/buildutil"
-	"golang.org/x/tools/go/loader"
-	"honnef.co/go/tools/lint"
-	"honnef.co/go/tools/simple"
-	"honnef.co/go/tools/staticcheck"
-	"honnef.co/go/tools/unused"
 )
 
 const cockroachDB = "github.com/cockroachdb/cockroach"
@@ -63,6 +48,70 @@ func dirCmd(
 	return cmd, stderr, stream.ReadLines(stdout), nil
 }
 
+// vetCmd executes commands like dirCmd, but stderr is used as the output
+// instead of stdout, as produced by programs like `go vet`.
+func vetCmd(t *testing.T, dir, name string, args []string, filters []stream.Filter) {
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	var b bytes.Buffer
+	cmd.Stdout = &b
+	cmd.Stderr = &b
+	switch err := cmd.Run(); err.(type) {
+	case nil:
+	case *exec.ExitError:
+		// Non-zero exit is expected.
+	default:
+		t.Fatal(err)
+	}
+	filters = append([]stream.Filter{
+		stream.FilterFunc(func(arg stream.Arg) error {
+			scanner := bufio.NewScanner(&b)
+			for scanner.Scan() {
+				if s := scanner.Text(); strings.TrimSpace(s) != "" {
+					arg.Out <- s
+				}
+			}
+			return scanner.Err()
+		})}, filters...)
+
+	if err := stream.ForEach(stream.Sequence(filters...), func(s string) {
+		t.Errorf("\n%s", s)
+	}); err != nil {
+		t.Error(err)
+	}
+}
+
+// TestLint runs a suite of linters on the codebase. This file is
+// organized into two sections. First are the global linters, which
+// run on the entire repo every time. Second are the package-scoped
+// linters, which can be restricted to a specific package with the PKG
+// makefile variable. Linters that require anything more than a `git
+// grep` should preferably be added to the latter group (and within
+// that group, adding to Megacheck is better than creating a new
+// test).
+//
+// Linters may be skipped for two reasons: The "short" flag (i.e.
+// `make lintshort`), which skips the most expensive linters (more for
+// memory than for CPU usage), and the PKG variable. Some linters in
+// the global group may be skipped if the PKG flag is set regardless
+// of the short flag since they cannot be restricted to the package.
+// It should be reasonable to run `make lintshort` and `make lint
+// PKG=some/modified/pkg` locally and rely on CI for the more
+// expensive linters.
+//
+// Linters which run in a single process without internal
+// parallelization, and which have reasonable memory consumption
+// should be marked with t.Parallel(). As a rule of thumb anything
+// that requires type-checking the go code needs too much memory to
+// parallelize here (although it's fine for such tests to run multiple
+// goroutines internally using a shared loader object).
+//
+// Performance notes: This needs a lot of memory and CPU time. As of
+// 2018-07-13, the largest consumers of memory are
+// TestMegacheck/staticcheck (9GB) and TestUnused (6GB). Memory
+// consumption of staticcheck could be reduced by running it on a
+// subset of the packages at a time, although this comes at the
+// expense of increased running time.
 func TestLint(t *testing.T) {
 	crdb, err := build.Import(cockroachDB, "", build.FindOnly)
 	if err != nil {
@@ -70,9 +119,34 @@ func TestLint(t *testing.T) {
 	}
 	pkgDir := filepath.Join(crdb.Dir, "pkg")
 
-	t.Run("TestCopyrightHeaders", func(t *testing.T) {
+	pkgVar, pkgSpecified := os.LookupEnv("PKG")
+
+	t.Run("TestLowercaseFunctionNames", func(t *testing.T) {
 		t.Parallel()
-		cmd, stderr, filter, err := dirCmd(pkgDir, "git", "grep", "-LE", `^// (Copyright|Code generated by)`, "--", "*.go")
+		reSkipCasedFunction, err := regexp.Compile(`^(Binary file.*|[^:]+:\d+:(` +
+			`query error .*` + // OK when in logic tests
+			`|` +
+			`\s*(//|#).*` + // OK when mentioned in comment
+			`|` +
+			`.*lint: uppercase function OK` + // linter annotation at end of line
+			`))$`)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var names []string
+		for _, name := range builtins.AllBuiltinNames {
+			switch name {
+			case "extract", "trim", "overlay", "position", "substring":
+				// Exempt special forms: EXTRACT(... FROM ...), etc.
+			default:
+				names = append(names, strings.ToUpper(name))
+			}
+		}
+
+		cmd, stderr, filter, err := dirCmd(crdb.Dir,
+			"git", "grep", "-nE", fmt.Sprintf(`[^_a-zA-Z](%s)\(`, strings.Join(names, "|")),
+			"--", "pkg")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -82,9 +156,98 @@ func TestLint(t *testing.T) {
 		}
 
 		if err := stream.ForEach(filter, func(s string) {
-			t.Errorf(`%s <- missing license header`, s)
+			if reSkipCasedFunction.MatchString(s) {
+				// OK when mentioned in comment or lint disabled.
+				return
+			}
+			if strings.Contains(s, "FAMILY"+"(") {
+				t.Errorf("\n%s <- forbidden; use \"FAMILY (\" (with space) or "+
+					"lowercase \"family(\" for the built-in function", s)
+			} else {
+				t.Errorf("\n%s <- forbidden; use lowercase for SQL built-in functions", s)
+			}
 		}); err != nil {
 			t.Error(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
+		}
+	})
+
+	t.Run("TestCopyrightHeaders", func(t *testing.T) {
+		t.Parallel()
+
+		bslHeader := regexp.MustCompile(`// Copyright 20\d\d The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+`)
+
+		cclHeader := regexp.MustCompile(`// Copyright 20\d\d The Cockroach Authors.
+//
+// Licensed as a CockroachDB Enterprise file under the Cockroach Community
+// License \(the "License"\); you may not use this file except in compliance with
+// the License. You may obtain a copy of the License at
+//
+//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+`)
+
+		// These extensions identify source files that should have copyright headers.
+		extensions := []string{
+			"*.go", "*.cc", "*.h", "*.js", "*.ts", "*.tsx", "*.s", "*.S", "*.styl", "*.proto", "*.rl",
+		}
+
+		cmd, stderr, filter, err := dirCmd(pkgDir, "git", append([]string{"ls-files"}, extensions...)...)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stream.ForEach(stream.Sequence(filter,
+			stream.GrepNot(`\.pb\.go`),
+			stream.GrepNot(`\.pb\.gw\.go`),
+			stream.GrepNot(`\.og\.go`),
+			stream.GrepNot(`_string\.go`),
+			stream.GrepNot(`_generated\.go`),
+			stream.GrepNot(`/embedded.go`),
+		), func(filename string) {
+			isCCL := strings.Contains(filename, "ccl/")
+			var expHeader *regexp.Regexp
+			if isCCL {
+				expHeader = cclHeader
+			} else {
+				expHeader = bslHeader
+			}
+
+			file, err := os.Open(filepath.Join(pkgDir, filename))
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			defer file.Close()
+			data := make([]byte, 1024)
+			n, err := file.Read(data)
+			if err != nil {
+				t.Errorf("reading start of %s: %s", filename, err)
+			}
+			data = data[0:n]
+
+			if expHeader.Find(data) == nil {
+				t.Errorf("did not find expected license header (ccl=%v) in %s", isCCL, filename)
+			}
+		}); err != nil {
+			t.Fatal(err)
 		}
 
 		if err := cmd.Wait(); err != nil {
@@ -106,7 +269,7 @@ func TestLint(t *testing.T) {
 		}
 
 		if err := stream.ForEach(filter, func(s string) {
-			t.Error(s)
+			t.Errorf("\n%s", s)
 		}); err != nil {
 			t.Error(err)
 		}
@@ -142,6 +305,31 @@ func TestLint(t *testing.T) {
 		}
 	})
 
+	// TestTabsInOptgen verifies tabs aren't used in optgen (.opt) files.
+	t.Run("TestTabsInOptgen", func(t *testing.T) {
+		t.Parallel()
+		cmd, stderr, filter, err := dirCmd(pkgDir, "git", "grep", "-nE", "^ *\t", "--", "*.opt")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stream.ForEach(filter, func(s string) {
+			t.Errorf(`%s <- tab detected, use spaces instead`, s)
+		}); err != nil {
+			t.Error(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
+		}
+	})
+
 	t.Run("TestEnvutil", func(t *testing.T) {
 		t.Parallel()
 		for _, tc := range []struct {
@@ -155,14 +343,13 @@ func TestLint(t *testing.T) {
 					":!acceptance",
 					":!ccl/acceptanceccl/backup_test.go",
 					":!ccl/backupccl/backup_cloud_test.go",
-					":!ccl/storageccl/export_storage_test.go",
+					":!storage/cloud/external_storage_test.go",
 					":!ccl/workloadccl/fixture_test.go",
 					":!cmd",
 					":!nightly",
 					":!testutils/lint",
 					":!util/envutil/env.go",
-					":!util/log/clog.go",
-					":!util/color/color.go",
+					":!util/log/tracebacks.go",
 					":!util/sdnotify/sdnotify_unix.go",
 				},
 			},
@@ -187,7 +374,7 @@ func TestLint(t *testing.T) {
 			}
 
 			if err := stream.ForEach(filter, func(s string) {
-				t.Errorf(`%s <- forbidden; use "envutil" instead`, s)
+				t.Errorf("\n%s <- forbidden; use 'envutil' instead", s)
 			}); err != nil {
 				t.Error(err)
 			}
@@ -210,7 +397,9 @@ func TestLint(t *testing.T) {
 			`\bsync\.(RW)?Mutex`,
 			"--",
 			"*.go",
+			":!*/doc.go",
 			":!util/syncutil/mutex_sync.go",
+			":!util/syncutil/mutex_sync_race.go",
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -221,7 +410,136 @@ func TestLint(t *testing.T) {
 		}
 
 		if err := stream.ForEach(filter, func(s string) {
-			t.Errorf(`%s <- forbidden; use "syncutil.{,RW}Mutex" instead`, s)
+			t.Errorf("\n%s <- forbidden; use 'syncutil.{,RW}Mutex' instead", s)
+		}); err != nil {
+			t.Error(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
+		}
+	})
+
+	t.Run("TestSQLTelemetryDirectCount", func(t *testing.T) {
+		t.Parallel()
+		cmd, stderr, filter, err := dirCmd(
+			pkgDir,
+			"git",
+			"grep",
+			"-nE",
+			`[^[:alnum:]]telemetry\.Count\(`,
+			"--",
+			"sql",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stream.ForEach(filter, func(s string) {
+			t.Errorf("\n%s <- forbidden; use 'sqltelemetry.xxxCounter()' / `telemetry.Inc' instead", s)
+		}); err != nil {
+			t.Error(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
+		}
+	})
+
+	t.Run("TestSQLTelemetryGetCounter", func(t *testing.T) {
+		t.Parallel()
+		cmd, stderr, filter, err := dirCmd(
+			pkgDir,
+			"git",
+			"grep",
+			"-nE",
+			`[^[:alnum:]]telemetry\.GetCounter`,
+			"--",
+			"sql",
+			":!sql/sqltelemetry",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stream.ForEach(filter, func(s string) {
+			t.Errorf("\n%s <- forbidden; use 'sqltelemetry.xxxCounter() instead", s)
+		}); err != nil {
+			t.Error(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
+		}
+	})
+
+	t.Run("TestCBOPanics", func(t *testing.T) {
+		t.Parallel()
+		cmd, stderr, filter, err := dirCmd(
+			pkgDir,
+			"git",
+			"grep",
+			"-nE",
+			fmt.Sprintf(`[^[:alnum:]]panic\((%s|"|[a-z]+Error\{errors\.(New|Errorf)|fmt\.Errorf)`, "`"),
+			"--",
+			"sql/opt",
+			":!sql/opt/optgen",
+			":!sql/opt/testutils",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stream.ForEach(filter, func(s string) {
+			t.Errorf("\n%s <- forbidden; use panic(errors.AssertionFailedf()) instead", s)
+		}); err != nil {
+			t.Error(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
+		}
+	})
+
+	t.Run("TestInternalErrorCodes", func(t *testing.T) {
+		t.Parallel()
+		cmd, stderr, filter, err := dirCmd(
+			pkgDir,
+			"git",
+			"grep",
+			"-nE",
+			`[^[:alnum:]]pgerror\.(NewError|Wrap).*pgerror\.CodeInternalError`,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stream.ForEach(filter, func(s string) {
+			t.Errorf("\n%s <- forbidden; use errors.AssertionFailedf() instead", s)
 		}); err != nil {
 			t.Error(err)
 		}
@@ -308,7 +626,46 @@ func TestLint(t *testing.T) {
 		}
 
 		if err := stream.ForEach(filter, func(s string) {
-			t.Errorf(`%s <- forbidden; use "timeutil" instead`, s)
+			t.Errorf("\n%s <- forbidden; use 'timeutil' instead", s)
+		}); err != nil {
+			t.Error(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
+		}
+	})
+
+	t.Run("TestContext", func(t *testing.T) {
+		t.Parallel()
+		cmd, stderr, filter, err := dirCmd(
+			pkgDir,
+			"git",
+			"grep",
+			"-nE",
+			`\bcontext\.With(Deadline|Timeout)\(`,
+			"--",
+			"*.go",
+			":!util/contextutil/context.go",
+			// TODO(jordan): ban these too?
+			":!server/debug/**",
+			":!workload/**",
+			":!*_test.go",
+			":!cli/debug_synctest.go",
+			":!cmd/**",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stream.ForEach(filter, func(s string) {
+			t.Errorf("\n%s <- forbidden; use 'contextutil.RunWithTimeout' instead", s)
 		}); err != nil {
 			t.Error(err)
 		}
@@ -332,7 +689,9 @@ func TestLint(t *testing.T) {
 			"*.go",
 			":!rpc/context_test.go",
 			":!rpc/context.go",
+			":!rpc/nodedialer/nodedialer_test.go",
 			":!util/grpcutil/grpc_util_test.go",
+			":!cli/systembench/network_test_server.go",
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -343,32 +702,7 @@ func TestLint(t *testing.T) {
 		}
 
 		if err := stream.ForEach(filter, func(s string) {
-			t.Errorf(`%s <- forbidden; use "rpc.NewServer" instead`, s)
-		}); err != nil {
-			t.Error(err)
-		}
-
-		if err := cmd.Wait(); err != nil {
-			if out := stderr.String(); len(out) > 0 {
-				t.Fatalf("err=%s, stderr=%s", err, out)
-			}
-		}
-	})
-
-	t.Run("TestPGErrors", func(t *testing.T) {
-		t.Parallel()
-		// TODO(justin): we should expand the packages this applies to as possible.
-		cmd, stderr, filter, err := dirCmd(pkgDir, "git", "grep", "-nE", `((fmt|errors).Errorf|errors.New)`, "--", "sql/parser/*.go", "util/ipaddr/*.go")
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if err := cmd.Start(); err != nil {
-			t.Fatal(err)
-		}
-
-		if err := stream.ForEach(filter, func(s string) {
-			t.Errorf(`%s <- forbidden; use "pgerror.NewErrorf" instead`, s)
+			t.Errorf("\n%s <- forbidden; use 'rpc.NewServer' instead", s)
 		}); err != nil {
 			t.Error(err)
 		}
@@ -405,7 +739,43 @@ func TestLint(t *testing.T) {
 			filter,
 			stream.GrepNot(`protoutil\.Clone\(`),
 		), func(s string) {
-			t.Errorf(`%s <- forbidden; use "protoutil.Clone" instead`, s)
+			t.Errorf("\n%s <- forbidden; use 'protoutil.Clone' instead", s)
+		}); err != nil {
+			t.Error(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
+		}
+	})
+
+	t.Run("TestTParallel", func(t *testing.T) {
+		t.Parallel()
+		cmd, stderr, filter, err := dirCmd(
+			pkgDir,
+			"git",
+			"grep",
+			"-nE",
+			`\.Parallel\(\)`,
+			"--",
+			"*.go",
+			":!testutils/lint/*.go",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stream.ForEach(stream.Sequence(
+			filter,
+			stream.GrepNot(`// SAFE FOR TESTING`),
+		), func(s string) {
+			t.Errorf("\n%s <- forbidden, use a sync.WaitGroup instead (cf https://github.com/golang/go/issues/31651)", s)
 		}); err != nil {
 			t.Error(err)
 		}
@@ -441,9 +811,9 @@ func TestLint(t *testing.T) {
 
 		if err := stream.ForEach(stream.Sequence(
 			filter,
-			stream.GrepNot(`(json|yaml|protoutil|\.Field)\.Marshal\(`),
+			stream.GrepNot(`(json|yaml|protoutil|xml|\.Field)\.Marshal\(`),
 		), func(s string) {
-			t.Errorf(`%s <- forbidden; use "protoutil.Marshal" instead`, s)
+			t.Errorf("\n%s <- forbidden; use 'protoutil.Marshal' instead", s)
 		}); err != nil {
 			t.Error(err)
 		}
@@ -479,9 +849,9 @@ func TestLint(t *testing.T) {
 
 		if err := stream.ForEach(stream.Sequence(
 			filter,
-			stream.GrepNot(`(json|jsonpb|yaml|protoutil)\.Unmarshal\(`),
+			stream.GrepNot(`(json|jsonpb|yaml|xml|protoutil|toml|Codec)\.Unmarshal\(`),
 		), func(s string) {
-			t.Errorf(`%s <- forbidden; use "protoutil.Unmarshal" instead`, s)
+			t.Errorf("\n%s <- forbidden; use 'protoutil.Unmarshal' instead", s)
 		}); err != nil {
 			t.Error(err)
 		}
@@ -521,7 +891,7 @@ func TestLint(t *testing.T) {
 		if err := stream.ForEach(stream.Sequence(
 			filter,
 		), func(s string) {
-			t.Errorf(`%s <- forbidden; use "protoutil.Message" instead`, s)
+			t.Errorf("\n%s <- forbidden; use 'protoutil.Message' instead", s)
 		}); err != nil {
 			t.Error(err)
 		}
@@ -545,7 +915,7 @@ func TestLint(t *testing.T) {
 		}
 
 		if err := stream.ForEach(filter, func(s string) {
-			t.Errorf(`%s <- forbidden; use "yaml.UnmarshalStrict" instead`, s)
+			t.Errorf("\n%s <- forbidden; use 'yaml.UnmarshalStrict' instead", s)
 		}); err != nil {
 			t.Error(err)
 		}
@@ -572,7 +942,7 @@ func TestLint(t *testing.T) {
 			filter,
 			stream.GrepNot(`gosql "database/sql"`),
 		), func(s string) {
-			t.Errorf(`%s <- forbidden; import "database/sql" as "gosql" to avoid confusion with "cockroach/sql"`, s)
+			t.Errorf("\n%s <- forbidden; import 'database/sql' as 'gosql' to avoid confusion with 'cockroach/sql'", s)
 		}); err != nil {
 			t.Error(err)
 		}
@@ -586,6 +956,9 @@ func TestLint(t *testing.T) {
 
 	t.Run("TestMisspell", func(t *testing.T) {
 		t.Parallel()
+		if pkgSpecified {
+			t.Skip("PKG specified")
+		}
 		cmd, stderr, filter, err := dirCmd(pkgDir, "git", "ls-files")
 		if err != nil {
 			t.Fatal(err)
@@ -604,12 +977,13 @@ func TestLint(t *testing.T) {
 			filter,
 			stream.GrepNot(`.*\.lock`),
 			stream.GrepNot(`^storage\/engine\/rocksdb_error_dict\.go$`),
+			stream.GrepNot(`^workload/tpcds/tpcds.go$`),
 			stream.Map(func(s string) string {
 				return filepath.Join(pkgDir, s)
 			}),
 			stream.Xargs("misspell", "-locale", "US", "-i", strings.Join(ignoredRules, ",")),
 		), func(s string) {
-			t.Errorf(s)
+			t.Errorf("\n%s", s)
 		}); err != nil {
 			t.Error(err)
 		}
@@ -623,8 +997,11 @@ func TestLint(t *testing.T) {
 
 	t.Run("TestGofmtSimplify", func(t *testing.T) {
 		t.Parallel()
+		if pkgSpecified {
+			t.Skip("PKG specified")
+		}
 
-		cmd, stderr, filter, err := dirCmd(pkgDir, "git", "ls-files", "*.go", ":!*/testdata/*")
+		cmd, stderr, filter, err := dirCmd(pkgDir, "git", "ls-files", "*.go", ":!*/testdata/*", ":!*_generated.go")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -633,6 +1010,7 @@ func TestLint(t *testing.T) {
 			t.Fatal(err)
 		}
 
+		var buf bytes.Buffer
 		if err := stream.ForEach(
 			stream.Sequence(
 				filter,
@@ -641,9 +1019,13 @@ func TestLint(t *testing.T) {
 				}),
 				stream.Xargs("gofmt", "-s", "-d", "-l"),
 			), func(s string) {
-				t.Error(s)
+				fmt.Fprintln(&buf, s)
 			}); err != nil {
 			t.Error(err)
+		}
+		errs := buf.String()
+		if len(errs) > 0 {
+			t.Errorf("\n%s", errs)
 		}
 
 		if err := cmd.Wait(); err != nil {
@@ -655,8 +1037,11 @@ func TestLint(t *testing.T) {
 
 	t.Run("TestCrlfmt", func(t *testing.T) {
 		t.Parallel()
-		ignore := `\.(pb(\.gw)?)|(\.og)\.go|/testdata/`
-		cmd, stderr, filter, err := dirCmd(pkgDir, "crlfmt", "-ignore", ignore, "-tab", "2", ".")
+		if pkgSpecified {
+			t.Skip("PKG specified")
+		}
+		ignore := `\.(pb(\.gw)?)|(\.[eo]g)\.go|/testdata/|^sql/parser/sql\.go$|_generated\.go$`
+		cmd, stderr, filter, err := dirCmd(pkgDir, "crlfmt", "-fast", "-ignore", ignore, "-tab", "2", ".")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -665,10 +1050,15 @@ func TestLint(t *testing.T) {
 			t.Fatal(err)
 		}
 
+		var buf bytes.Buffer
 		if err := stream.ForEach(filter, func(s string) {
-			t.Error(s)
+			fmt.Fprintln(&buf, s)
 		}); err != nil {
 			t.Error(err)
+		}
+		errs := buf.String()
+		if len(errs) > 0 {
+			t.Errorf("\n%s", errs)
 		}
 
 		if err := cmd.Wait(); err != nil {
@@ -684,9 +1074,9 @@ func TestLint(t *testing.T) {
 				args[i] = strconv.Quote(args[i])
 			}
 			t.Logf("run the following to fix your formatting:\n"+
-				"\n%s %s\n\n"+
+				"\nbin/crlfmt %s\n\n"+
 				"Don't forget to add amend the result to the correct commits.",
-				cmd.Args[0], strings.Join(args, " "),
+				strings.Join(args, " "),
 			)
 		}
 	})
@@ -703,7 +1093,7 @@ func TestLint(t *testing.T) {
 		}
 
 		if err := stream.ForEach(filter, func(s string) {
-			t.Errorf(`%s <- please remove the Author comment within`, s)
+			t.Errorf("\n%s <- please remove the Author comment within", s)
 		}); err != nil {
 			t.Error(err)
 		}
@@ -712,205 +1102,12 @@ func TestLint(t *testing.T) {
 			if out := stderr.String(); len(out) > 0 {
 				t.Fatalf("err=%s, stderr=%s", err, out)
 			}
-		}
-	})
-
-	t.Run("TestMegacheck", func(t *testing.T) {
-		if testing.Short() {
-			t.Skip("short flag")
-		}
-		t.Parallel()
-
-		ctx := gotool.DefaultContext
-		releaseTags := ctx.BuildContext.ReleaseTags
-		lastTag := releaseTags[len(releaseTags)-1]
-		dotIdx := strings.IndexByte(lastTag, '.')
-		goVersion, err := strconv.Atoi(lastTag[dotIdx+1:])
-		if err != nil {
-			t.Fatal(err)
-		}
-		// NB: this doesn't use `pkgScope` because `honnef.co/go/unused`
-		// produces many false positives unless it inspects all our packages.
-		paths := ctx.ImportPaths([]string{cockroachDB + "/pkg/..."})
-		conf := loader.Config{
-			Build:      &ctx.BuildContext,
-			ParserMode: parser.ParseComments,
-			ImportPkgs: make(map[string]bool, len(paths)),
-		}
-		for _, path := range paths {
-			conf.ImportPkgs[path] = true
-		}
-		lprog, err := conf.Load()
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		unusedChecker := unused.NewChecker(unused.CheckAll)
-		unusedChecker.WholeProgram = true
-
-		for checker, ignores := range map[lint.Checker][]lint.Ignore{
-			&miscChecker{}:  nil,
-			&timerChecker{}: nil,
-			simple.NewChecker(): {
-				&lint.GlobIgnore{Pattern: "github.com/cockroachdb/cockroach/pkg/security/securitytest/embedded.go", Checks: []string{"S1013"}},
-				&lint.GlobIgnore{Pattern: "github.com/cockroachdb/cockroach/pkg/ui/embedded.go", Checks: []string{"S1013"}},
-			},
-			staticcheck.NewChecker(): {
-				// The generated parser is full of `case` arms such as:
-				//
-				// case 1:
-				// 	sqlDollar = sqlS[sqlpt-1 : sqlpt+1]
-				// 	//line sql.y:781
-				// 	{
-				// 		sqllex.(*Scanner).stmts = sqlDollar[1].union.stmts()
-				// 	}
-				//
-				// where the code in braces is generated from the grammar action; if
-				// the action does not make use of the matched expression, sqlDollar
-				// will be assigned but not used. This is expected and intentional.
-				//
-				// Concretely, the grammar:
-				//
-				// stmt:
-				//   alter_table_stmt
-				// | backup_stmt
-				// | copy_from_stmt
-				// | create_stmt
-				// | delete_stmt
-				// | drop_stmt
-				// | explain_stmt
-				// | help_stmt
-				// | prepare_stmt
-				// | execute_stmt
-				// | deallocate_stmt
-				// | grant_stmt
-				// | insert_stmt
-				// | rename_stmt
-				// | revoke_stmt
-				// | savepoint_stmt
-				// | select_stmt
-				//   {
-				//     $$.val = $1.slct()
-				//   }
-				// | set_stmt
-				// | show_stmt
-				// | split_stmt
-				// | transaction_stmt
-				// | release_stmt
-				// | truncate_stmt
-				// | update_stmt
-				// | /* EMPTY */
-				//   {
-				//     $$.val = Statement(nil)
-				//   }
-				//
-				// is compiled into the `case` arm:
-				//
-				// case 28:
-				// 	sqlDollar = sqlS[sqlpt-0 : sqlpt+1]
-				// 	//line sql.y:830
-				// 	{
-				// 		sqlVAL.union.val = Statement(nil)
-				// 	}
-				//
-				// which results in the unused warning:
-				//
-				// sql/parser/yaccpar:362:3: this value of sqlDollar is never used (SA4006)
-				&lint.GlobIgnore{Pattern: "github.com/cockroachdb/cockroach/pkg/sql/parser/sql.go", Checks: []string{"SA4006"}},
-				// Files generated by github.com/grpc-ecosystem/grpc-gateway use a
-				// deprecated logging method (SA1019). Ignore such errors until they
-				// fix it and we update to using a newer SHA.
-				&lint.GlobIgnore{Pattern: "github.com/cockroachdb/cockroach/pkg/*/*/*.pb.gw.go", Checks: []string{"SA1019"}},
-			},
-			unused.NewLintChecker(unusedChecker): {
-				// sql/parser/yaccpar:14:6: type sqlParser is unused (U1000)
-				// sql/parser/yaccpar:15:2: func sqlParser.Parse is unused (U1000)
-				// sql/parser/yaccpar:16:2: func sqlParser.Lookahead is unused (U1000)
-				// sql/parser/yaccpar:29:6: func sqlNewParser is unused (U1000)
-				// sql/parser/yaccpar:152:6: func sqlParse is unused (U1000)
-				&lint.GlobIgnore{Pattern: "github.com/cockroachdb/cockroach/pkg/sql/parser/sql.go", Checks: []string{"U1000"}},
-				// Generated file containing many unused postgres error codes.
-				&lint.GlobIgnore{Pattern: "github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror/codes.go", Checks: []string{"U1000"}},
-			},
-		} {
-			t.Run(checker.Name(), func(t *testing.T) {
-				linter := lint.Linter{
-					Checker:   checker,
-					Ignores:   ignores,
-					GoVersion: goVersion,
-				}
-				for _, p := range linter.Lint(lprog, &conf) {
-					t.Errorf("%s: %s", p.Position, &p)
-				}
-			})
-		}
-	})
-
-	// TestLogicTestsLint verifies that all the logic test files start with
-	// a LogicTest directive.
-	t.Run("TestLogicTestsLint", func(t *testing.T) {
-		t.Parallel()
-		cmd, stderr, filter, err := dirCmd(
-			pkgDir, "git", "ls-files",
-			"sql/logictest/testdata/logic_test/",
-			"sql/logictest/testdata/planner_test/",
-			"sql/opt/exec/execbuilder/testdata/",
-		)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if err := cmd.Start(); err != nil {
-			t.Fatal(err)
-		}
-
-		if err := stream.ForEach(filter, func(filename string) {
-			file, err := os.Open(filepath.Join(pkgDir, filename))
-			if err != nil {
-				t.Error(err)
-				return
-			}
-			firstLine, err := bufio.NewReader(file).ReadString('\n')
-			if err != nil {
-				t.Errorf("reading first line of %s: %s", filename, err)
-				return
-			}
-			if !strings.HasPrefix(firstLine, "# LogicTest:") {
-				t.Errorf("%s must start with a directive, e.g. `# LogicTest: default`", filename)
-			}
-		}); err != nil {
-			t.Error(err)
-		}
-
-		if err := cmd.Wait(); err != nil {
-			if out := stderr.String(); len(out) > 0 {
-				t.Fatalf("err=%s, stderr=%s", err, out)
-			}
-		}
-	})
-
-	// TestHelpURLs checks that all help texts have a valid documentation URL.
-	t.Run("TestHelpURLs", func(t *testing.T) {
-		if testing.Short() {
-			t.Skip("short flag")
-		}
-
-		t.Parallel()
-		var buf bytes.Buffer
-		for key, body := range sqlparser.HelpMessages {
-			msg := sqlparser.HelpMessage{Command: key, HelpMessageBody: body}
-			buf.WriteString(msg.String())
-		}
-		cmd := exec.Command("grep", "-nE", urlcheck.URLRE)
-		cmd.Stdin = &buf
-		if err := urlcheck.CheckURLsFromGrepOutput(cmd); err != nil {
-			t.Fatal(err)
 		}
 	})
 
 	// Things that are packaged scoped are below here.
-	pkgScope, ok := os.LookupEnv("PKG")
-	if !ok {
+	pkgScope := pkgVar
+	if !pkgSpecified {
 		pkgScope = "./pkg/..."
 	}
 
@@ -919,13 +1116,26 @@ func TestLint(t *testing.T) {
 
 		// forbiddenImportPkg -> permittedReplacementPkg
 		forbiddenImports := map[string]string{
-			"golang.org/x/net/context": "context",
-			"log":  "util/log",
-			"path": "path/filepath",
-			"github.com/golang/protobuf/proto": "github.com/gogo/protobuf/proto",
-			"github.com/satori/go.uuid":        "util/uuid",
-			"golang.org/x/sync/singleflight":   "github.com/cockroachdb/cockroach/pkg/util/syncutil/singleflight",
-			"syscall":                          "sysutil",
+			"golang.org/x/net/context":                    "context",
+			"log":                                         "util/log",
+			"path":                                        "path/filepath",
+			"github.com/golang/protobuf/proto":            "github.com/gogo/protobuf/proto",
+			"github.com/satori/go.uuid":                   "util/uuid",
+			"golang.org/x/sync/singleflight":              "github.com/cockroachdb/cockroach/pkg/util/syncutil/singleflight",
+			"syscall":                                     "sysutil",
+			"github.com/cockroachdb/errors/assert":        "github.com/cockroachdb/errors",
+			"github.com/cockroachdb/errors/barriers":      "github.com/cockroachdb/errors",
+			"github.com/cockroachdb/errors/contexttags":   "github.com/cockroachdb/errors",
+			"github.com/cockroachdb/errors/domains":       "github.com/cockroachdb/errors",
+			"github.com/cockroachdb/errors/errbase":       "github.com/cockroachdb/errors",
+			"github.com/cockroachdb/errors/errutil":       "github.com/cockroachdb/errors",
+			"github.com/cockroachdb/errors/issuelink":     "github.com/cockroachdb/errors",
+			"github.com/cockroachdb/errors/markers":       "github.com/cockroachdb/errors",
+			"github.com/cockroachdb/errors/report":        "github.com/cockroachdb/errors",
+			"github.com/cockroachdb/errors/safedetails":   "github.com/cockroachdb/errors",
+			"github.com/cockroachdb/errors/secondary":     "github.com/cockroachdb/errors",
+			"github.com/cockroachdb/errors/telemetrykeys": "github.com/cockroachdb/errors",
+			"github.com/cockroachdb/errors/withstack":     "github.com/cockroachdb/errors",
 		}
 
 		// grepBuf creates a grep string that matches any forbidden import pkgs.
@@ -990,7 +1200,7 @@ func TestLint(t *testing.T) {
 
 			// Test that a disallowed package is not imported.
 			if replPkg, ok := forbiddenImports[importedPkg]; ok {
-				t.Errorf(`%s <- please use %q instead of %q`, s, replPkg, importedPkg)
+				t.Errorf("\n%s <- please use %q instead of %q", s, replPkg, importedPkg)
 			}
 
 			// Test that the settings package does not import CRDB dependencies.
@@ -1012,69 +1222,74 @@ func TestLint(t *testing.T) {
 
 	t.Run("TestVet", func(t *testing.T) {
 		t.Parallel()
-		// `go vet` is a special snowflake that emits all its output on
-		// `stderr.
-		cmd := exec.Command("go", "vet", "-all", "-shadow", "-printfuncs",
-			strings.Join([]string{
-				"Info:1",
-				"Infof:1",
-				"InfofDepth:2",
-				"Warning:1",
-				"Warningf:1",
-				"WarningfDepth:2",
-				"Error:1",
-				"Errorf:1",
-				"ErrorfDepth:2",
-				"Fatal:1",
-				"Fatalf:1",
-				"FatalfDepth:2",
-				"Event:1",
-				"Eventf:1",
-				"ErrEvent:1",
-				"ErrEventf:1",
-				"NewError:1",
-				"NewErrorf:1",
-				"VEvent:2",
-				"VEventf:2",
-				"UnimplementedWithIssueErrorf:1",
-				"Wrapf:1",
-			}, ","),
-			pkgScope,
-		)
-		cmd.Dir = crdb.Dir
-		var b bytes.Buffer
-		cmd.Stdout = &b
-		cmd.Stderr = &b
-		switch err := cmd.Run(); err.(type) {
-		case nil:
-		case *exec.ExitError:
-			// Non-zero exit is expected.
-		default:
-			t.Fatal(err)
+		runVet := func(t *testing.T, args ...string) {
+			args = append(append([]string{"vet"}, args...), pkgScope)
+			vetCmd(t, crdb.Dir, "go", args, []stream.Filter{
+				stream.GrepNot(`declaration of "?(pE|e)rr"? shadows`),
+				stream.GrepNot(`\.pb\.gw\.go:[0-9:]+: declaration of "?ctx"? shadows`),
+				stream.GrepNot(`\.[eo]g\.go:[0-9:]+: declaration of ".*" shadows`),
+				// This exception is for hash.go, which re-implements runtime.noescape
+				// for efficient hashing.
+				stream.GrepNot(`pkg/sql/colexec/hash.go:[0-9:]+: possible misuse of unsafe.Pointer`),
+				stream.GrepNot(`^#`), // comment line
+			})
 		}
+		printfuncs := strings.Join([]string{
+			"ErrEvent",
+			"ErrEventf",
+			"Error",
+			"Errorf",
+			"ErrorfDepth",
+			"Event",
+			"Eventf",
+			"Fatal",
+			"Fatalf",
+			"FatalfDepth",
+			"Info",
+			"Infof",
+			"InfofDepth",
+			"AssertionFailedf",
+			"AssertionFailedWithDepthf",
+			"NewAssertionErrorWithWrappedErrf",
+			"DangerousStatementf",
+			"pgerror.New",
+			"pgerror.NewWithDepthf",
+			"pgerror.Newf",
+			"SetDetailf",
+			"SetHintf",
+			"Unimplemented",
+			"Unimplementedf",
+			"UnimplementedWithDepthf",
+			"UnimplementedWithIssueDetailf",
+			"UnimplementedWithIssuef",
+			"VEvent",
+			"VEventf",
+			"Warning",
+			"Warningf",
+			"WarningfDepth",
+			"Wrapf",
+			"WrapWithDepthf",
+		}, ",")
 
-		if err := stream.ForEach(stream.Sequence(
-			stream.FilterFunc(func(arg stream.Arg) error {
-				scanner := bufio.NewScanner(&b)
-				for scanner.Scan() {
-					if s := scanner.Text(); strings.TrimSpace(s) != "" {
-						arg.Out <- s
-					}
-				}
-				return scanner.Err()
-			}),
-			stream.GrepNot(`declaration of "?(pE|e)rr"? shadows`),
-			stream.GrepNot(`\.pb\.gw\.go:[0-9]+: declaration of "?ctx"? shadows`),
-			stream.GrepNot(`\.og\.go:[0-9]+: declaration of ".*" shadows`),
-			stream.GrepNot(`^#`), // comment line
-			// Upstream compiler error. See: https://github.com/golang/go/issues/23701
-			stream.GrepNot(`pkg/sql/pgwire/pgwire_test\.go.*internal compiler error`),
-			stream.GrepNot(`^Please file a bug report|^https://golang.org/issue/new`),
-		), func(s string) {
-			t.Error(s)
-		}); err != nil {
-			t.Error(err)
-		}
+		// Unfortunately if an analyzer is passed via -vettool like shadow, it seems
+		// we cannot also run the core analyzers (or at least cannot pass them flags
+		// like -printfuncs).
+		t.Run("shadow", func(t *testing.T) { runVet(t, "-vettool=bin/shadow") })
+		// The -printfuncs functionality is interesting and
+		// under-documented. It checks two things:
+		//
+		// - that functions that accept formatting specifiers are given
+		//   arguments of the proper type.
+		// - that functions that don't accept formatting specifiers
+		//   are not given any.
+		//
+		// Whether a function takes a format string or not is determined
+		// as follows: (comment taken from the source of `go vet`)
+		//
+		//    A function may be a Printf or Print wrapper if its last argument is ...interface{}.
+		//    If the next-to-last argument is a string, then this may be a Printf wrapper.
+		//    Otherwise it may be a Print wrapper.
+		runVet(t, "-all", "-printfuncs", printfuncs)
 	})
 
 	// TODO(tamird): replace this with errcheck.NewChecker() when
@@ -1087,7 +1302,7 @@ func TestLint(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		// errcheck uses 1GB of ram (as of 2017-02-18), so don't parallelize it.
+		// errcheck uses 2GB of ram (as of 2017-07-13), so don't parallelize it.
 		cmd, stderr, filter, err := dirCmd(
 			crdb.Dir,
 			"errcheck",
@@ -1104,7 +1319,7 @@ func TestLint(t *testing.T) {
 		}
 
 		if err := stream.ForEach(filter, func(s string) {
-			t.Errorf(`%s <- unchecked error`, s)
+			t.Errorf("%s <- unchecked error", s)
 		}); err != nil {
 			t.Error(err)
 		}
@@ -1120,7 +1335,7 @@ func TestLint(t *testing.T) {
 		if testing.Short() {
 			t.Skip("short flag")
 		}
-		// returncheck uses 1GB of ram (as of 2017-02-18), so don't parallelize it.
+		// returncheck uses 2GB of ram (as of 2017-07-13), so don't parallelize it.
 		cmd, stderr, filter, err := dirCmd(crdb.Dir, "returncheck", pkgScope)
 		if err != nil {
 			t.Fatal(err)
@@ -1131,7 +1346,7 @@ func TestLint(t *testing.T) {
 		}
 
 		if err := stream.ForEach(filter, func(s string) {
-			t.Errorf(`%s <- unchecked error`, s)
+			t.Errorf("%s <- unchecked error", s)
 		}); err != nil {
 			t.Error(err)
 		}
@@ -1157,11 +1372,10 @@ func TestLint(t *testing.T) {
 		if err := stream.ForEach(
 			stream.Sequence(
 				filter,
-				// _fsm.go files are allowed to dot-import the util/fsm package.
-				stream.GrepNot("_fsm.go.*should not use dot imports"),
 				stream.GrepNot("sql/.*exported func .* returns unexported type sql.planNode"),
+				stream.GrepNot("pkg/sql/types/types.go.* var Uuid should be UUID"),
 			), func(s string) {
-				t.Error(s)
+				t.Errorf("\n%s", s)
 			}); err != nil {
 			t.Error(err)
 		}
@@ -1172,381 +1386,108 @@ func TestLint(t *testing.T) {
 			}
 		}
 	})
-}
 
-type miscChecker struct{}
-
-func (*miscChecker) Name() string {
-	return "misccheck"
-}
-
-func (*miscChecker) Prefix() string {
-	return "CR"
-}
-
-func (*miscChecker) Init(*lint.Program) {}
-
-func (*miscChecker) Funcs() map[string]lint.Func {
-	return map[string]lint.Func{
-		"FloatToUnsigned": checkConvertFloatToUnsigned,
-		"Unconvert":       checkUnconvert,
-	}
-}
-
-func forAllFiles(j *lint.Job, fn func(node ast.Node) bool) {
-	for _, f := range j.Program.Files {
-		if !lint.IsGenerated(f) {
-			ast.Inspect(f, fn)
+	t.Run("TestStaticCheck", func(t *testing.T) {
+		// staticcheck uses 2.4GB of ram (as of 2019-05-10), so don't parallelize it.
+		if testing.Short() {
+			t.Skip("short flag")
 		}
-	}
-}
+		cmd, stderr, filter, err := dirCmd(
+			crdb.Dir,
+			"staticcheck",
+			"-unused.whole-program",
+			pkgScope,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
 
-// @ianlancetaylor via golang-nuts[0]:
-//
-// For the record, the spec says, in https://golang.org/ref/spec#Conversions:
-// "In all non-constant conversions involving floating-point or complex
-// values, if the result type cannot represent the value the conversion
-// succeeds but the result value is implementation-dependent."  That is the
-// case that applies here: you are converting a negative floating point number
-// to uint64, which can not represent a negative value, so the result is
-// implementation-dependent.  The conversion to int64 works, of course. And
-// the conversion to int64 and then to uint64 succeeds in converting to int64,
-// and when converting to uint64 follows a different rule: "When converting
-// between integer types, if the value is a signed integer, it is sign
-// extended to implicit infinite precision; otherwise it is zero extended. It
-// is then truncated to fit in the result type's size."
-//
-// So, basically, don't convert a negative floating point number to an
-// unsigned integer type.
-//
-// [0] https://groups.google.com/d/msg/golang-nuts/LH2AO1GAIZE/PyygYRwLAwAJ
-//
-// TODO(tamird): upstream this.
-func checkConvertFloatToUnsigned(j *lint.Job) {
-	forAllFiles(j, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
-			return true
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
 		}
-		castType, ok := j.Program.Info.TypeOf(call.Fun).(*types.Basic)
-		if !ok {
-			return true
+
+		if err := stream.ForEach(
+			stream.Sequence(
+				filter,
+				// Skip .pb.go and .pb.gw.go generated files.
+				stream.GrepNot(`pkg/.*\.pb(\.gw|)\.go:`),
+				// Skip generated file.
+				stream.GrepNot(`pkg/ui/distoss/bindata.go`),
+				stream.GrepNot(`pkg/ui/distccl/bindata.go`),
+				// sql.go is the generated parser, which sets sqlDollar in all cases,
+				// even if it might not be used again.
+				stream.GrepNot(`pkg/sql/parser/sql.go:.*this value of sqlDollar is never used`),
+				// Generated file containing many unused postgres error codes.
+				stream.GrepNot(`pkg/sql/pgwire/pgcode/codes.go:.* const .* is unused`),
+				// The methods in exprgen.customFuncs are used via reflection.
+				stream.GrepNot(`pkg/sql/opt/optgen/exprgen/custom_funcs.go:.* func .* is unused`),
+			), func(s string) {
+				t.Errorf("\n%s", s)
+			}); err != nil {
+			t.Error(err)
 		}
-		if castType.Info()&types.IsUnsigned == 0 {
-			return true
-		}
-		for _, arg := range call.Args {
-			argType, ok := j.Program.Info.TypeOf(arg).(*types.Basic)
-			if !ok {
-				continue
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
 			}
-			if argType.Info()&types.IsFloat == 0 {
-				continue
-			}
-			j.Errorf(arg, "do not convert a floating point number to an unsigned integer type")
 		}
-		return true
 	})
-}
 
-func walkForStmts(n ast.Node, fn func(ast.Stmt) bool) bool {
-	fr, ok := n.(*ast.ForStmt)
-	if !ok {
-		return true
-	}
-	return walkStmts(fr.Body.List, fn)
-}
+	t.Run("TestRoachLint", func(t *testing.T) {
+		t.Parallel()
 
-func walkSelectStmts(n ast.Node, fn func(ast.Stmt) bool) bool {
-	sel, ok := n.(*ast.SelectStmt)
-	if !ok {
-		return true
-	}
-	return walkStmts(sel.Body.List, fn)
-}
+		vetCmd(t, crdb.Dir, "roachlint", []string{pkgScope}, []stream.Filter{
+			// Ignore generated files.
+			stream.GrepNot(`pkg/.*\.pb\.go:`),
+			stream.GrepNot(`pkg/col/coldata/.*\.eg\.go:`),
+			stream.GrepNot(`pkg/col/colserde/arrowserde/.*_generated\.go:`),
+			stream.GrepNot(`pkg/sql/colexec/.*\.eg\.go:`),
+			stream.GrepNot(`pkg/sql/colexec/.*_generated\.go:`),
+			stream.GrepNot(`pkg/sql/pgwire/hba/conf.go:`),
 
-func walkStmts(stmts []ast.Stmt, fn func(ast.Stmt) bool) bool {
-	for _, stmt := range stmts {
-		if !fn(stmt) {
-			return false
-		}
-	}
-	return true
-}
+			// Ignore types that can change by system.
+			stream.GrepNot(`pkg/util/sysutil/sysutil_unix.go:`),
 
-// timerChecker assures that timeutil.Timer objects are used correctly, to
-// avoid race conditions and deadlocks. These timers require callers to set
-// their Read field to true when their channel has been received on. If this
-// field is not set and the timer's Reset method is called, we will deadlock.
-// This lint assures that the Read field is set in the most common case where
-// Reset is used, within a for-loop where each iteration blocks on a select
-// statement. The timers are usually used as timeouts on these select
-// statements, and need to be reset after each iteration.
-//
-// for {
-//   timer.Reset(...)
-//   select {
-//     case <-timer.C:
-//       timer.Read = true   <--  lint verifies that this line is present
-//     case ...:
-//   }
-// }
-//
-type timerChecker struct {
-	timerType types.Type
-}
-
-func (*timerChecker) Name() string {
-	return "timercheck"
-}
-
-func (*timerChecker) Prefix() string {
-	return "T"
-}
-
-const timerChanName = "C"
-
-func (m *timerChecker) Init(program *lint.Program) {
-	timeutilPkg := program.Prog.Package("github.com/cockroachdb/cockroach/pkg/util/timeutil")
-	if timeutilPkg == nil {
-		log.Fatal("timeutil package not found")
-	}
-	timerObject := timeutilPkg.Pkg.Scope().Lookup("Timer")
-	if timerObject == nil {
-		log.Fatal("timeutil.Timer type not found")
-	}
-	m.timerType = timerObject.Type()
-
-	func() {
-		if typ, ok := m.timerType.Underlying().(*types.Struct); ok {
-			for i := 0; i < typ.NumFields(); i++ {
-				if typ.Field(i).Name() == timerChanName {
-					return
-				}
-			}
-		}
-		log.Fatalf("no field called %q in type %s", timerChanName, m.timerType)
-	}()
-}
-
-func (m *timerChecker) Funcs() map[string]lint.Func {
-	return map[string]lint.Func{
-		"TimeutilTimerRead": m.checkSetTimeutilTimerRead,
-	}
-}
-
-func (m *timerChecker) selectorIsTimer(s *ast.SelectorExpr, info *types.Info) bool {
-	selTyp := info.TypeOf(s.X)
-	if ptr, ok := selTyp.(*types.Pointer); ok {
-		selTyp = ptr.Elem()
-	}
-	return selTyp == m.timerType
-}
-
-func (m *timerChecker) checkSetTimeutilTimerRead(j *lint.Job) {
-	forAllFiles(j, func(n ast.Node) bool {
-		return walkForStmts(n, func(s ast.Stmt) bool {
-			return walkSelectStmts(s, func(s ast.Stmt) bool {
-				comm, ok := s.(*ast.CommClause)
-				if !ok || comm.Comm == nil /* default: */ {
-					return true
-				}
-
-				// if receiving on a timer's C chan.
-				var unary ast.Expr
-				switch v := comm.Comm.(type) {
-				case *ast.AssignStmt:
-					// case `now := <-timer.C:`
-					unary = v.Rhs[0]
-				case *ast.ExprStmt:
-					// case `<-timer.C:`
-					unary = v.X
-				default:
-					return true
-				}
-				chanRead, ok := unary.(*ast.UnaryExpr)
-				if !ok || chanRead.Op != token.ARROW {
-					return true
-				}
-				selector, ok := chanRead.X.(*ast.SelectorExpr)
-				if !ok {
-					return true
-				}
-				if !m.selectorIsTimer(selector, j.Program.Info) {
-					return true
-				}
-				selectorName := fmt.Sprint(selector.X)
-				if selector.Sel.String() != timerChanName {
-					return true
-				}
-
-				// Verify that the case body contains `timer.Read = true`.
-				noRead := walkStmts(comm.Body, func(s ast.Stmt) bool {
-					assign, ok := s.(*ast.AssignStmt)
-					if !ok || assign.Tok != token.ASSIGN {
-						return true
-					}
-					for i := range assign.Lhs {
-						l, r := assign.Lhs[i], assign.Rhs[i]
-
-						// if assignment to correct field in timer.
-						assignSelector, ok := l.(*ast.SelectorExpr)
-						if !ok {
-							return true
-						}
-						if !m.selectorIsTimer(assignSelector, j.Program.Info) {
-							return true
-						}
-						if fmt.Sprint(assignSelector.X) != selectorName {
-							return true
-						}
-						if assignSelector.Sel.String() != "Read" {
-							return true
-						}
-
-						// if assigning `true`.
-						val, ok := r.(*ast.Ident)
-						if !ok {
-							return true
-						}
-						if val.String() == "true" {
-							// returning false will short-circuit walkStmts and assign
-							// noRead to false instead of the default value of true.
-							return false
-						}
-					}
-					return true
-				})
-				if noRead {
-					j.Errorf(comm, "must set timer.Read = true after reading from timer.C (see timeutil/timer.go)")
-				}
-				return true
-			})
+			// Ignore tests.
+			// TODO(mjibson): remove this ignore.
+			stream.GrepNot(`pkg/.*_test\.go:`),
 		})
 	})
-}
 
-// Adapted from https://github.com/mdempsky/unconvert/blob/beb68d938016d2dec1d1b078054f4d3db25f97be/unconvert.go#L371-L414.
-func checkUnconvert(j *lint.Job) {
-	forAllFiles(j, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
-			return true
+	t.Run("TestVectorizedPanics", func(t *testing.T) {
+		t.Parallel()
+		cmd, stderr, filter, err := dirCmd(
+			pkgDir,
+			"git",
+			"grep",
+			"-nE",
+			fmt.Sprintf(`panic\(.*\)`),
+			"--",
+			"sql/colexec",
+			"sql/colflow",
+			":!sql/colexec/execerror/error.go",
+			":!sql/colexec/execpb/stats.pb.go",
+			":!sql/colflow/vectorized_panic_propagation_test.go",
+		)
+		if err != nil {
+			t.Fatal(err)
 		}
-		if len(call.Args) != 1 || call.Ellipsis != token.NoPos {
-			return true
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
 		}
-		ft, ok := j.Program.Info.Types[call.Fun]
-		if !ok {
-			j.Errorf(call.Fun, "missing type")
-			return true
+
+		if err := stream.ForEach(filter, func(s string) {
+			t.Errorf("\n%s <- forbidden; use either execerror.VectorizedInternalPanic() or execerror.NonVectorizedPanic() instead", s)
+		}); err != nil {
+			t.Error(err)
 		}
-		if !ft.IsType() {
-			// Function call; not a conversion.
-			return true
-		}
-		at, ok := j.Program.Info.Types[call.Args[0]]
-		if !ok {
-			j.Errorf(call.Args[0], "missing type")
-			return true
-		}
-		if !types.Identical(ft.Type, at.Type) {
-			// A real conversion.
-			return true
-		}
-		if isUntypedValue(call.Args[0], j.Program.Info) {
-			// Workaround golang.org/issue/13061.
-			return true
-		}
-		// Adapted from https://github.com/mdempsky/unconvert/blob/beb68d938016d2dec1d1b078054f4d3db25f97be/unconvert.go#L416-L430.
-		//
-		// cmd/cgo generates explicit type conversions that
-		// are often redundant when introducing
-		// _cgoCheckPointer calls (issue #16).  Users can't do
-		// anything about these, so skip over them.
-		if ident, ok := call.Fun.(*ast.Ident); ok {
-			if ident.Name == "_cgoCheckPointer" {
-				return false
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
 			}
 		}
-		j.Errorf(n, "unnecessary conversion")
-		return true
 	})
-}
-
-// Cribbed from https://github.com/mdempsky/unconvert/blob/beb68d938016d2dec1d1b078054f4d3db25f97be/unconvert.go#L557-L607.
-func isUntypedValue(n ast.Expr, info *types.Info) bool {
-	switch n := n.(type) {
-	case *ast.BinaryExpr:
-		switch n.Op {
-		case token.SHL, token.SHR:
-			// Shifts yield an untyped value if their LHS is untyped.
-			return isUntypedValue(n.X, info)
-		case token.EQL, token.NEQ, token.LSS, token.GTR, token.LEQ, token.GEQ:
-			// Comparisons yield an untyped boolean value.
-			return true
-		case token.ADD, token.SUB, token.MUL, token.QUO, token.REM,
-			token.AND, token.OR, token.XOR, token.AND_NOT,
-			token.LAND, token.LOR:
-			return isUntypedValue(n.X, info) && isUntypedValue(n.Y, info)
-		}
-	case *ast.UnaryExpr:
-		switch n.Op {
-		case token.ADD, token.SUB, token.NOT, token.XOR:
-			return isUntypedValue(n.X, info)
-		}
-	case *ast.BasicLit:
-		// Basic literals are always untyped.
-		return true
-	case *ast.ParenExpr:
-		return isUntypedValue(n.X, info)
-	case *ast.SelectorExpr:
-		return isUntypedValue(n.Sel, info)
-	case *ast.Ident:
-		if obj, ok := info.Uses[n]; ok {
-			if obj.Pkg() == nil && obj.Name() == "nil" {
-				// The universal untyped zero value.
-				return true
-			}
-			if b, ok := obj.Type().(*types.Basic); ok && b.Info()&types.IsUntyped != 0 {
-				// Reference to an untyped constant.
-				return true
-			}
-		}
-	case *ast.CallExpr:
-		if b, ok := asBuiltin(n.Fun, info); ok {
-			switch b.Name() {
-			case "real", "imag":
-				return isUntypedValue(n.Args[0], info)
-			case "complex":
-				return isUntypedValue(n.Args[0], info) && isUntypedValue(n.Args[1], info)
-			}
-		}
-	}
-
-	return false
-}
-
-// Cribbed from https://github.com/mdempsky/unconvert/blob/beb68d938016d2dec1d1b078054f4d3db25f97be/unconvert.go#L609-L630.
-func asBuiltin(n ast.Expr, info *types.Info) (*types.Builtin, bool) {
-	for {
-		paren, ok := n.(*ast.ParenExpr)
-		if !ok {
-			break
-		}
-		n = paren.X
-	}
-
-	ident, ok := n.(*ast.Ident)
-	if !ok {
-		return nil, false
-	}
-
-	obj, ok := info.Uses[ident]
-	if !ok {
-		return nil, false
-	}
-
-	b, ok := obj.(*types.Builtin)
-	return b, ok
 }

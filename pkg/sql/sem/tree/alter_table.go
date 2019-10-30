@@ -1,27 +1,21 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree
 
-import (
-	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
-)
+import "github.com/cockroachdb/cockroach/pkg/sql/types"
 
 // AlterTable represents an ALTER TABLE statement.
 type AlterTable struct {
 	IfExists bool
-	Table    NormalizableTableName
+	Table    *UnresolvedObjectName
 	Cmds     AlterTableCmds
 }
 
@@ -31,7 +25,7 @@ func (node *AlterTable) Format(ctx *FmtCtx) {
 	if node.IfExists {
 		ctx.WriteString("IF EXISTS ")
 	}
-	ctx.FormatNode(&node.Table)
+	ctx.FormatNode(node.Table)
 	ctx.FormatNode(&node.Cmds)
 }
 
@@ -63,6 +57,10 @@ func (*AlterTableDropColumn) alterTableCmd()         {}
 func (*AlterTableDropConstraint) alterTableCmd()     {}
 func (*AlterTableDropNotNull) alterTableCmd()        {}
 func (*AlterTableDropStored) alterTableCmd()         {}
+func (*AlterTableSetNotNull) alterTableCmd()         {}
+func (*AlterTableRenameColumn) alterTableCmd()       {}
+func (*AlterTableRenameConstraint) alterTableCmd()   {}
+func (*AlterTableRenameTable) alterTableCmd()        {}
 func (*AlterTableSetAudit) alterTableCmd()           {}
 func (*AlterTableSetDefault) alterTableCmd()         {}
 func (*AlterTableValidateConstraint) alterTableCmd() {}
@@ -76,6 +74,10 @@ var _ AlterTableCmd = &AlterTableDropColumn{}
 var _ AlterTableCmd = &AlterTableDropConstraint{}
 var _ AlterTableCmd = &AlterTableDropNotNull{}
 var _ AlterTableCmd = &AlterTableDropStored{}
+var _ AlterTableCmd = &AlterTableSetNotNull{}
+var _ AlterTableCmd = &AlterTableRenameColumn{}
+var _ AlterTableCmd = &AlterTableRenameConstraint{}
+var _ AlterTableCmd = &AlterTableRenameTable{}
 var _ AlterTableCmd = &AlterTableSetAudit{}
 var _ AlterTableCmd = &AlterTableSetDefault{}
 var _ AlterTableCmd = &AlterTableValidateConstraint{}
@@ -91,21 +93,62 @@ type ColumnMutationCmd interface {
 
 // AlterTableAddColumn represents an ADD COLUMN command.
 type AlterTableAddColumn struct {
-	ColumnKeyword bool
-	IfNotExists   bool
-	ColumnDef     *ColumnTableDef
+	IfNotExists bool
+	ColumnDef   *ColumnTableDef
 }
 
 // Format implements the NodeFormatter interface.
 func (node *AlterTableAddColumn) Format(ctx *FmtCtx) {
-	ctx.WriteString(" ADD ")
-	if node.ColumnKeyword {
-		ctx.WriteString("COLUMN ")
-	}
+	ctx.WriteString(" ADD COLUMN ")
 	if node.IfNotExists {
 		ctx.WriteString("IF NOT EXISTS ")
 	}
 	ctx.FormatNode(node.ColumnDef)
+}
+
+// HoistAddColumnConstraints converts column constraints in ADD COLUMN commands,
+// stored in node.Cmds, into top-level commands to add those constraints.
+// Currently, this only applies to checks. For example, the ADD COLUMN in
+//
+//     ALTER TABLE t ADD COLUMN a INT CHECK (a < 1)
+//
+// is transformed into two commands, as in
+//
+//     ALTER TABLE t ADD COLUMN a INT, ADD CONSTRAINT check_a CHECK (a < 1)
+//
+// (with an auto-generated name).
+//
+// Note that some SQL databases require that a constraint attached to a column
+// to refer only to the column it is attached to. We follow Postgres' behavior,
+// however, in omitting this restriction by blindly hoisting all column
+// constraints. For example, the following statement is accepted in
+// CockroachDB and Postgres, but not necessarily other SQL databases:
+//
+//     ALTER TABLE t ADD COLUMN a INT CHECK (a < b)
+//
+func (node *AlterTable) HoistAddColumnConstraints() {
+	var normalizedCmds AlterTableCmds
+
+	for _, cmd := range node.Cmds {
+		normalizedCmds = append(normalizedCmds, cmd)
+
+		if t, ok := cmd.(*AlterTableAddColumn); ok {
+			d := t.ColumnDef
+			for _, checkExpr := range d.CheckExprs {
+				normalizedCmds = append(normalizedCmds,
+					&AlterTableAddConstraint{
+						ConstraintDef: &CheckConstraintTableDef{
+							Expr: checkExpr.Expr,
+							Name: checkExpr.ConstraintName,
+						},
+						ValidationBehavior: ValidationDefault,
+					},
+				)
+			}
+			d.CheckExprs = nil
+		}
+	}
+	node.Cmds = normalizedCmds
 }
 
 // ValidationBehavior specifies whether or not a constraint is validated.
@@ -135,34 +178,22 @@ func (node *AlterTableAddConstraint) Format(ctx *FmtCtx) {
 
 // AlterTableAlterColumnType represents an ALTER TABLE ALTER COLUMN TYPE command.
 type AlterTableAlterColumnType struct {
-	Collation      string
-	Column         Name
-	ColumnKeyword  bool
-	SetDataKeyword bool
-	ToType         coltypes.T
-	Using          Expr
+	Collation string
+	Column    Name
+	ToType    *types.T
+	Using     Expr
 }
 
 // Format implements the NodeFormatter interface.
 func (node *AlterTableAlterColumnType) Format(ctx *FmtCtx) {
-	ctx.WriteString(" ALTER ")
-	if node.ColumnKeyword {
-		ctx.WriteString("COLUMN ")
-	}
+	ctx.WriteString(" ALTER COLUMN ")
 	ctx.FormatNode(&node.Column)
-
-	if node.SetDataKeyword {
-		ctx.WriteString(" SET DATA")
-	}
-
-	ctx.WriteString(" TYPE ")
-	node.ToType.Format(ctx.Buffer, ctx.flags.EncodeFlags())
-
+	ctx.WriteString(" SET DATA TYPE ")
+	ctx.WriteString(node.ToType.SQLString())
 	if len(node.Collation) > 0 {
 		ctx.WriteString(" COLLATE ")
 		ctx.WriteString(node.Collation)
 	}
-
 	if node.Using != nil {
 		ctx.WriteString(" USING ")
 		ctx.FormatNode(node.Using)
@@ -176,18 +207,14 @@ func (node *AlterTableAlterColumnType) GetColumn() Name {
 
 // AlterTableDropColumn represents a DROP COLUMN command.
 type AlterTableDropColumn struct {
-	ColumnKeyword bool
-	IfExists      bool
-	Column        Name
-	DropBehavior  DropBehavior
+	IfExists     bool
+	Column       Name
+	DropBehavior DropBehavior
 }
 
 // Format implements the NodeFormatter interface.
 func (node *AlterTableDropColumn) Format(ctx *FmtCtx) {
-	ctx.WriteString(" DROP ")
-	if node.ColumnKeyword {
-		ctx.WriteString("COLUMN ")
-	}
+	ctx.WriteString(" DROP COLUMN ")
 	if node.IfExists {
 		ctx.WriteString("IF EXISTS ")
 	}
@@ -227,12 +254,50 @@ func (node *AlterTableValidateConstraint) Format(ctx *FmtCtx) {
 	ctx.FormatNode(&node.Constraint)
 }
 
+// AlterTableRenameTable represents an ALTE RTABLE RENAME TO command.
+type AlterTableRenameTable struct {
+	NewName TableName
+}
+
+// Format implements the NodeFormatter interface.
+func (node *AlterTableRenameTable) Format(ctx *FmtCtx) {
+	ctx.WriteString(" RENAME TO ")
+	ctx.FormatNode(&node.NewName)
+}
+
+// AlterTableRenameColumn represents an ALTER TABLE RENAME [COLUMN] command.
+type AlterTableRenameColumn struct {
+	Column  Name
+	NewName Name
+}
+
+// Format implements the NodeFormatter interface.
+func (node *AlterTableRenameColumn) Format(ctx *FmtCtx) {
+	ctx.WriteString(" RENAME COLUMN ")
+	ctx.FormatNode(&node.Column)
+	ctx.WriteString(" TO ")
+	ctx.FormatNode(&node.NewName)
+}
+
+// AlterTableRenameConstraint represents an ALTER TABLE RENAME CONSTRAINT command.
+type AlterTableRenameConstraint struct {
+	Constraint Name
+	NewName    Name
+}
+
+// Format implements the NodeFormatter interface.
+func (node *AlterTableRenameConstraint) Format(ctx *FmtCtx) {
+	ctx.WriteString(" RENAME CONSTRAINT ")
+	ctx.FormatNode(&node.Constraint)
+	ctx.WriteString(" TO ")
+	ctx.FormatNode(&node.NewName)
+}
+
 // AlterTableSetDefault represents an ALTER COLUMN SET DEFAULT
 // or DROP DEFAULT command.
 type AlterTableSetDefault struct {
-	ColumnKeyword bool
-	Column        Name
-	Default       Expr
+	Column  Name
+	Default Expr
 }
 
 // GetColumn implements the ColumnMutationCmd interface.
@@ -242,10 +307,7 @@ func (node *AlterTableSetDefault) GetColumn() Name {
 
 // Format implements the NodeFormatter interface.
 func (node *AlterTableSetDefault) Format(ctx *FmtCtx) {
-	ctx.WriteString(" ALTER ")
-	if node.ColumnKeyword {
-		ctx.WriteString("COLUMN ")
-	}
+	ctx.WriteString(" ALTER COLUMN ")
 	ctx.FormatNode(&node.Column)
 	if node.Default == nil {
 		ctx.WriteString(" DROP DEFAULT")
@@ -255,11 +317,28 @@ func (node *AlterTableSetDefault) Format(ctx *FmtCtx) {
 	}
 }
 
+// AlterTableSetNotNull represents an ALTER COLUMN SET NOT NULL
+// command.
+type AlterTableSetNotNull struct {
+	Column Name
+}
+
+// GetColumn implements the ColumnMutationCmd interface.
+func (node *AlterTableSetNotNull) GetColumn() Name {
+	return node.Column
+}
+
+// Format implements the NodeFormatter interface.
+func (node *AlterTableSetNotNull) Format(ctx *FmtCtx) {
+	ctx.WriteString(" ALTER COLUMN ")
+	ctx.FormatNode(&node.Column)
+	ctx.WriteString(" SET NOT NULL")
+}
+
 // AlterTableDropNotNull represents an ALTER COLUMN DROP NOT NULL
 // command.
 type AlterTableDropNotNull struct {
-	ColumnKeyword bool
-	Column        Name
+	Column Name
 }
 
 // GetColumn implements the ColumnMutationCmd interface.
@@ -269,10 +348,7 @@ func (node *AlterTableDropNotNull) GetColumn() Name {
 
 // Format implements the NodeFormatter interface.
 func (node *AlterTableDropNotNull) Format(ctx *FmtCtx) {
-	ctx.WriteString(" ALTER ")
-	if node.ColumnKeyword {
-		ctx.WriteString("COLUMN ")
-	}
+	ctx.WriteString(" ALTER COLUMN ")
 	ctx.FormatNode(&node.Column)
 	ctx.WriteString(" DROP NOT NULL")
 }

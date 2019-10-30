@@ -1,17 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package spanset
 
@@ -75,7 +70,7 @@ func TestSpanSetCheckAllowedBoundaries(t *testing.T) {
 	}
 	for _, span := range allowed {
 		if err := ss.CheckAllowed(SpanReadOnly, span); err != nil {
-			t.Errorf("expected %s to be allowed, but got error: %s", span, err)
+			t.Errorf("expected %s to be allowed, but got error: %+v", span, err)
 		}
 	}
 
@@ -121,15 +116,15 @@ func TestSpanSetWriteImpliesRead(t *testing.T) {
 	ss.Add(SpanReadWrite, rwSpan)
 
 	if err := ss.CheckAllowed(SpanReadOnly, roSpan); err != nil {
-		t.Errorf("expected to be allowed to read roSpan, error: %s", err)
+		t.Errorf("expected to be allowed to read roSpan, error: %+v", err)
 	}
 	if err := ss.CheckAllowed(SpanReadWrite, roSpan); err == nil {
 		t.Errorf("expected not to be allowed to write roSpan")
 	}
 	if err := ss.CheckAllowed(SpanReadOnly, rwSpan); err != nil {
-		t.Errorf("expected to be allowed to read rwSpan, error: %s", err)
+		t.Errorf("expected to be allowed to read rwSpan, error: %+v", err)
 	}
 	if err := ss.CheckAllowed(SpanReadWrite, rwSpan); err != nil {
-		t.Errorf("expected to be allowed to read rwSpan, error: %s", err)
+		t.Errorf("expected to be allowed to read rwSpan, error: %+v", err)
 	}
 }

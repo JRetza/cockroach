@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 //
 // This file implements the select code that deals with column references
 // and resolving column names in expressions.
@@ -21,10 +17,11 @@ import (
 	"context"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // NameResolutionVisitor is a tree.Visitor implementation used to
@@ -48,12 +45,12 @@ type NameResolutionVisitor struct {
 
 var _ tree.Visitor = &NameResolutionVisitor{}
 
-func makeUntypedTuple(texprs []tree.TypedExpr) *tree.Tuple {
+func makeUntypedTuple(labels []string, texprs []tree.TypedExpr) *tree.Tuple {
 	exprs := make(tree.Exprs, len(texprs))
 	for i, e := range texprs {
 		exprs[i] = e
 	}
-	return &tree.Tuple{Exprs: exprs}
+	return &tree.Tuple{Exprs: exprs, Labels: labels}
 }
 
 // VisitPre implements tree.Visitor.
@@ -66,9 +63,18 @@ func (v *NameResolutionVisitor) VisitPre(expr tree.Expr) (recurse bool, newNode 
 	case tree.UnqualifiedStar:
 		v.foundDependentVars = true
 
+	case *tree.TupleStar:
+		// TupleStars at the top level of a SELECT clause are replaced
+		// when the select's renders are prepared. If we encounter one
+		// here during expression analysis, it's being used as an argument
+		// to an inner expression. In that case, we just report its tuple
+		// operand unchanged.
+		v.foundStars = true
+		return v.VisitPre(t.Expr)
+
 	case *tree.AllColumnsSelector:
 		v.foundStars = true
-		// AllColumnsSelector at the top level of a SELECT clause are
+		// AllColumnsSelectors at the top level of a SELECT clause are
 		// replaced when the select's renders are prepared. If we
 		// encounter one here during expression analysis, it's being used
 		// as an argument to an inner expression/function. In that case,
@@ -77,9 +83,9 @@ func (v *NameResolutionVisitor) VisitPre(expr tree.Expr) (recurse bool, newNode 
 		// Hence:
 		//    SELECT kv.* FROM kv                 -> SELECT k, v FROM kv
 		//    SELECT (kv.*) FROM kv               -> SELECT (k, v) FROM kv
-		//    SELECT COUNT(DISTINCT kv.*) FROM kv -> SELECT COUNT(DISTINCT (k, v)) FROM kv
+		//    SELECT count(DISTINCT kv.*) FROM kv -> SELECT count(DISTINCT (k, v)) FROM kv
 		//
-		_, exprs, err := expandStar(context.TODO(), v.sources, t, v.iVarHelper)
+		cols, exprs, err := expandStar(context.TODO(), v.sources, t, v.iVarHelper)
 		if err != nil {
 			v.err = err
 			return false, expr
@@ -91,8 +97,13 @@ func (v *NameResolutionVisitor) VisitPre(expr tree.Expr) (recurse bool, newNode 
 		}
 		// We return an untyped tuple because name resolution occurs
 		// before type checking, and type checking will resolve the
-		// tuple's type.
-		return false, makeUntypedTuple(exprs)
+		// tuple's type. However we need to preserve the labels in
+		// case of e.g. `SELECT (kv.*).v`.
+		labels := make([]string, len(exprs))
+		for i := range exprs {
+			labels[i] = cols[i].Name
+		}
+		return false, makeUntypedTuple(labels, exprs)
 
 	case *tree.IndexedVar:
 		// If the indexed var is a standalone ordinal reference, ensure it
@@ -134,13 +145,7 @@ func (v *NameResolutionVisitor) VisitPre(expr tree.Expr) (recurse bool, newNode 
 			return false, expr
 		}
 
-		if fd.HasOverloadsNeedingRepeatedEvaluation {
-			// TODO(knz): this property should really be an attribute of the
-			// individual overloads. By looking at the name-level property
-			// indicator, we are marking a function as row-dependent as
-			// soon as one overload is, even if the particular overload
-			// that would be selected by type checking for this FuncExpr
-			// is constant. This could be more fine-grained.
+		if fd.NeedsRepeatedEvaluation {
 			v.foundDependentVars = true
 		}
 
@@ -249,7 +254,7 @@ func expandStar(
 	ctx context.Context, src MultiSourceInfo, v tree.VarName, ivarHelper tree.IndexedVarHelper,
 ) (columns ResultColumns, exprs []tree.TypedExpr, err error) {
 	if len(src) == 0 || len(src[0].SourceColumns) == 0 {
-		return nil, nil, pgerror.NewErrorf(pgerror.CodeInvalidNameError,
+		return nil, nil, pgerror.Newf(pgcode.InvalidName,
 			"cannot use %q without a FROM clause", tree.ErrString(v))
 	}
 
@@ -284,33 +289,4 @@ func expandStar(
 	}
 
 	return columns, exprs, nil
-}
-
-// CheckRenderStar handles the case where the target specification contains a
-// SQL star (UnqualifiedStar or AllColumnsSelector). We match the prefix of the
-// name to one of the tables in the query and then expand the "*" into a list
-// of columns. A ResultColumns and Expr pair is returned for each column.
-func CheckRenderStar(
-	ctx context.Context,
-	target tree.SelectExpr,
-	info MultiSourceInfo,
-	ivarHelper tree.IndexedVarHelper,
-) (isStar bool, columns ResultColumns, exprs []tree.TypedExpr, err error) {
-	v, ok := target.Expr.(tree.VarName)
-	if !ok {
-		return false, nil, nil, nil
-	}
-
-	switch v.(type) {
-	case tree.UnqualifiedStar, *tree.AllColumnsSelector:
-		if target.As != "" {
-			return false, nil, nil, pgerror.NewErrorf(pgerror.CodeSyntaxError,
-				"%q cannot be aliased", tree.ErrString(v))
-		}
-
-		columns, exprs, err = expandStar(ctx, info, v, ivarHelper)
-		return true, columns, exprs, err
-	default:
-		return false, nil, nil, nil
-	}
 }

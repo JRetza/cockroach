@@ -1,18 +1,47 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package enginepb
+
+import (
+	"math"
+	"sort"
+)
+
+// TxnEpoch is a zero-indexed epoch for a transaction. When a transaction
+// retries, it increments its epoch, invalidating all of its previous writes.
+type TxnEpoch int32
+
+// TxnSeq is a zero-indexed sequence number asssigned to a a request performed
+// by a transaction. Writes within a transaction have unique sequences and start
+// at sequence number 1. Reads within a transaction have non-unique sequences
+// and start at sequence number 0.
+//
+// Writes within a transaction logically take place in sequence number order.
+// Reads within a transaction observe only writes performed by the transaction
+// at equal or lower sequence numbers.
+type TxnSeq int32
+
+// TxnPriority defines the priority that a transaction operates at. Transactions
+// with high priorities are preferred over transaction with low priorities when
+// resolving conflicts between themselves. For example, transaction priorities
+// are used to determine which transaction to abort when resolving transaction
+// deadlocks.
+type TxnPriority int32
+
+const (
+	// MinTxnPriority is the minimum allowed txn priority.
+	MinTxnPriority TxnPriority = 0
+	// MaxTxnPriority is the maximum allowed txn priority.
+	MaxTxnPriority TxnPriority = math.MaxInt32
+)
 
 // Short returns a prefix of the transaction's ID.
 func (t TxnMeta) Short() string {
@@ -128,4 +157,34 @@ func (ms *MVCCStats) Subtract(oms MVCCStats) {
 // IsInline returns true if the value is inlined in the metadata.
 func (meta MVCCMetadata) IsInline() bool {
 	return meta.RawBytes != nil
+}
+
+// AddToIntentHistory adds the sequence and value to the intent history.
+func (meta *MVCCMetadata) AddToIntentHistory(seq TxnSeq, val []byte) {
+	meta.IntentHistory = append(meta.IntentHistory,
+		MVCCMetadata_SequencedIntent{Sequence: seq, Value: val})
+}
+
+// GetPrevIntentSeq goes through the intent history and finds the previous
+// intent's sequence number given the current sequence.
+func (meta *MVCCMetadata) GetPrevIntentSeq(seq TxnSeq) (TxnSeq, bool) {
+	index := sort.Search(len(meta.IntentHistory), func(i int) bool {
+		return meta.IntentHistory[i].Sequence >= seq
+	})
+	if index > 0 && index < len(meta.IntentHistory) {
+		return meta.IntentHistory[index-1].Sequence, true
+	}
+	return 0, false
+}
+
+// GetIntentValue goes through the intent history and finds the value
+// written at the sequence number.
+func (meta *MVCCMetadata) GetIntentValue(seq TxnSeq) ([]byte, bool) {
+	index := sort.Search(len(meta.IntentHistory), func(i int) bool {
+		return meta.IntentHistory[i].Sequence >= seq
+	})
+	if index < len(meta.IntentHistory) && meta.IntentHistory[index].Sequence == seq {
+		return meta.IntentHistory[index].Value, true
+	}
+	return nil, false
 }

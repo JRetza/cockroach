@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tests_test
 
@@ -19,25 +15,25 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/gogo/protobuf/proto"
-	"github.com/kr/pretty"
-
+	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/gogo/protobuf/proto"
+	"github.com/kr/pretty"
 )
 
 func TestInitialKeys(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	const keysPerDesc = 2
-	const nonDescKeys = 5
+	const nonDescKeys = 9
 
-	ms := sqlbase.MakeMetadataSchema()
-	kv := ms.GetInitialValues()
+	ms := sqlbase.MakeMetadataSchema(config.DefaultZoneConfigRef(), config.DefaultSystemZoneConfigRef())
+	kv, _ /* splits */ := ms.GetInitialValues()
 	expected := nonDescKeys + keysPerDesc*ms.SystemDescriptorCount()
 	if actual := len(kv); actual != expected {
 		t.Fatalf("Wrong number of initial sql kv pairs: %d, wanted %d", actual, expected)
@@ -56,7 +52,7 @@ func TestInitialKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	ms.AddDescriptor(keys.SystemDatabaseID, &desc)
-	kv = ms.GetInitialValues()
+	kv, _ /* splits */ = ms.GetInitialValues()
 	expected = nonDescKeys + keysPerDesc*ms.SystemDescriptorCount()
 	if actual := len(kv); actual != expected {
 		t.Fatalf("Wrong number of initial sql kv pairs: %d, wanted %d", actual, expected)
@@ -120,15 +116,15 @@ func TestSystemTableLiterals(t *testing.T) {
 		{keys.TableStatisticsTableID, sqlbase.TableStatisticsTableSchema, sqlbase.TableStatisticsTable},
 		{keys.LocationsTableID, sqlbase.LocationsTableSchema, sqlbase.LocationsTable},
 		{keys.RoleMembersTableID, sqlbase.RoleMembersTableSchema, sqlbase.RoleMembersTable},
+		{keys.CommentsTableID, sqlbase.CommentsTableSchema, sqlbase.CommentsTable},
 	} {
-		// Always create tables with "admin" privileges included, or CreateTestTableDescriptor fails.
-		privs := sqlbase.NewCustomSuperuserPrivilegeDescriptor(sqlbase.SystemAllowedPrivileges[test.id])
+		privs := *test.pkg.Privileges
 		gen, err := sql.CreateTestTableDescriptor(
 			context.TODO(),
 			keys.SystemDatabaseID,
 			test.id,
 			test.schema,
-			privs,
+			&privs,
 		)
 		if err != nil {
 			t.Fatalf("test: %+v, err: %v", test, err)

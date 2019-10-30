@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage_test
 
@@ -19,11 +15,9 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"sort"
 	"testing"
 	"time"
-
-	"github.com/kr/pretty"
-	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
@@ -41,6 +35,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/kr/pretty"
+	"github.com/pkg/errors"
 )
 
 type modelTimeSeriesDataStore struct {
@@ -48,8 +44,8 @@ type modelTimeSeriesDataStore struct {
 	t                  testing.TB
 	containsCalled     int
 	pruneCalled        int
-	pruneSeenStartKeys map[string]struct{}
-	pruneSeenEndKeys   map[string]struct{}
+	pruneSeenStartKeys []roachpb.Key
+	pruneSeenEndKeys   []roachpb.Key
 }
 
 func (m *modelTimeSeriesDataStore) ContainsTimeSeries(start, end roachpb.RKey) bool {
@@ -59,31 +55,42 @@ func (m *modelTimeSeriesDataStore) ContainsTimeSeries(start, end roachpb.RKey) b
 	m.Lock()
 	defer m.Unlock()
 	m.containsCalled++
-	return true
+
+	// We're going to consider some user-space ranges as containing timeseries.
+	return roachpb.Key("a").Compare(start.AsRawKey()) <= 0 &&
+		roachpb.Key("z").Compare(end.AsRawKey()) > 0
 }
 
-func (m *modelTimeSeriesDataStore) PruneTimeSeries(
+func (m *modelTimeSeriesDataStore) MaintainTimeSeries(
 	ctx context.Context,
 	snapshot engine.Reader,
 	start, end roachpb.RKey,
 	db *client.DB,
+	_ *mon.BytesMonitor,
+	_ int64,
 	now hlc.Timestamp,
 ) error {
 	if snapshot == nil {
-		m.t.Fatal("PruneTimeSeries was passed a nil snapshot")
+		m.t.Fatal("MaintainTimeSeries was passed a nil snapshot")
 	}
 	if db == nil {
-		m.t.Fatal("PruneTimeSeries was passed a nil client.DB")
+		m.t.Fatal("MaintainTimeSeries was passed a nil client.DB")
 	}
 	if !start.Less(end) {
-		m.t.Fatalf("PruneTimeSeries passed start key %v which is not less than end key %v", start, end)
+		m.t.Fatalf("MaintainTimeSeries passed start key %v which is not less than end key %v", start, end)
 	}
 
 	m.Lock()
 	defer m.Unlock()
 	m.pruneCalled++
-	m.pruneSeenStartKeys[start.String()] = struct{}{}
-	m.pruneSeenEndKeys[end.String()] = struct{}{}
+	m.pruneSeenStartKeys = append(m.pruneSeenStartKeys, start.AsRawKey())
+	sort.Slice(m.pruneSeenStartKeys, func(i, j int) bool {
+		return m.pruneSeenStartKeys[i].Compare(m.pruneSeenStartKeys[j]) < 0
+	})
+	m.pruneSeenEndKeys = append(m.pruneSeenEndKeys, end.AsRawKey())
+	sort.Slice(m.pruneSeenEndKeys, func(i, j int) bool {
+		return m.pruneSeenEndKeys[i].Compare(m.pruneSeenEndKeys[j]) < 0
+	})
 	return nil
 }
 
@@ -92,28 +99,27 @@ func (m *modelTimeSeriesDataStore) PruneTimeSeries(
 func TestTimeSeriesMaintenanceQueue(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	model := &modelTimeSeriesDataStore{
-		t:                  t,
-		pruneSeenStartKeys: make(map[string]struct{}),
-		pruneSeenEndKeys:   make(map[string]struct{}),
-	}
+	ctx := context.Background()
+	model := &modelTimeSeriesDataStore{t: t}
 
 	manual := hlc.NewManualClock(1)
 	cfg := storage.TestStoreConfig(hlc.NewClock(manual.UnixNano, time.Nanosecond))
 	cfg.TimeSeriesDataStore = model
 	cfg.TestingKnobs.DisableScanner = true
 	cfg.TestingKnobs.DisableSplitQueue = true
+	cfg.TestingKnobs.DisableMergeQueue = true
 
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(ctx)
 	store := createTestStoreWithConfig(t, stopper, cfg)
 
-	// Generate several splits.
-	splitKeys := []roachpb.Key{roachpb.Key("c"), roachpb.Key("b"), roachpb.Key("a")}
+	// Generate several splits. The "c"-"zz" range is not going to be considered
+	// as containing timeseries.
+	splitKeys := []roachpb.Key{roachpb.Key("zz"), roachpb.Key("c"), roachpb.Key("b"), roachpb.Key("a")}
 	for _, k := range splitKeys {
-		repl := store.LookupReplica(roachpb.RKey(k), nil)
+		repl := store.LookupReplica(roachpb.RKey(k))
 		args := adminSplitArgs(k)
-		if _, pErr := client.SendWrappedWith(context.Background(), store, roachpb.Header{
+		if _, pErr := client.SendWrappedWith(ctx, store, roachpb.Header{
 			RangeID: repl.RangeID,
 		}, args); pErr != nil {
 			t.Fatal(pErr)
@@ -123,65 +129,49 @@ func TestTimeSeriesMaintenanceQueue(t *testing.T) {
 	// Generate a list of start/end keys the model should have been passed by
 	// the queue. This consists of all split keys, with KeyMin as an additional
 	// start and KeyMax as an additional end.
-	expectedStartKeys := make(map[string]struct{})
-	expectedEndKeys := make(map[string]struct{})
-	expectedStartKeys[roachpb.KeyMin.String()] = struct{}{}
-	expectedEndKeys[roachpb.KeyMax.String()] = struct{}{}
-	for _, expected := range splitKeys {
-		expectedStartKeys[expected.String()] = struct{}{}
-		expectedEndKeys[expected.String()] = struct{}{}
-	}
+	expectedStartKeys := []roachpb.Key{roachpb.Key("a"), roachpb.Key("b")}
 
-	// Wait for splits to complete and system config to be available.
-	testutils.SucceedsSoon(t, func() error {
-		if a, e := store.ReplicaCount(), len(expectedEndKeys); a != e {
-			return fmt.Errorf("expected %d replicas in store; found %d", a, e)
-		}
-		if _, ok := store.Gossip().GetSystemConfig(); !ok {
-			return fmt.Errorf("system config not yet available")
-		}
-		return nil
-	})
+	expectedEndKeys := []roachpb.Key{roachpb.Key("b"), roachpb.Key("c")}
 
 	// Force replica scan to run, which will populate the model.
 	now := store.Clock().Now()
-	store.ForceTimeSeriesMaintenanceQueueProcess()
+	if err := store.ForceTimeSeriesMaintenanceQueueProcess(); err != nil {
+		t.Fatal(err)
+	}
 
 	// Wait for processing to complete.
 	testutils.SucceedsSoon(t, func() error {
 		model.Lock()
 		defer model.Unlock()
-		if a, e := model.containsCalled, len(expectedStartKeys); a != e {
+		// containsCalled is dependent on the number of ranges in the cluster, which
+		// is larger than the ones we've created.
+		if a, e := model.containsCalled, len(expectedStartKeys); a < e {
 			return fmt.Errorf("ContainsTimeSeries called %d times; expected %d", a, e)
 		}
 		if a, e := model.pruneCalled, len(expectedStartKeys); a != e {
-			return fmt.Errorf("PruneTimeSeries called %d times; expected %d", a, e)
+			return fmt.Errorf("MaintainTimeSeries called %d times; expected %d", a, e)
 		}
 		return nil
 	})
 
 	model.Lock()
 	if a, e := model.pruneSeenStartKeys, expectedStartKeys; !reflect.DeepEqual(a, e) {
-		t.Errorf("start keys seen by PruneTimeSeries did not match expectation: %s", pretty.Diff(a, e))
+		t.Errorf("start keys seen by MaintainTimeSeries did not match expectation: %s", pretty.Diff(a, e))
 	}
 	if a, e := model.pruneSeenEndKeys, expectedEndKeys; !reflect.DeepEqual(a, e) {
-		t.Errorf("end keys seen by PruneTimeSeries did not match expectation: %s", pretty.Diff(a, e))
+		t.Errorf("end keys seen by MaintainTimeSeries did not match expectation: %s", pretty.Diff(a, e))
 	}
 	model.Unlock()
 
 	testutils.SucceedsSoon(t, func() error {
-		keys := []roachpb.RKey{roachpb.RKeyMin}
-		for _, k := range splitKeys {
-			keys = append(keys, roachpb.RKey(k))
-		}
-		for _, key := range keys {
-			repl := store.LookupReplica(key, nil)
-			ts, err := repl.GetQueueLastProcessed(context.TODO(), "timeSeriesMaintenance")
+		for _, key := range expectedStartKeys {
+			repl := store.LookupReplica(roachpb.RKey(key))
+			ts, err := repl.GetQueueLastProcessed(ctx, "timeSeriesMaintenance")
 			if err != nil {
 				return err
 			}
 			if ts.Less(now) {
-				return errors.Errorf("expected last processed %s > %s", ts, now)
+				return errors.Errorf("expected last processed (%s) %s > %s", repl, ts, now)
 			}
 		}
 		return nil
@@ -189,27 +179,33 @@ func TestTimeSeriesMaintenanceQueue(t *testing.T) {
 
 	// Force replica scan to run. But because we haven't moved the
 	// clock forward, no pruning will take place on second invocation.
-	store.ForceTimeSeriesMaintenanceQueueProcess()
+	if err := store.ForceTimeSeriesMaintenanceQueueProcess(); err != nil {
+		t.Fatal(err)
+	}
 	model.Lock()
-	if a, e := model.containsCalled, len(expectedStartKeys); a != e {
+	if a, e := model.containsCalled, len(expectedStartKeys); a < e {
 		t.Errorf("ContainsTimeSeries called %d times; expected %d", a, e)
 	}
 	if a, e := model.pruneCalled, len(expectedStartKeys); a != e {
-		t.Errorf("PruneTimeSeries called %d times; expected %d", a, e)
+		t.Errorf("MaintainTimeSeries called %d times; expected %d", a, e)
 	}
 	model.Unlock()
 
 	// Move clock forward and force to scan again.
 	manual.Increment(storage.TimeSeriesMaintenanceInterval.Nanoseconds())
-	store.ForceTimeSeriesMaintenanceQueueProcess()
+	if err := store.ForceTimeSeriesMaintenanceQueueProcess(); err != nil {
+		t.Fatal(err)
+	}
 	testutils.SucceedsSoon(t, func() error {
 		model.Lock()
 		defer model.Unlock()
-		if a, e := model.containsCalled, len(expectedStartKeys)*2; a != e {
+		// containsCalled is dependent on the number of ranges in the cluster, which
+		// is larger than the ones we've created.
+		if a, e := model.containsCalled, len(expectedStartKeys)*2; a < e {
 			return errors.Errorf("ContainsTimeSeries called %d times; expected %d", a, e)
 		}
 		if a, e := model.pruneCalled, len(expectedStartKeys)*2; a != e {
-			return errors.Errorf("PruneTimeSeries called %d times; expected %d", a, e)
+			return errors.Errorf("MaintainTimeSeries called %d times; expected %d", a, e)
 		}
 		return nil
 	})
@@ -272,7 +268,7 @@ func TestTimeSeriesMaintenanceQueueServer(t *testing.T) {
 
 	// Force a range split in between near past and far past. This guarantees
 	// that the pruning operation will issue a DeleteRange which spans ranges.
-	if err := db.AdminSplit(context.TODO(), splitKey, splitKey); err != nil {
+	if err := db.AdminSplit(context.TODO(), splitKey, splitKey, hlc.MaxTimestamp /* expirationTime */); err != nil {
 		t.Fatal(err)
 	}
 
@@ -329,9 +325,11 @@ func TestTimeSeriesMaintenanceQueueServer(t *testing.T) {
 	storeID := roachpb.StoreID(1)
 	store, err := tsrv.Stores().GetStore(roachpb.StoreID(1))
 	if err != nil {
-		t.Fatalf("error retrieving store %d: %s", storeID, err)
+		t.Fatalf("error retrieving store %d: %+v", storeID, err)
 	}
-	store.ForceTimeSeriesMaintenanceQueueProcess()
+	if err := store.ForceTimeSeriesMaintenanceQueueProcess(); err != nil {
+		t.Fatal(err)
+	}
 
 	// Verify the older datapoint has been pruned.
 	testutils.SucceedsSoon(t, func() error {

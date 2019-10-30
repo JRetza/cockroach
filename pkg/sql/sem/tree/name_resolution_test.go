@@ -1,20 +1,17 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"testing"
@@ -23,68 +20,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
 
-func TestNormalizeTableName(t *testing.T) {
-	testCases := []struct {
-		in, out  string
-		expanded string
-		err      string
-	}{
-		{`a`, `a`, `""."".a`, ``},
-		{`a.b`, `a.b`, `"".a.b`, ``},
-		{`a.b.c`, `a.b.c`, `a.b.c`, ``},
-		{`a.b.c.d`, ``, ``, `syntax error at or near "\."`},
-		{`a.""`, ``, ``, `invalid table name: a\.""`},
-		{`a.b.""`, ``, ``, `invalid table name: a\.b\.""`},
-		{`a.b.c.""`, ``, ``, `syntax error at or near "\."`},
-		{`a."".c`, ``, ``, `invalid table name: a\.""\.c`},
-
-		// CockroachDB extension: empty catalog name.
-		{`"".b.c`, `"".b.c`, `"".b.c`, ``},
-
-		// Check keywords: disallowed in first position, ok afterwards.
-		{`user.x.y`, ``, ``, `syntax error`},
-		{`"user".x.y`, `"user".x.y`, `"user".x.y`, ``},
-		{`x.user.y`, `x."user".y`, `x."user".y`, ``},
-		{`x.user`, `x."user"`, `"".x."user"`, ``},
-
-		{`foo@bar`, ``, ``, `syntax error at or near "@"`},
-		{`test.*`, ``, ``, `syntax error at or near "\*"`},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.in, func(t *testing.T) {
-			tn, err := func() (*tree.TableName, error) {
-				stmt, err := parser.ParseOne(fmt.Sprintf("ALTER TABLE %s RENAME TO x", tc.in))
-				if err != nil {
-					return nil, err
-				}
-				tn, err := stmt.(*tree.RenameTable).Name.Normalize()
-				if err != nil {
-					return nil, err
-				}
-				return tn, nil
-			}()
-			if !testutils.IsError(err, tc.err) {
-				t.Fatalf("%s: expected %s, but found %v", tc.in, tc.err, err)
-			}
-			if tc.err != "" {
-				return
-			}
-			if out := tn.String(); tc.out != out {
-				t.Fatalf("%s: expected %s, but found %s", tc.in, tc.out, out)
-			}
-			tn.ExplicitSchema = true
-			tn.ExplicitCatalog = true
-			if out := tn.String(); tc.expanded != out {
-				t.Fatalf("%s: expected full %s, but found %s", tc.in, tc.expanded, out)
-			}
-		})
-	}
-}
-
 func TestClassifyTablePattern(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	testCases := []struct {
 		in, out  string
 		expanded string
@@ -93,10 +34,10 @@ func TestClassifyTablePattern(t *testing.T) {
 		{`a`, `a`, `""."".a`, ``},
 		{`a.b`, `a.b`, `"".a.b`, ``},
 		{`a.b.c`, `a.b.c`, `a.b.c`, ``},
-		{`a.b.c.d`, ``, ``, `syntax error at or near "\."`},
+		{`a.b.c.d`, ``, ``, `at or near "\.": syntax error`},
 		{`a.""`, ``, ``, `invalid table name: a\.""`},
 		{`a.b.""`, ``, ``, `invalid table name: a\.b\.""`},
-		{`a.b.c.""`, ``, ``, `syntax error at or near "\."`},
+		{`a.b.c.""`, ``, ``, `at or near "\.": syntax error`},
 		{`a."".c`, ``, ``, `invalid table name: a\.""\.c`},
 		// CockroachDB extension: empty catalog name.
 		{`"".b.c`, `"".b.c`, `"".b.c`, ``},
@@ -110,13 +51,13 @@ func TestClassifyTablePattern(t *testing.T) {
 		{`*`, `*`, `""."".*`, ``},
 		{`a.*`, `a.*`, `"".a.*`, ``},
 		{`a.b.*`, `a.b.*`, `a.b.*`, ``},
-		{`a.b.c.*`, ``, ``, `syntax error at or near "\."`},
-		{`a.b.*.c`, ``, ``, `syntax error at or near "\."`},
-		{`a.*.b`, ``, ``, `syntax error at or near "\."`},
-		{`*.b`, ``, ``, `syntax error at or near "\."`},
+		{`a.b.c.*`, ``, ``, `at or near "\.": syntax error`},
+		{`a.b.*.c`, ``, ``, `at or near "\.": syntax error`},
+		{`a.*.b`, ``, ``, `at or near "\.": syntax error`},
+		{`*.b`, ``, ``, `at or near "\.": syntax error`},
 		{`"".*`, ``, ``, `invalid table name: "".\*`},
 		{`a."".*`, ``, ``, `invalid table name: a\.""\.\*`},
-		{`a.b."".*`, ``, ``, `syntax error at or near "\."`},
+		{`a.b."".*`, ``, ``, `invalid table name: a.b.""`},
 		// CockroachDB extension: empty catalog name.
 		{`"".b.*`, `"".b.*`, `"".b.*`, ``},
 
@@ -125,7 +66,7 @@ func TestClassifyTablePattern(t *testing.T) {
 		{`"user".x.*`, `"user".x.*`, `"user".x.*`, ``},
 		{`x.user.*`, `x."user".*`, `x."user".*`, ``},
 
-		{`foo@bar`, ``, ``, `syntax error at or near "@"`},
+		{`foo@bar`, ``, ``, `at or near "@": syntax error`},
 	}
 
 	for _, tc := range testCases {
@@ -135,7 +76,7 @@ func TestClassifyTablePattern(t *testing.T) {
 				if err != nil {
 					return nil, err
 				}
-				tp, err := stmt.(*tree.Grant).Targets.Tables[0].NormalizeTablePattern()
+				tp, err := stmt.AST.(*tree.Grant).Targets.Tables[0].NormalizeTablePattern()
 				if err != nil {
 					return nil, err
 				}
@@ -169,6 +110,7 @@ func TestClassifyTablePattern(t *testing.T) {
 }
 
 func TestClassifyColumnName(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	testCases := []struct {
 		in, out string
 		err     string
@@ -177,12 +119,12 @@ func TestClassifyColumnName(t *testing.T) {
 		{`a.b`, `a.b`, ``},
 		{`a.b.c`, `a.b.c`, ``},
 		{`a.b.c.d`, `a.b.c.d`, ``},
-		{`a.b.c.d.e`, ``, `syntax error at or near "\."`},
+		{`a.b.c.d.e`, ``, `at or near "\.": syntax error`},
 		{`""`, ``, `invalid column name: ""`},
 		{`a.""`, ``, `invalid column name: a\.""`},
 		{`a.b.""`, ``, `invalid column name: a\.b\.""`},
 		{`a.b.c.""`, ``, `invalid column name: a\.b\.c\.""`},
-		{`a.b.c.d.""`, ``, `syntax error at or near "\."`},
+		{`a.b.c.d.""`, ``, `at or near "\.": syntax error`},
 		{`"".a`, ``, `invalid column name: ""\.a`},
 		{`"".a.b`, ``, `invalid column name: ""\.a\.b`},
 		// CockroachDB extension: empty catalog name.
@@ -201,14 +143,14 @@ func TestClassifyColumnName(t *testing.T) {
 		{`a.*`, `a.*`, ``},
 		{`a.b.*`, `a.b.*`, ``},
 		{`a.b.c.*`, `a.b.c.*`, ``},
-		{`a.b.c.d.*`, ``, `syntax error at or near "\."`},
-		{`a.b.*.c`, ``, `syntax error at or near "\."`},
-		{`a.*.b`, ``, `syntax error at or near "\."`},
-		{`*.b`, ``, `syntax error at or near "\."`},
+		{`a.b.c.d.*`, ``, `at or near "\.": syntax error`},
+		{`a.b.*.c`, ``, `at or near "\.": syntax error`},
+		{`a.*.b`, ``, `at or near "\.": syntax error`},
+		{`*.b`, ``, `at or near "\.": syntax error`},
 		{`"".*`, ``, `invalid column name: "".\*`},
 		{`a."".*`, ``, `invalid column name: a\.""\.\*`},
 		{`a.b."".*`, ``, `invalid column name: a\.b\.""\.\*`},
-		{`a.b.c."".*`, ``, `syntax error at or near "\."`},
+		{`a.b.c."".*`, ``, `at or near "\.": syntax error`},
 
 		{`"".a.*`, ``, `invalid column name: ""\.a.*`},
 		// CockroachDB extension: empty catalog name.
@@ -221,7 +163,7 @@ func TestClassifyColumnName(t *testing.T) {
 		{`"user".x.*`, `"user".x.*`, ``},
 		{`x.user.*`, `x.user.*`, ``},
 
-		{`foo@bar`, ``, `syntax error at or near "@"`},
+		{`foo@bar`, ``, `at or near "@": syntax error`},
 	}
 
 	for _, tc := range testCases {
@@ -231,7 +173,7 @@ func TestClassifyColumnName(t *testing.T) {
 				if err != nil {
 					return nil, err
 				}
-				v := stmt.(*tree.Select).Select.(*tree.SelectClause).Exprs[0].Expr.(tree.VarName)
+				v := stmt.AST.(*tree.Select).Select.(*tree.SelectClause).Exprs[0].Expr.(tree.VarName)
 				return v.NormalizeVarName()
 			}()
 			if !testutils.IsError(err, tc.err) {
@@ -257,10 +199,10 @@ func TestClassifyColumnName(t *testing.T) {
 // fakeSource represents a fake column resolution environment for tests.
 type fakeSource struct {
 	t           *testing.T
-	knownTables knownTableList
+	knownTables []knownTable
 }
 
-type knownTableList []struct {
+type knownTable struct {
 	srcName tree.TableName
 	columns []tree.Name
 }
@@ -269,7 +211,7 @@ type colsRes tree.NameList
 
 func (c colsRes) ColumnSourceMeta() {}
 
-// FindSourceMatchingName implements the ColumnItemResolver interface.
+// FindSourceMatchingName is part of the ColumnItemResolver interface.
 func (f *fakeSource) FindSourceMatchingName(
 	_ context.Context, tn tree.TableName,
 ) (
@@ -300,7 +242,7 @@ func (f *fakeSource) FindSourceMatchingName(
 			}
 		}
 		if found {
-			return tree.MoreThanOne, nil, nil, fmt.Errorf("ambiguous table name: %s", &tn)
+			return tree.MoreThanOne, nil, nil, fmt.Errorf("ambiguous source name: %q", &tn)
 		}
 		found = true
 		prefix = &t.srcName
@@ -312,7 +254,7 @@ func (f *fakeSource) FindSourceMatchingName(
 	return tree.ExactlyOne, prefix, columns, nil
 }
 
-// FindSourceProvidingColumn implements the ColumnItemResolver interface.
+// FindSourceProvidingColumn is part of the ColumnItemResolver interface.
 func (f *fakeSource) FindSourceProvidingColumn(
 	_ context.Context, col tree.Name,
 ) (prefix *tree.TableName, srcMeta tree.ColumnSourceMeta, colHint int, err error) {
@@ -329,7 +271,7 @@ func (f *fakeSource) FindSourceProvidingColumn(
 				continue
 			}
 			if found {
-				return nil, nil, -1, fmt.Errorf("ambiguous column name: %s", &col)
+				return nil, nil, -1, f.ambiguousColumnErr(col)
 			}
 			found = true
 			colHint = c
@@ -339,16 +281,31 @@ func (f *fakeSource) FindSourceProvidingColumn(
 		}
 	}
 	if !found {
-		return nil, nil, -1, fmt.Errorf("unknown column name: %s", &col)
+		return nil, nil, -1, fmt.Errorf("column %q does not exist", &col)
 	}
 	return prefix, columns, colHint, nil
+}
+
+func (f *fakeSource) ambiguousColumnErr(col tree.Name) error {
+	var candidates bytes.Buffer
+	sep := ""
+	for i := range f.knownTables {
+		t := &f.knownTables[i]
+		for _, cn := range t.columns {
+			if cn == col {
+				fmt.Fprintf(&candidates, "%s%s.%s", sep, tree.ErrString(&t.srcName), cn)
+				sep = ", "
+			}
+		}
+	}
+	return fmt.Errorf("column reference %q is ambiguous (candidates: %s)", &col, candidates.String())
 }
 
 type colRes string
 
 func (c colRes) ColumnResolutionResult() {}
 
-// Resolve implements the ColumnItemResolver interface.
+// Resolve is part of the ColumnItemResolver interface.
 func (f *fakeSource) Resolve(
 	_ context.Context,
 	prefix *tree.TableName,
@@ -367,166 +324,63 @@ func (f *fakeSource) Resolve(
 		if columns[colHint] != col {
 			return nil, fmt.Errorf("programming error: invalid colHint %d", colHint)
 		}
-		return colRes(fmt.Sprintf("%s.%s(%d)", prefix, col, colHint)), nil
+		return colRes(fmt.Sprintf("%s.%s", prefix, col)), nil
 	}
-	for c, cn := range columns {
+	for _, cn := range columns {
 		if col == cn {
 			// Resolution succeeded.
-			return colRes(fmt.Sprintf("%s.%s(%d)", prefix, col, c)), nil
+			return colRes(fmt.Sprintf("%s.%s", prefix, col)), nil
 		}
 	}
 	return nil, fmt.Errorf("unknown column name: %s", &col)
 }
 
-func newFakeSource() *fakeSource {
-	return &fakeSource{
-		knownTables: knownTableList{
-			{tree.MakeTableNameWithSchema("", "crdb_internal", "tables"), []tree.Name{"table_name"}},
-			{tree.MakeTableName("db1", "foo"), []tree.Name{"x"}},
-			{tree.MakeTableName("db2", "foo"), []tree.Name{"x"}},
-			{tree.MakeUnqualifiedTableName("bar"), []tree.Name{"x"}},
-			{tree.MakeTableName("db1", "kv"), []tree.Name{"k", "v"}},
-		},
+var _ sqlutils.ColumnItemResolverTester = &fakeSource{}
+
+// GetColumnItemResolver is part of the sqlutils.ColumnItemResolverTester
+// interface.
+func (f *fakeSource) GetColumnItemResolver() tree.ColumnItemResolver {
+	return f
+}
+
+// AddTable is part of the sqlutils.ColumnItemResolverTester interface.
+func (f *fakeSource) AddTable(tabName tree.TableName, colNames []tree.Name) {
+	f.knownTables = append(f.knownTables, knownTable{srcName: tabName, columns: colNames})
+}
+
+// ResolveQualifiedStarTestResults is part of the
+// sqlutils.ColumnItemResolverTester interface.
+func (f *fakeSource) ResolveQualifiedStarTestResults(
+	srcName *tree.TableName, srcMeta tree.ColumnSourceMeta,
+) (string, string, error) {
+	cs, ok := srcMeta.(colsRes)
+	if !ok {
+		return "", "", fmt.Errorf("fake resolver did not return colsRes, found %T instead", srcMeta)
 	}
+	nl := tree.NameList(cs)
+	return srcName.String(), nl.String(), nil
+}
+
+// ResolveColumnItemTestResults is part of the
+// sqlutils.ColumnItemResolverTester interface.
+func (f *fakeSource) ResolveColumnItemTestResults(res tree.ColumnResolutionResult) (string, error) {
+	c, ok := res.(colRes)
+	if !ok {
+		return "", fmt.Errorf("fake resolver did not return colRes, found %T instead", res)
+	}
+	return string(c), nil
 }
 
 func TestResolveQualifiedStar(t *testing.T) {
-	testCases := []struct {
-		in    string
-		tnout string
-		csout string
-		err   string
-	}{
-		{`a.*`, ``, ``, `no data source matches pattern: a.*`},
-		{`foo.*`, ``, ``, `ambiguous table name: foo`},
-		{`db1.public.foo.*`, `db1.public.foo`, `x`, ``},
-		{`db1.foo.*`, `db1.public.foo`, `x`, ``},
-		{`dbx.foo.*`, ``, ``, `no data source matches pattern: dbx.foo.*`},
-		{`kv.*`, `db1.public.kv`, `k, v`, ``},
-	}
-	fakeFrom := newFakeSource()
-	for _, tc := range testCases {
-		t.Run(tc.in, func(t *testing.T) {
-			fakeFrom.t = t
-			tnout, csout, err := func() (string, string, error) {
-				stmt, err := parser.ParseOne(fmt.Sprintf("SELECT %s", tc.in))
-				if err != nil {
-					return "", "", err
-				}
-				v := stmt.(*tree.Select).Select.(*tree.SelectClause).Exprs[0].Expr.(tree.VarName)
-				c, err := v.NormalizeVarName()
-				if err != nil {
-					return "", "", err
-				}
-				acs, ok := c.(*tree.AllColumnsSelector)
-				if !ok {
-					return "", "", fmt.Errorf("var name %s (%T) did not resolve to AllColumnsSelector, found %T instead",
-						v, v, c)
-				}
-				tn, res, err := acs.Resolve(context.Background(), fakeFrom)
-				if err != nil {
-					return "", "", err
-				}
-				cs, ok := res.(colsRes)
-				if !ok {
-					return "", "", fmt.Errorf("fake resolver did not return colsRes, found %T instead", res)
-				}
-				nl := tree.NameList(cs)
-				return tn.String(), nl.String(), nil
-			}()
-			if !testutils.IsError(err, tc.err) {
-				t.Fatalf("%s: expected %s, but found %v", tc.in, tc.err, err)
-			}
-			if tc.err != "" {
-				return
-			}
-
-			if tc.tnout != tnout {
-				t.Fatalf("%s: expected tn %s, but found %s", tc.in, tc.tnout, tnout)
-			}
-			if tc.csout != csout {
-				t.Fatalf("%s: expected cs %s, but found %s", tc.in, tc.csout, csout)
-			}
-		})
-	}
+	defer leaktest.AfterTest(t)()
+	f := &fakeSource{t: t}
+	sqlutils.RunResolveQualifiedStarTest(t, f)
 }
 
 func TestResolveColumnItem(t *testing.T) {
-	testCases := []struct {
-		in  string
-		out string
-		err string
-	}{
-		{`a`, ``, `unknown column name`},
-		{`x`, ``, `ambiguous column name`},
-		{`k`, `db1.public.kv.k(0)`, ``},
-		{`v`, `db1.public.kv.v(1)`, ``},
-		{`table_name`, `"".crdb_internal.tables.table_name(0)`, ``},
-
-		{`blix.x`, ``, `no data source matches prefix: blix`},
-		{`"".x`, ``, `invalid column name: ""\.x`},
-		{`foo.x`, ``, `ambiguous table name`},
-		{`kv.k`, `db1.public.kv.k(0)`, ``},
-		{`bar.x`, `bar.x(0)`, ``},
-		{`tables.table_name`, `"".crdb_internal.tables.table_name(0)`, ``},
-
-		{`a.b.x`, ``, `no data source matches prefix: a\.b`},
-		{`crdb_internal.tables.table_name`, `"".crdb_internal.tables.table_name(0)`, ``},
-		{`public.foo.x`, ``, `ambiguous table name`},
-		{`public.kv.k`, `db1.public.kv.k(0)`, ``},
-
-		// CockroachDB extension: d.t.x -> d.public.t.x
-		{`db1.foo.x`, `db1.public.foo.x(0)`, ``},
-		{`db2.foo.x`, `db2.public.foo.x(0)`, ``},
-
-		{`a.b.c.x`, ``, `no data source matches prefix: a\.b\.c`},
-		{`"".crdb_internal.tables.table_name`, `"".crdb_internal.tables.table_name(0)`, ``},
-		{`db1.public.foo.x`, `db1.public.foo.x(0)`, ``},
-		{`db2.public.foo.x`, `db2.public.foo.x(0)`, ``},
-		{`db1.public.kv.v`, `db1.public.kv.v(1)`, ``},
-	}
-
-	fakeFrom := newFakeSource()
-	for _, tc := range testCases {
-		t.Run(tc.in, func(t *testing.T) {
-			fakeFrom.t = t
-			out, err := func() (string, error) {
-				stmt, err := parser.ParseOne(fmt.Sprintf("SELECT %s", tc.in))
-				if err != nil {
-					return "", err
-				}
-				v := stmt.(*tree.Select).Select.(*tree.SelectClause).Exprs[0].Expr.(tree.VarName)
-				c, err := v.NormalizeVarName()
-				if err != nil {
-					return "", err
-				}
-				ci, ok := c.(*tree.ColumnItem)
-				if !ok {
-					return "", fmt.Errorf("var name %s (%T) did not resolve to ColumnItem, found %T instead",
-						v, v, c)
-				}
-				res, err := ci.Resolve(context.Background(), fakeFrom)
-				if err != nil {
-					return "", err
-				}
-				s, ok := res.(colRes)
-				if !ok {
-					return "", fmt.Errorf("fake resolver did not return colRes, found %T instead", res)
-				}
-				return string(s), nil
-			}()
-			if !testutils.IsError(err, tc.err) {
-				t.Fatalf("%s: expected %s, but found %v", tc.in, tc.err, err)
-			}
-			if tc.err != "" {
-				return
-			}
-
-			if tc.out != out {
-				t.Fatalf("%s: expected %s, but found %s", tc.in, tc.out, out)
-			}
-		})
-	}
+	defer leaktest.AfterTest(t)()
+	f := &fakeSource{t: t}
+	sqlutils.RunResolveColumnItemTest(t, f)
 }
 
 // fakeMetadata represents a fake table resolution environment for tests.
@@ -595,7 +449,7 @@ func (fakeResResult) NameResolutionResult() {}
 
 // LookupObject implements the TableNameResolver interface.
 func (f *fakeMetadata) LookupObject(
-	_ context.Context, dbName, scName, tbName string,
+	_ context.Context, lookupFlags tree.ObjectLookupFlags, dbName, scName, tbName string,
 ) (found bool, obMeta tree.NameResolutionResult, err error) {
 	defer func() {
 		f.t.Logf("LookupObject(%s, %s, %s) -> found %v meta %v err %v",
@@ -671,6 +525,7 @@ func newFakeMetadata() *fakeMetadata {
 }
 
 func TestResolveTablePatternOrName(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	type spath = sessiondata.SearchPath
 
 	var mpath = func(args ...string) spath { return sessiondata.MakeSearchPath(args) }
@@ -849,7 +704,7 @@ func TestResolveTablePatternOrName(t *testing.T) {
 				if err != nil {
 					return nil, "", err
 				}
-				tp, err := stmt.(*tree.Grant).Targets.Tables[0].NormalizeTablePattern()
+				tp, err := stmt.AST.(*tree.Grant).Targets.Tables[0].NormalizeTablePattern()
 				if err != nil {
 					return nil, "", err
 				}
@@ -866,7 +721,8 @@ func TestResolveTablePatternOrName(t *testing.T) {
 					ctPrefix = tpv.Catalog()
 				case *tree.TableName:
 					if tc.expected {
-						found, obMeta, err = tpv.ResolveExisting(ctx, fakeResolver, tc.curDb, tc.searchPath)
+						flags := tree.ObjectLookupFlags{}
+						found, obMeta, err = tpv.ResolveExisting(ctx, fakeResolver, flags, tc.curDb, tc.searchPath)
 					} else {
 						found, scMeta, err = tpv.ResolveTarget(ctx, fakeResolver, tc.curDb, tc.searchPath)
 					}

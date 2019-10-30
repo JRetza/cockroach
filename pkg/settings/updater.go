@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package settings
 
@@ -38,7 +34,7 @@ func EncodeInt(i int64) string {
 
 // EncodeFloat encodes a bool in the format parseRaw expects.
 func EncodeFloat(f float64) string {
-	return strconv.FormatFloat(f, 'E', -1, 64)
+	return strconv.FormatFloat(f, 'G', -1, 64)
 }
 
 type updater struct {
@@ -101,7 +97,7 @@ func (u updater) Set(key, rawValue string, vt string) error {
 		}
 		setting.set(u.sv, b)
 		return nil
-	case numericSetting:
+	case numericSetting: // includes *EnumSetting
 		i, err := strconv.Atoi(rawValue)
 		if err != nil {
 			return err
@@ -119,12 +115,6 @@ func (u updater) Set(key, rawValue string, vt string) error {
 			return err
 		}
 		return setting.set(u.sv, d)
-	case *EnumSetting:
-		i, err := strconv.Atoi(rawValue)
-		if err != nil {
-			return err
-		}
-		return setting.set(u.sv, int64(i))
 	case *StateMachineSetting:
 		return setting.set(u.sv, []byte(rawValue))
 	}

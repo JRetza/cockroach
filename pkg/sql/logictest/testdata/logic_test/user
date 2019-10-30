@@ -1,9 +1,9 @@
-# LogicTest: default
+# LogicTest: local
 
 query T colnames
 SHOW USERS
 ----
-username
+user_name
 root
 testuser
 
@@ -13,7 +13,7 @@ CREATE USER user1
 query T colnames
 SHOW USERS
 ----
-username
+user_name
 root
 testuser
 user1
@@ -54,7 +54,7 @@ CREATE USER foo☂
 statement error pq: username "-foo" invalid; usernames are case insensitive, must start with a letter or underscore, may contain letters, digits, dashes, or underscores, and must not exceed 63 characters
 CREATE USER "-foo"
 
-statement error pq: syntax error at or near "-"
+statement error at or near "-": syntax error
 CREATE USER foo-bar
 
 statement ok
@@ -77,7 +77,7 @@ EXECUTE chpw('blix', 'blah')
 query T colnames
 SHOW USERS
 ----
-username
+user_name
 foo
 foo-bar
 root
@@ -111,7 +111,23 @@ SELECT current_user, session_user, user
 ----
 testuser  testuser  testuser
 
+statement ok
+SET SESSION AUTHORIZATION DEFAULT
+
+query T
+SHOW session_user
+----
+testuser
+
 user root
 
 statement error pq: user root cannot use password authentication
 ALTER USER root WITH PASSWORD 'foo'
+
+statement ok
+SET SESSION AUTHORIZATION DEFAULT
+
+query T
+SHOW session_user
+----
+root

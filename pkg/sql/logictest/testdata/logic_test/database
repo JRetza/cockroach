@@ -1,4 +1,4 @@
-# LogicTest: default opt
+# LogicTest: local
 
 statement ok
 CREATE DATABASE a
@@ -15,17 +15,30 @@ CREATE DATABASE ""
 query T colnames
 SHOW DATABASES
 ----
-Database
+database_name
 a
 defaultdb
 postgres
 system
 test
 
+statement ok
+COMMENT ON DATABASE a IS 'A'
+
+query TT colnames
+SHOW DATABASES WITH COMMENT
+----
+database_name  comment
+a              A
+defaultdb      NULL
+postgres       NULL
+system         NULL
+test           NULL
+
 query T colnames
 SHOW SCHEMAS FROM a
 ----
-Schema
+schema_name
 crdb_internal
 information_schema
 pg_catalog
@@ -133,7 +146,7 @@ DROP DATABASE ""
 query T colnames
 SHOW DATABASES
 ----
-Database
+database_name
 a
 c
 defaultdb
@@ -156,7 +169,7 @@ SELECT * FROM b.a
 
 user testuser
 
-statement error only superusers are allowed to CREATE DATABASE
+statement error only users with the admin role are allowed to CREATE DATABASE
 CREATE DATABASE privs
 
 user root

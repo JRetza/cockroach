@@ -10,6 +10,7 @@ package backupccl_test
 
 import (
 	"bytes"
+	gosql "database/sql"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -19,8 +20,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/importccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl/sampledataccl"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/cockroach/pkg/workload/bank"
+	"github.com/cockroachdb/cockroach/pkg/workload/workloadsql"
 )
 
 func bankBuf(numAccounts int) *bytes.Buffer {
@@ -28,8 +29,8 @@ func bankBuf(numAccounts int) *bytes.Buffer {
 	var buf bytes.Buffer
 	fmt.Fprintf(&buf, "CREATE TABLE %s %s;\n", bankData.Name, bankData.Schema)
 	for rowIdx := 0; rowIdx < bankData.InitialRows.NumBatches; rowIdx++ {
-		for _, row := range bankData.InitialRows.Batch(rowIdx) {
-			rowBatch := strings.Join(workload.StringTuple(row), `,`)
+		for _, row := range bankData.InitialRows.BatchRows(rowIdx) {
+			rowBatch := strings.Join(workloadsql.StringTuple(row), `,`)
 			fmt.Fprintf(&buf, "INSERT INTO %s VALUES (%s);\n", bankData.Name, rowBatch)
 		}
 	}
@@ -37,6 +38,9 @@ func bankBuf(numAccounts int) *bytes.Buffer {
 }
 
 func BenchmarkClusterBackup(b *testing.B) {
+	if testing.Short() {
+		b.Skip("TODO: fix benchmark")
+	}
 	// NB: This benchmark takes liberties in how b.N is used compared to the go
 	// documentation's description. We're getting useful information out of it,
 	// but this is not a pattern to cargo-cult.
@@ -91,6 +95,9 @@ func BenchmarkClusterRestore(b *testing.B) {
 }
 
 func BenchmarkLoadRestore(b *testing.B) {
+	if testing.Short() {
+		b.Skip("TODO: fix benchmark")
+	}
 	// NB: This benchmark takes liberties in how b.N is used compared to the go
 	// documentation's description. We're getting useful information out of it,
 	// but this is not a pattern to cargo-cult.
@@ -103,7 +110,7 @@ func BenchmarkLoadRestore(b *testing.B) {
 	b.SetBytes(int64(buf.Len() / b.N))
 	ts := hlc.Timestamp{WallTime: hlc.UnixNano()}
 	b.ResetTimer()
-	if _, err := importccl.Load(ctx, sqlDB.DB, buf, "data", dir, ts, 0, dir); err != nil {
+	if _, err := importccl.Load(ctx, sqlDB.DB.(*gosql.DB), buf, "data", dir, ts, 0, dir); err != nil {
 		b.Fatalf("%+v", err)
 	}
 	sqlDB.Exec(b, fmt.Sprintf(`RESTORE data.* FROM '%s'`, dir))
@@ -139,6 +146,9 @@ func BenchmarkLoadSQL(b *testing.B) {
 }
 
 func BenchmarkClusterEmptyIncrementalBackup(b *testing.B) {
+	if testing.Short() {
+		b.Skip("TODO: fix benchmark")
+	}
 	const numStatements = 100000
 
 	_, _, sqlDB, _, cleanupFn := backupRestoreTestSetup(b, multiNode, 0, initNone)

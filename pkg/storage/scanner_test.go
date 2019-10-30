@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -19,9 +15,6 @@ import (
 	"fmt"
 	"testing"
 	"time"
-
-	"github.com/google/btree"
-	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
@@ -33,6 +26,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/google/btree"
+	"github.com/pkg/errors"
 )
 
 func makeAmbCtx() log.AmbientContext {
@@ -65,10 +60,7 @@ func newTestRangeSet(count int, t *testing.T) *testRangeSet {
 			KeyCount:  1,
 			LiveCount: 1,
 		}
-
-		if err := repl.setDesc(desc); err != nil {
-			t.Fatal(err)
-		}
+		repl.mu.state.Desc = desc
 		if exRngItem := rs.replicasByKey.ReplaceOrInsert(repl); exRngItem != nil {
 			t.Fatalf("failed to insert range %s", repl)
 		}
@@ -148,7 +140,10 @@ func (tq *testQueue) Start(stopper *stop.Stopper) {
 	})
 }
 
-func (tq *testQueue) MaybeAdd(repl *Replica, now hlc.Timestamp) {
+// NB: MaybeAddAsync on a testQueue is actually synchronous.
+func (tq *testQueue) MaybeAddAsync(ctx context.Context, replI replicaInQueue, now hlc.Timestamp) {
+	repl := replI.(*Replica)
+
 	tq.Lock()
 	defer tq.Unlock()
 	if index := tq.indexOf(repl.RangeID); index == -1 {
@@ -162,6 +157,14 @@ func (tq *testQueue) MaybeRemove(rangeID roachpb.RangeID) {
 	if index := tq.indexOf(rangeID); index != -1 {
 		tq.ranges = append(tq.ranges[:index], tq.ranges[index+1:]...)
 	}
+}
+
+func (tq *testQueue) Name() string {
+	return "testQueue"
+}
+
+func (tq *testQueue) NeedsLease() bool {
+	return false
 }
 
 func (tq *testQueue) count() int {
@@ -197,7 +200,7 @@ func TestScannerAddToQueues(t *testing.T) {
 	q2.setDisabled(true)
 	mc := hlc.NewManualClock(123)
 	clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
-	s := newReplicaScanner(makeAmbCtx(), clock, 1*time.Millisecond, 0, ranges)
+	s := newReplicaScanner(makeAmbCtx(), clock, 1*time.Millisecond, 0, 0, ranges)
 	s.AddQueues(q1, q2)
 	stopper := stop.NewStopper()
 
@@ -249,7 +252,7 @@ func TestScannerTiming(t *testing.T) {
 			q := &testQueue{}
 			mc := hlc.NewManualClock(123)
 			clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
-			s := newReplicaScanner(makeAmbCtx(), clock, duration, 0, ranges)
+			s := newReplicaScanner(makeAmbCtx(), clock, duration, 0, 0, ranges)
 			s.AddQueues(q)
 			stopper := stop.NewStopper()
 			s.Start(stopper)
@@ -287,19 +290,37 @@ func TestScannerPaceInterval(t *testing.T) {
 	for _, duration := range durations {
 		startTime := timeutil.Now()
 		ranges := newTestRangeSet(count, t)
-		s := newReplicaScanner(makeAmbCtx(), nil, duration, 0, ranges)
+		s := newReplicaScanner(makeAmbCtx(), nil, duration, 0, 0, ranges)
 		interval := s.paceInterval(startTime, startTime)
 		logErrorWhenNotCloseTo(duration/count, interval)
 		// The range set is empty
 		ranges = newTestRangeSet(0, t)
-		s = newReplicaScanner(makeAmbCtx(), nil, duration, 0, ranges)
+		s = newReplicaScanner(makeAmbCtx(), nil, duration, 0, 0, ranges)
 		interval = s.paceInterval(startTime, startTime)
 		logErrorWhenNotCloseTo(duration, interval)
 		ranges = newTestRangeSet(count, t)
-		s = newReplicaScanner(makeAmbCtx(), nil, duration, 0, ranges)
+		s = newReplicaScanner(makeAmbCtx(), nil, duration, 0, 0, ranges)
 		// Move the present to duration time into the future
 		interval = s.paceInterval(startTime, startTime.Add(duration))
 		logErrorWhenNotCloseTo(0, interval)
+	}
+}
+
+// TestScannerMinMaxIdleTime verifies that the pace interval will not
+// be less than the specified min idle time or greater than the
+// specified max idle time.
+func TestScannerMinMaxIdleTime(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	const targetInterval = 100 * time.Millisecond
+	const minIdleTime = 10 * time.Millisecond
+	const maxIdleTime = 15 * time.Millisecond
+	for count := range []int{1, 10, 20, 100} {
+		startTime := timeutil.Now()
+		ranges := newTestRangeSet(count, t)
+		s := newReplicaScanner(makeAmbCtx(), nil, targetInterval, minIdleTime, maxIdleTime, ranges)
+		if interval := s.paceInterval(startTime, startTime); interval < minIdleTime || interval > maxIdleTime {
+			t.Errorf("expected interval %s <= %s <= %s", minIdleTime, interval, maxIdleTime)
+		}
 	}
 }
 
@@ -312,7 +333,7 @@ func TestScannerDisabled(t *testing.T) {
 	q := &testQueue{}
 	mc := hlc.NewManualClock(123)
 	clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
-	s := newReplicaScanner(makeAmbCtx(), clock, 1*time.Millisecond, 0, ranges)
+	s := newReplicaScanner(makeAmbCtx(), clock, 1*time.Millisecond, 0, 0, ranges)
 	s.AddQueues(q)
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.TODO())
@@ -362,7 +383,7 @@ func TestScannerDisabled(t *testing.T) {
 func TestScannerDisabledWithZeroInterval(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ranges := newTestRangeSet(1, t)
-	s := newReplicaScanner(makeAmbCtx(), nil, 0*time.Millisecond, 0, ranges)
+	s := newReplicaScanner(makeAmbCtx(), nil, 0*time.Millisecond, 0, 0, ranges)
 	if !s.GetDisabled() {
 		t.Errorf("expected scanner to be disabled")
 	}
@@ -375,7 +396,7 @@ func TestScannerEmptyRangeSet(t *testing.T) {
 	q := &testQueue{}
 	mc := hlc.NewManualClock(123)
 	clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
-	s := newReplicaScanner(makeAmbCtx(), clock, time.Hour, 0, ranges)
+	s := newReplicaScanner(makeAmbCtx(), clock, time.Hour, 0, 0, ranges)
 	s.AddQueues(q)
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.TODO())

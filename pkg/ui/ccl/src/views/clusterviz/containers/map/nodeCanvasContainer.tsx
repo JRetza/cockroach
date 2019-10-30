@@ -1,8 +1,8 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Cockroach Community Licence (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed as a CockroachDB Enterprise file under the Cockroach Community
+// License (the "License"); you may not use this file except in compliance with
+// the License. You may obtain a copy of the License at
 //
 //     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
 
@@ -30,7 +30,6 @@ import { CLUSTERVIZ_ROOT } from "src/routes/visualization";
 import { getLocality } from "src/util/localities";
 import Loading from "src/views/shared/components/loading";
 import { NodeCanvas } from "./nodeCanvas";
-import spinner from "assets/spinner.gif";
 
 type Liveness = cockroach.storage.Liveness;
 
@@ -42,6 +41,7 @@ interface NodeCanvasContainerProps {
   livenesses: { [id: string]: Liveness };
   dataExists: boolean;
   dataIsValid: boolean;
+  dataErrors: Error[];
   refreshNodes: typeof refreshNodes;
   refreshLiveness: typeof refreshLiveness;
   refreshLocations: typeof refreshLocations;
@@ -73,17 +73,17 @@ class NodeCanvasContainer extends React.Component<NodeCanvasContainerProps & Nod
     return (
       <Loading
         loading={!this.props.dataExists}
-        className="loading-image loading-image__spinner-left"
-        image={spinner}
-      >
-        <NodeCanvas
-          localityTree={currentLocality}
-          locationTree={this.props.locationTree}
-          tiers={this.props.tiers}
-          livenessStatuses={this.props.livenessStatuses}
-          livenesses={this.props.livenesses}
-        />
-      </Loading>
+        error={this.props.dataErrors}
+        render={() => (
+          <NodeCanvas
+            localityTree={currentLocality}
+            locationTree={this.props.locationTree}
+            tiers={this.props.tiers}
+            livenessStatuses={this.props.livenessStatuses}
+            livenesses={this.props.livenesses}
+          />
+        )}
+      />
     );
   }
 }
@@ -102,6 +102,13 @@ const selectDataIsValid = createSelector(
   (nodes, locations, liveness) => nodes.valid && locations.valid && liveness.valid,
 );
 
+const dataErrors = createSelector(
+  selectNodeRequestStatus,
+  selectLocationsRequestStatus,
+  selectLivenessRequestStatus,
+  (nodes, locations, liveness) => [nodes.lastError, locations.lastError, liveness.lastError],
+);
+
 export default connect(
   (state: AdminUIState, _ownProps: NodeCanvasContainerOwnProps) => ({
     nodesSummary: nodesSummarySelector(state),
@@ -111,6 +118,7 @@ export default connect(
     livenesses: livenessByNodeIDSelector(state),
     dataIsValid: selectDataIsValid(state),
     dataExists: selectDataExists(state),
+    dataErrors: dataErrors(state),
   }),
   {
     refreshNodes,

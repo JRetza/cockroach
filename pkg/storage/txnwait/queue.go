@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package txnwait
 
@@ -24,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -35,6 +32,29 @@ import (
 
 const maxWaitForQueryTxn = 50 * time.Millisecond
 
+// TxnLivenessHeartbeatMultiplier specifies what multiple the transaction
+// liveness threshold should be of the transaction heartbeat internval.
+var TxnLivenessHeartbeatMultiplier = envutil.EnvOrDefaultInt(
+	"COCKROACH_TXN_LIVENESS_HEARTBEAT_MULTIPLIER", 5)
+
+// TxnLivenessThreshold is the maximum duration between transaction heartbeats
+// before the transaction is considered expired by Queue. It is exposed and
+// mutable to allow tests to override it.
+//
+// Use TestingOverrideTxnLivenessThreshold to override the value in tests.
+var TxnLivenessThreshold = time.Duration(TxnLivenessHeartbeatMultiplier) * base.DefaultTxnHeartbeatInterval
+
+// TestingOverrideTxnLivenessThreshold allows tests to override the transaction
+// liveness threshold. The function returns a closure that should be called to
+// reset the value.
+func TestingOverrideTxnLivenessThreshold(t time.Duration) func() {
+	old := TxnLivenessThreshold
+	TxnLivenessThreshold = t
+	return func() {
+		TxnLivenessThreshold = old
+	}
+}
+
 // ShouldPushImmediately returns whether the PushTxn request should
 // proceed without queueing. This is true for pushes which are neither
 // ABORT nor TIMESTAMP, but also for ABORT and TIMESTAMP pushes where
@@ -44,7 +64,7 @@ func ShouldPushImmediately(req *roachpb.PushTxnRequest) bool {
 		return true
 	}
 	p1, p2 := req.PusherTxn.Priority, req.PusheeTxn.Priority
-	if p1 > p2 && (p1 == roachpb.MaxTxnPriority || p2 == roachpb.MinTxnPriority) {
+	if p1 > p2 && (p1 == enginepb.MaxTxnPriority || p2 == enginepb.MinTxnPriority) {
 		return true
 	}
 	return false
@@ -54,13 +74,14 @@ func ShouldPushImmediately(req *roachpb.PushTxnRequest) bool {
 // fulfilled by the current transaction state. This may be true
 // for transactions with pushed timestamps.
 func isPushed(req *roachpb.PushTxnRequest, txn *roachpb.Transaction) bool {
-	return (txn.Status != roachpb.PENDING ||
-		(req.PushType == roachpb.PUSH_TIMESTAMP && req.PushTo.Less(txn.Timestamp)))
+	return (txn.Status.IsFinalized() ||
+		(req.PushType == roachpb.PUSH_TIMESTAMP && !txn.Timestamp.Less(req.PushTo)))
 }
 
-// TxnExpiration is the timestamp after which the transaction will be considered expired.
+// TxnExpiration computes the timestamp after which the transaction will be
+// considered expired.
 func TxnExpiration(txn *roachpb.Transaction) hlc.Timestamp {
-	return txn.LastActive().Add(2*base.DefaultHeartbeatInterval.Nanoseconds(), 0)
+	return txn.LastActive().Add(TxnLivenessThreshold.Nanoseconds(), 0)
 }
 
 // IsExpired is true if the given transaction is expired.
@@ -72,7 +93,7 @@ func IsExpired(now hlc.Timestamp, txn *roachpb.Transaction) bool {
 // copy of the supplied transaction. It is necessary to fully copy
 // each field in the transaction to avoid race conditions.
 func createPushTxnResponse(txn *roachpb.Transaction) *roachpb.PushTxnResponse {
-	return &roachpb.PushTxnResponse{PusheeTxn: txn.Clone()}
+	return &roachpb.PushTxnResponse{PusheeTxn: *txn}
 }
 
 // A waitingPush represents a PushTxn command that is waiting on the
@@ -89,11 +110,12 @@ type waitingPush struct {
 	}
 }
 
-// A waitingQuery represents a QueryTxn command that is waiting on
-// a target transaction to change status or acquire new dependencies.
-type waitingQuery struct {
-	req     *roachpb.QueryTxnRequest
+// A waitingQueries object represents one or more QueryTxn commands that are
+// waiting on the same target transaction to change status or acquire new
+// dependencies.
+type waitingQueries struct {
 	pending chan struct{}
+	count   int
 }
 
 // A pendingTxn represents a transaction waiting to be pushed by one
@@ -129,11 +151,21 @@ type StoreInterface interface {
 	Clock() *hlc.Clock
 	Stopper() *stop.Stopper
 	DB() *client.DB
+	GetTxnWaitKnobs() TestingKnobs
+	GetTxnWaitMetrics() *Metrics
 }
 
 // ReplicaInterface provides some parts of a Replica without incurring a dependency.
 type ReplicaInterface interface {
 	ContainsKey(roachpb.Key) bool
+}
+
+// TestingKnobs represents testing knobs for a Queue.
+type TestingKnobs struct {
+	// OnTxnWaitEnqueue is called when a would-be pusher joins a wait queue.
+	OnPusherBlocked func(ctx context.Context, push *roachpb.PushTxnRequest)
+	// OnTxnUpdate is called by Queue.UpdateTxn.
+	OnTxnUpdate func(ctx context.Context, txn *roachpb.Transaction)
 }
 
 // Queue enqueues PushTxn requests which are waiting on extant txns
@@ -154,7 +186,7 @@ type Queue struct {
 	mu    struct {
 		syncutil.Mutex
 		txns    map[uuid.UUID]*pendingTxn
-		queries map[uuid.UUID][]*waitingQuery
+		queries map[uuid.UUID]*waitingQueries
 	}
 }
 
@@ -175,7 +207,7 @@ func (q *Queue) Enable() {
 		q.mu.txns = map[uuid.UUID]*pendingTxn{}
 	}
 	if q.mu.queries == nil {
-		q.mu.queries = map[uuid.UUID][]*waitingQuery{}
+		q.mu.queries = map[uuid.UUID]*waitingQueries{}
 	}
 }
 
@@ -193,19 +225,24 @@ func (q *Queue) Clear(disable bool) {
 		}
 		pt.waitingPushes = nil
 	}
-	var queryWaiters []chan struct{}
-	for _, waitingQueries := range q.mu.queries {
-		for _, w := range waitingQueries {
-			queryWaiters = append(queryWaiters, w.pending)
-		}
+
+	queryWaiters := q.mu.queries
+	queryWaitersCount := 0
+	for _, waitingQueries := range queryWaiters {
+		queryWaitersCount += waitingQueries.count
 	}
+
+	metrics := q.store.GetTxnWaitMetrics()
+	metrics.PusheeWaiting.Dec(int64(len(q.mu.txns)))
+	metrics.PusherWaiting.Dec(int64(len(pushWaiters)))
+	metrics.QueryWaiting.Dec(int64(queryWaitersCount))
 
 	if log.V(1) {
 		log.Infof(
 			context.Background(),
 			"clearing %d push waiters and %d query waiters",
 			len(pushWaiters),
-			len(queryWaiters),
+			queryWaitersCount,
 		)
 	}
 
@@ -214,7 +251,7 @@ func (q *Queue) Clear(disable bool) {
 		q.mu.queries = nil
 	} else {
 		q.mu.txns = map[uuid.UUID]*pendingTxn{}
-		q.mu.queries = map[uuid.UUID][]*waitingQuery{}
+		q.mu.queries = map[uuid.UUID]*waitingQueries{}
 	}
 	q.mu.Unlock()
 
@@ -224,7 +261,7 @@ func (q *Queue) Clear(disable bool) {
 	}
 	// Close query waiters outside of the mutex lock.
 	for _, w := range queryWaiters {
-		close(w)
+		close(w.pending)
 	}
 }
 
@@ -250,6 +287,7 @@ func (q *Queue) Enqueue(txn *roachpb.Transaction) {
 	if pt, ok := q.mu.txns[txn.ID]; ok {
 		pt.txn.Store(txn)
 	} else {
+		q.store.GetTxnWaitMetrics().PusheeWaiting.Inc(1)
 		pt = &pendingTxn{}
 		pt.txn.Store(txn)
 		q.mu.txns[txn.ID] = pt
@@ -262,22 +300,18 @@ func (q *Queue) Enqueue(txn *roachpb.Transaction) {
 func (q *Queue) UpdateTxn(ctx context.Context, txn *roachpb.Transaction) {
 	txn.AssertInitialized(ctx)
 	q.mu.Lock()
+	if f := q.store.GetTxnWaitKnobs().OnTxnUpdate; f != nil {
+		f(ctx, txn)
+	}
 
-	if log.V(1) {
-		if count := len(q.mu.queries[txn.ID]); count > 0 {
-			log.Infof(ctx, "returning %d waiting queries for %s", count, txn.ID.Short())
-		}
-	}
-	for _, w := range q.mu.queries[txn.ID] {
-		close(w.pending)
-	}
-	delete(q.mu.queries, txn.ID)
+	q.releaseWaitingQueriesLocked(ctx, txn.ID)
 
 	if q.mu.txns == nil {
 		// Not enabled; do nothing.
 		q.mu.Unlock()
 		return
 	}
+
 	pending, ok := q.mu.txns[txn.ID]
 	if !ok {
 		q.mu.Unlock()
@@ -288,6 +322,9 @@ func (q *Queue) UpdateTxn(ctx context.Context, txn *roachpb.Transaction) {
 	delete(q.mu.txns, txn.ID)
 	pending.txn.Store(txn)
 	q.mu.Unlock()
+
+	q.store.GetTxnWaitMetrics().PusheeWaiting.Dec(1)
+	q.store.GetTxnWaitMetrics().PusherWaiting.Dec(int64(len(waitingPushes)))
 
 	if log.V(1) && len(waitingPushes) > 0 {
 		log.Infof(context.Background(), "updating %d push waiters for %s", len(waitingPushes), txn.ID.Short())
@@ -325,7 +362,7 @@ func (q *Queue) GetDependents(txnID uuid.UUID) []uuid.UUID {
 func (q *Queue) isTxnUpdated(pending *pendingTxn, req *roachpb.QueryTxnRequest) bool {
 	// First check whether txn status or priority has changed.
 	txn := pending.getTxn()
-	if txn.Status != roachpb.PENDING || txn.Priority > req.Txn.Priority {
+	if txn.Status.IsFinalized() || txn.Priority > req.Txn.Priority {
 		return true
 	}
 	// Next, see if there is any discrepancy in the set of known dependents.
@@ -341,20 +378,14 @@ func (q *Queue) isTxnUpdated(pending *pendingTxn, req *roachpb.QueryTxnRequest) 
 	return false
 }
 
-func (q *Queue) clearWaitingQueriesLocked(ctx context.Context, txnID uuid.UUID) {
-	waitingQueries := q.mu.queries[txnID]
-	if log.V(1) && len(waitingQueries) > 0 {
-		log.Infof(
-			ctx,
-			"proceeding with %d query waiters for %s",
-			len(waitingQueries),
-			txnID.Short(),
-		)
-	}
-	for _, w := range waitingQueries {
+func (q *Queue) releaseWaitingQueriesLocked(ctx context.Context, txnID uuid.UUID) {
+	if w, ok := q.mu.queries[txnID]; ok {
+		metrics := q.store.GetTxnWaitMetrics()
+		metrics.QueryWaiting.Dec(int64(w.count))
+		log.VEventf(ctx, 2, "releasing %d waiting queries for %s", w.count, txnID.Short())
 		close(w.pending)
+		delete(q.mu.queries, txnID)
 	}
-	delete(q.mu.queries, txnID)
 }
 
 // ErrDeadlock is a sentinel error returned when a cyclic dependency between
@@ -407,11 +438,14 @@ func (q *Queue) MaybeWaitForPush(
 		pending: make(chan *roachpb.Transaction, 1),
 	}
 	pending.waitingPushes = append(pending.waitingPushes, push)
+	if f := q.store.GetTxnWaitKnobs().OnPusherBlocked; f != nil {
+		f(ctx, req)
+	}
 	// Because we're adding another dependent on the pending
 	// transaction, send on the waiting queries' channel to
 	// indicate there is a new dependent and they should proceed
 	// to execute the QueryTxn command.
-	q.clearWaitingQueriesLocked(ctx, req.PusheeTxn.ID)
+	q.releaseWaitingQueriesLocked(ctx, req.PusheeTxn.ID)
 
 	if req.PusherTxn.ID != (uuid.UUID{}) {
 		log.VEventf(
@@ -433,7 +467,9 @@ func (q *Queue) MaybeWaitForPush(
 	var queryPusherCh <-chan *roachpb.Transaction // accepts updates to the pusher txn
 	var queryPusherErrCh <-chan *roachpb.Error    // accepts errors querying the pusher txn
 	var readyCh chan struct{}                     // signaled when pusher txn should be queried
-	if req.PusherTxn.ID != (uuid.UUID{}) {
+
+	// Query the pusher if it's a valid read-write transaction.
+	if req.PusherTxn.ID != uuid.Nil && req.PusherTxn.IsWriting() {
 		// Create a context which will be canceled once this call completes.
 		// This ensures that the goroutine created to query the pusher txn
 		// is properly cleaned up.
@@ -449,35 +485,53 @@ func (q *Queue) MaybeWaitForPush(
 			}
 		}()
 	}
-	var pusheeTxnTimer timeutil.Timer
-	defer pusheeTxnTimer.Stop()
 	pusherPriority := req.PusherTxn.Priority
 	pusheePriority := req.PusheeTxn.Priority
 
-	first := true
-	for {
-		// Set the timer to check for the pushee txn's expiration.
-		if !first {
-			expiration := TxnExpiration(pending.txn.Load().(*roachpb.Transaction)).GoTime()
-			now := q.store.Clock().Now().GoTime()
-			pusheeTxnTimer.Reset(expiration.Sub(now))
-		} else {
-			// The first time we want to check the pushee's txn record immediately:
-			// the pushee might be gone by the time the pusher gets here if it cleaned
-			// itself up after the pusher saw an intent but before it entered this
-			// queue.
-			pusheeTxnTimer.Reset(0)
-			first = false
-		}
+	metrics := q.store.GetTxnWaitMetrics()
+	metrics.PusherWaiting.Inc(1)
+	tBegin := timeutil.Now()
+	defer func() { metrics.PusherWaitTime.RecordValue(timeutil.Since(tBegin).Nanoseconds()) }()
 
+	slowTimerThreshold := time.Minute
+	slowTimer := timeutil.NewTimer()
+	defer slowTimer.Stop()
+	slowTimer.Reset(slowTimerThreshold)
+
+	var pusheeTxnTimer timeutil.Timer
+	defer pusheeTxnTimer.Stop()
+	// The first time we want to check the pushee's txn record immediately:
+	// the pushee might be gone by the time the pusher gets here if it cleaned
+	// itself up after the pusher saw an intent but before it entered this
+	// queue.
+	pusheeTxnTimer.Reset(0)
+	for {
 		select {
+		case <-slowTimer.C:
+			slowTimer.Read = true
+			metrics.PusherSlow.Inc(1)
+			log.Warningf(ctx, "pusher %s: have been waiting %.2fs for pushee %s",
+				req.PusherTxn.ID.Short(),
+				timeutil.Since(tBegin).Seconds(),
+				req.PusheeTxn.ID.Short(),
+			)
+			defer func() {
+				metrics.PusherSlow.Dec(1)
+				log.Warningf(ctx, "pusher %s: finished waiting after %.2fs for pushee %s",
+					req.PusherTxn.ID.Short(),
+					timeutil.Since(tBegin).Seconds(),
+					req.PusheeTxn.ID.Short(),
+				)
+			}()
 		case <-ctx.Done():
 			// Caller has given up.
-			log.Event(ctx, "pusher giving up due to context cancellation")
+			log.VEvent(ctx, 2, "pusher giving up due to context cancellation")
 			return nil, roachpb.NewError(ctx.Err())
-
+		case <-q.store.Stopper().ShouldQuiesce():
+			// Let the push out so that they can be sent looking elsewhere.
+			return nil, nil
 		case txn := <-push.pending:
-			log.Eventf(ctx, "result of pending push: %v", txn)
+			log.VEventf(ctx, 2, "result of pending push: %v", txn)
 			// If txn is nil, the queue was cleared, presumably because the
 			// replica lost the range lease. Return not pushed so request
 			// proceeds and is redirected to the new range lease holder.
@@ -488,15 +542,15 @@ func (q *Queue) MaybeWaitForPush(
 			// pushed. If this PushTxn request is satisfied, return
 			// successful PushTxn response.
 			if isPushed(req, txn) {
-				log.Event(ctx, "push request is satisfied")
+				log.VEvent(ctx, 2, "push request is satisfied")
 				return createPushTxnResponse(txn), nil
 			}
 			// If not successfully pushed, return not pushed so request proceeds.
-			log.Event(ctx, "not pushed; returning to caller")
+			log.VEvent(ctx, 2, "not pushed; returning to caller")
 			return nil, nil
 
 		case <-pusheeTxnTimer.C:
-			log.Event(ctx, "querying pushee")
+			log.VEvent(ctx, 2, "querying pushee")
 			pusheeTxnTimer.Read = true
 			// Periodically check whether the pushee txn has been abandoned.
 			updatedPushee, _, pErr := q.queryTxnStatus(
@@ -506,24 +560,58 @@ func (q *Queue) MaybeWaitForPush(
 				return nil, pErr
 			} else if updatedPushee == nil {
 				// Continue with push.
-				log.Event(ctx, "pushee not found, push should now succeed")
+				log.VEvent(ctx, 2, "pushee not found, push should now succeed")
 				return nil, nil
 			}
 			pusheePriority = updatedPushee.Priority
 			pending.txn.Store(updatedPushee)
+			if updatedPushee.Status.IsFinalized() {
+				log.VEvent(ctx, 2, "push request is satisfied")
+				if updatedPushee.Status == roachpb.ABORTED {
+					// Inform any other waiting pushers that the transaction is now
+					// finalized. Intuitively we would expect that if any pusher was
+					// stuck waiting for the transaction to be finalized then it would
+					// have heard about the update when the transaction record moved
+					// into its finalized state. This is correct for cases where a
+					// command explicitly wrote the transaction record with a finalized
+					// status.
+					//
+					// However, this does not account for the case where a transaction
+					// becomes uncommittable due a loss of resolution in the store's
+					// timestamp cache. In that case, a transaction may suddenly become
+					// uncommittable without an associated write to its record. When
+					// this happens, no one else will immediately inform the other
+					// pushers about the uncommittable transaction. Eventually the
+					// pushee's coordinator will come along and roll back its record,
+					// but that's only if the pushee isn't itself waiting on the result
+					// of one of the pushers here. If there is such a dependency cycle
+					// then the other pushers may have to wait for up to the transaction
+					// expiration to query the pushee again and notice that the pushee
+					// is now uncommittable.
+					q.UpdateTxn(ctx, updatedPushee)
+				}
+				return createPushTxnResponse(updatedPushee), nil
+			}
 			if IsExpired(q.store.Clock().Now(), updatedPushee) {
 				log.VEventf(ctx, 1, "pushing expired txn %s", req.PusheeTxn.ID.Short())
 				return nil, nil
 			}
+			// Set the timer to check for the pushee txn's expiration.
+			expiration := TxnExpiration(updatedPushee).GoTime()
+			now := q.store.Clock().Now().GoTime()
+			pusheeTxnTimer.Reset(expiration.Sub(now))
 
 		case updatedPusher := <-queryPusherCh:
-			log.Eventf(ctx, "pusher was updated: %v", updatedPusher)
 			switch updatedPusher.Status {
 			case roachpb.COMMITTED:
-				return nil, roachpb.NewErrorWithTxn(roachpb.NewTransactionStatusError("already committed"), updatedPusher)
+				log.VEventf(ctx, 1, "pusher committed: %v", updatedPusher)
+				return nil, roachpb.NewErrorWithTxn(roachpb.NewTransactionCommittedStatusError(), updatedPusher)
 			case roachpb.ABORTED:
-				return nil, roachpb.NewErrorWithTxn(roachpb.NewTransactionAbortedError(), updatedPusher)
+				log.VEventf(ctx, 1, "pusher aborted: %v", updatedPusher)
+				return nil, roachpb.NewErrorWithTxn(
+					roachpb.NewTransactionAbortedError(roachpb.ABORT_REASON_PUSHER_ABORTED), updatedPusher)
 			}
+			log.VEventf(ctx, 2, "pusher was updated: %v", updatedPusher)
 			if updatedPusher.Priority > pusherPriority {
 				pusherPriority = updatedPusher.Priority
 			}
@@ -550,24 +638,23 @@ func (q *Queue) MaybeWaitForPush(
 			// Since the pusher has been updated, clear any waiting queries
 			// so that they continue with a query of new dependents added here.
 			q.mu.Lock()
-			q.clearWaitingQueriesLocked(ctx, req.PusheeTxn.ID)
+			q.releaseWaitingQueriesLocked(ctx, req.PusheeTxn.ID)
 			q.mu.Unlock()
 
 			if haveDependency {
 				// Break the deadlock if the pusher has higher priority.
 				p1, p2 := pusheePriority, pusherPriority
 				if p1 < p2 || (p1 == p2 && bytes.Compare(req.PusheeTxn.ID.GetBytes(), req.PusherTxn.ID.GetBytes()) < 0) {
-					if log.V(1) {
-						log.Infof(
-							ctx,
-							"%s breaking deadlock by force push of %s; dependencies=%s",
-							req.PusherTxn.ID.Short(),
-							req.PusheeTxn.ID.Short(),
-							dependents,
-						)
-					}
+					log.VEventf(
+						ctx,
+						1,
+						"%s breaking deadlock by force push of %s; dependencies=%s",
+						req.PusherTxn.ID.Short(),
+						req.PusheeTxn.ID.Short(),
+						dependents,
+					)
+					metrics.DeadlocksTotal.Inc(1)
 					return nil, ErrDeadlock
-
 				}
 			}
 			// Signal the pusher query txn loop to continue.
@@ -591,7 +678,7 @@ func (q *Queue) MaybeWaitForQuery(
 	if !req.WaitForUpdate {
 		return nil
 	}
-
+	metrics := q.store.GetTxnWaitMetrics()
 	q.mu.Lock()
 	// If the txn wait queue is not enabled or if the request is not
 	// contained within the replica, do nothing. The request can fall
@@ -604,11 +691,10 @@ func (q *Queue) MaybeWaitForQuery(
 	}
 
 	var maxWaitCh <-chan time.Time
-	pending, ok := q.mu.txns[req.Txn.ID]
 	// If the transaction we're waiting to query has a queue of txns
 	// in turn waiting on it, and is _already_ updated from what the
 	// caller is expecting, return to query the updates immediately.
-	if ok && q.isTxnUpdated(pending, req) {
+	if pending, ok := q.mu.txns[req.Txn.ID]; ok && q.isTxnUpdated(pending, req) {
 		q.mu.Unlock()
 		return nil
 	} else if !ok {
@@ -620,16 +706,40 @@ func (q *Queue) MaybeWaitForQuery(
 		maxWaitCh = time.After(maxWaitForQueryTxn)
 	}
 
-	query := &waitingQuery{
-		req:     req,
-		pending: make(chan struct{}),
+	// Add a new query to wait for updates to the transaction. If a query
+	// already exists, we can just increment its reference count.
+	query, ok := q.mu.queries[req.Txn.ID]
+	if ok {
+		query.count++
+	} else {
+		query = &waitingQueries{
+			pending: make(chan struct{}),
+			count:   1,
+		}
+		q.mu.queries[req.Txn.ID] = query
 	}
-	q.mu.queries[req.Txn.ID] = append(q.mu.queries[req.Txn.ID], query)
+	metrics.QueryWaiting.Inc(1)
 	q.mu.Unlock()
 
-	if log.V(2) {
-		log.Infof(ctx, "waiting on query for %s", req.Txn.ID.Short())
-	}
+	tBegin := timeutil.Now()
+	defer func() { metrics.QueryWaitTime.RecordValue(timeutil.Since(tBegin).Nanoseconds()) }()
+
+	// When we return, make sure to unregister the query so that it doesn't
+	// leak. If query.pending if closed, the query will have already been
+	// cleaned up, so this will be a no-op.
+	defer func() {
+		q.mu.Lock()
+		if query == q.mu.queries[req.Txn.ID] {
+			query.count--
+			metrics.QueryWaiting.Dec(1)
+			if query.count == 0 {
+				delete(q.mu.queries, req.Txn.ID)
+			}
+		}
+		q.mu.Unlock()
+	}()
+
+	log.VEventf(ctx, 2, "waiting on query for %s", req.Txn.ID.Short())
 	select {
 	case <-ctx.Done():
 		// Caller has given up.
@@ -688,6 +798,11 @@ func (q *Queue) startQueryPusherTxn(
 				} else if updatedPusher == nil {
 					// No pusher to query; the BeginTransaction hasn't yet created the
 					// pusher's record. Continue in order to backoff and retry.
+					// TODO(nvanbenschoten): we shouldn't hit this case in a 2.2
+					// cluster now that QueryTxn requests synthesize
+					// transactions from their provided TxnMeta. However, we
+					// need to keep the logic while we want to support
+					// compatibility with 2.1 nodes. Remove this in 2.3.
 					log.Event(ctx, "no pusher found; backing off")
 					continue
 				}
@@ -706,7 +821,7 @@ func (q *Queue) startQueryPusherTxn(
 
 				// Send an update of the pusher txn.
 				pusher.Update(updatedPusher)
-				ch <- &pusher
+				ch <- pusher
 
 				// Wait for context cancellation or indication on readyCh that the
 				// push waiter requires another query of the pusher txn.
@@ -743,8 +858,9 @@ func (q *Queue) queryTxnStatus(
 	now hlc.Timestamp,
 ) (*roachpb.Transaction, []uuid.UUID, *roachpb.Error) {
 	b := &client.Batch{}
+	b.Header.Timestamp = q.store.Clock().Now()
 	b.AddRawRequest(&roachpb.QueryTxnRequest{
-		Span: roachpb.Span{
+		RequestHeader: roachpb.RequestHeader{
 			Key: txnMeta.Key,
 		},
 		Txn:              txnMeta,
@@ -777,7 +893,9 @@ func (q *Queue) queryTxnStatus(
 	}
 	br := b.RawResponse()
 	resp := br.Responses[0].GetInner().(*roachpb.QueryTxnResponse)
-	// ID can be nil if no BeginTransaction has been sent yet.
+	// ID can be nil if no BeginTransaction has been sent yet and we're talking
+	// to a 2.1 node.
+	// TODO(nvanbenschoten): Remove this in 2.3.
 	if updatedTxn := &resp.QueriedTxn; updatedTxn.ID != (uuid.UUID{}) {
 		return updatedTxn, resp.WaitingTxns, nil
 	}

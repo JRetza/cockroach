@@ -1,4 +1,6 @@
-# LogicTest: default opt parallel-stmts distsql distsql-opt distsql-metadata
+# The tests in this file target the legacy FK paths.
+statement ok
+SET experimental_optimizer_foreign_keys = false
 
 subtest AllCascadingActions
 ### A test of all cascading actions in their most basic form.
@@ -55,7 +57,7 @@ statement ok
 DELETE FROM a WHERE id = 5;
 
 query I
-SELECT COUNT(*) FROM b;
+SELECT count(*) FROM b;
 ----
 0
 
@@ -182,50 +184,12 @@ DELETE FROM a WHERE id = 'a-pk1';
 
 query IIIIII
 SELECT
-  (SELECT COUNT(*) FROM a)
- ,(SELECT COUNT(*) FROM b1)
- ,(SELECT COUNT(*) FROM b2)
- ,(SELECT COUNT(*) FROM c1)
- ,(SELECT COUNT(*) FROM c2)
- ,(SELECT COUNT(*) FROM c3)
-;
-----
-0 0 0 0 0 0
-
-# Perform the same operation but with show trace.
-statement ok
-INSERT INTO a VALUES ('a-pk1');
-INSERT INTO b1 VALUES ('b1-pk1', 'a-pk1'), ('b1-pk2', 'a-pk1');
-INSERT INTO b2 VALUES ('b2-pk1', 'a-pk1'), ('b2-pk2', 'a-pk1');
-INSERT INTO c1 VALUES
-  ('c1-pk1-b1-pk1', 'b1-pk1')
- ,('c1-pk2-b1-pk1', 'b1-pk1')
- ,('c1-pk3-b1-pk2', 'b1-pk2')
- ,('c1-pk4-b1-pk2', 'b1-pk2')
-;
-INSERT INTO c2 VALUES
-  ('c2-pk1-b1-pk1', 'b1-pk1')
- ,('c2-pk2-b1-pk1', 'b1-pk1')
- ,('c2-pk3-b1-pk2', 'b1-pk2')
- ,('c2-pk4-b1-pk2', 'b1-pk2')
-;
-INSERT INTO c3 VALUES ('b2-pk1'), ('b2-pk2');
-
-query I
-SELECT COUNT(*) FROM [
-  SHOW KV TRACE FOR DELETE FROM a WHERE id = 'a-pk1'
-] WHERE message LIKE 'cascading %';
-----
-5
-
-query IIIIII
-SELECT
-  (SELECT COUNT(*) FROM a)
- ,(SELECT COUNT(*) FROM b1)
- ,(SELECT COUNT(*) FROM b2)
- ,(SELECT COUNT(*) FROM c1)
- ,(SELECT COUNT(*) FROM c2)
- ,(SELECT COUNT(*) FROM c3)
+  (SELECT count(*) FROM a)
+ ,(SELECT count(*) FROM b1)
+ ,(SELECT count(*) FROM b2)
+ ,(SELECT count(*) FROM c1)
+ ,(SELECT count(*) FROM c2)
+ ,(SELECT count(*) FROM c3)
 ;
 ----
 0 0 0 0 0 0
@@ -280,11 +244,11 @@ DELETE FROM a WHERE id = 'pk1';
 
 query IIIII
 SELECT
-  (SELECT COUNT(*) FROM a)
- ,(SELECT COUNT(*) FROM b1)
- ,(SELECT COUNT(*) FROM b2)
- ,(SELECT COUNT(*) FROM c1)
- ,(SELECT COUNT(*) FROM c2)
+  (SELECT count(*) FROM a)
+ ,(SELECT count(*) FROM b1)
+ ,(SELECT count(*) FROM b2)
+ ,(SELECT count(*) FROM c1)
+ ,(SELECT count(*) FROM c2)
 ;
 ----
 0 0 0 0 0
@@ -293,7 +257,7 @@ SELECT
 statement ok
 DROP TABLE c2, c1, b2, b1, a;
 
-subtest DeleteCascade_CompositeFKs
+subtest DeleteCascade_CompositeFKs_MatchSimple
 ### Basic Delete Cascade with composite FKs
 #     a
 #    / \
@@ -369,11 +333,100 @@ DELETE FROM a WHERE id = 'a-pk1';
 
 query IIIII
 SELECT
-  (SELECT COUNT(*) FROM a)
- ,(SELECT COUNT(*) FROM b1)
- ,(SELECT COUNT(*) FROM b2)
- ,(SELECT COUNT(*) FROM c1)
- ,(SELECT COUNT(*) FROM c2)
+  (SELECT count(*) FROM a)
+ ,(SELECT count(*) FROM b1)
+ ,(SELECT count(*) FROM b2)
+ ,(SELECT count(*) FROM c1)
+ ,(SELECT count(*) FROM c2)
+;
+----
+0 0 0 0 0
+
+# Clean up after the test.
+statement ok
+DROP TABLE c2, c1, b2, b1, a;
+
+subtest DeleteCascade_CompositeFKs_MatchFull
+### Basic Delete Cascade with composite FKs
+#     a
+#    / \
+#   b1 b2
+#  / \
+# c1  c2
+
+statement ok
+CREATE TABLE a (
+  id STRING PRIMARY KEY
+ ,x INT
+ ,UNIQUE (id, x)
+);
+
+statement ok
+CREATE TABLE b1 (
+  id STRING PRIMARY KEY
+ ,a_id STRING
+ ,x INT
+ ,y INT
+ ,INDEX (a_id, x, y)
+ ,FOREIGN KEY (a_id, x) REFERENCES a (id, x) MATCH FULL ON DELETE CASCADE
+ ,UNIQUE (id, x)
+);
+
+statement ok
+CREATE TABLE b2 (
+  id STRING PRIMARY KEY
+ ,a_id STRING
+ ,x INT
+ ,y INT
+ ,INDEX (a_id, x, y)
+ ,FOREIGN KEY (a_id, x) REFERENCES a (id, x) MATCH FULL ON DELETE CASCADE
+ ,UNIQUE (id, x)
+);
+
+statement ok
+CREATE TABLE c1 (
+  id STRING PRIMARY KEY
+ ,b_id STRING
+ ,x INT
+ ,FOREIGN KEY (b_id, x) REFERENCES b1 (id, x) MATCH FULL ON DELETE CASCADE
+);
+
+statement ok
+CREATE TABLE c2 (
+  id STRING PRIMARY KEY
+ ,b_id STRING
+ ,x INT
+ ,FOREIGN KEY (b_id, x) REFERENCES b1 (id, x) MATCH FULL ON DELETE CASCADE
+);
+
+statement ok
+INSERT INTO a VALUES ('a-pk1', 1);
+INSERT INTO b1 VALUES ('b1-pk1', 'a-pk1', 1, 1), ('b1-pk2', 'a-pk1', 1, 2);
+INSERT INTO b2 VALUES ('b2-pk1', 'a-pk1', 1, 1), ('b2-pk2', 'a-pk1', 1, 2);
+INSERT INTO c1 VALUES
+  ('c1-pk1-b1-pk1', 'b1-pk1', 1)
+ ,('c1-pk2-b1-pk1', 'b1-pk1', 1)
+ ,('c1-pk3-b1-pk2', 'b1-pk2', 1)
+ ,('c1-pk4-b1-pk2', 'b1-pk2', 1)
+;
+INSERT INTO c2 VALUES
+  ('c2-pk1-b1-pk1', 'b1-pk1', 1)
+ ,('c2-pk2-b1-pk1', 'b1-pk1', 1)
+ ,('c2-pk3-b1-pk2', 'b1-pk2', 1)
+ ,('c2-pk4-b1-pk2', 'b1-pk2', 1)
+;
+
+# ON DELETE CASCADE
+statement ok
+DELETE FROM a WHERE id = 'a-pk1';
+
+query IIIII
+SELECT
+  (SELECT count(*) FROM a)
+ ,(SELECT count(*) FROM b1)
+ ,(SELECT count(*) FROM b2)
+ ,(SELECT count(*) FROM c1)
+ ,(SELECT count(*) FROM c2)
 ;
 ----
 0 0 0 0 0
@@ -505,12 +558,12 @@ DELETE FROM b1 WHERE id = 'pk2';
 
 query IIIIII
 SELECT
-  (SELECT COUNT(*) FROM a)
- ,(SELECT COUNT(*) FROM b1)
- ,(SELECT COUNT(*) FROM b2)
- ,(SELECT COUNT(*) FROM c1)
- ,(SELECT COUNT(*) FROM c2)
- ,(SELECT COUNT(*) FROM c3)
+  (SELECT count(*) FROM a)
+ ,(SELECT count(*) FROM b1)
+ ,(SELECT count(*) FROM b2)
+ ,(SELECT count(*) FROM c1)
+ ,(SELECT count(*) FROM c2)
+ ,(SELECT count(*) FROM c3)
 ;
 ----
 2 1 2 1 1 2
@@ -521,12 +574,12 @@ DELETE FROM a WHERE id = 'pk1';
 
 query IIIIII
 SELECT
-  (SELECT COUNT(*) FROM a)
- ,(SELECT COUNT(*) FROM b1)
- ,(SELECT COUNT(*) FROM b2)
- ,(SELECT COUNT(*) FROM c1)
- ,(SELECT COUNT(*) FROM c2)
- ,(SELECT COUNT(*) FROM c3)
+  (SELECT count(*) FROM a)
+ ,(SELECT count(*) FROM b1)
+ ,(SELECT count(*) FROM b2)
+ ,(SELECT count(*) FROM c1)
+ ,(SELECT count(*) FROM c2)
+ ,(SELECT count(*) FROM c3)
 ;
 ----
 1 0 1 0 0 1
@@ -537,12 +590,12 @@ DELETE FROM a WHERE id = 'pk2';
 
 query IIIIII
 SELECT
-  (SELECT COUNT(*) FROM a)
- ,(SELECT COUNT(*) FROM b1)
- ,(SELECT COUNT(*) FROM b2)
- ,(SELECT COUNT(*) FROM c1)
- ,(SELECT COUNT(*) FROM c2)
- ,(SELECT COUNT(*) FROM c3)
+  (SELECT count(*) FROM a)
+ ,(SELECT count(*) FROM b1)
+ ,(SELECT count(*) FROM b2)
+ ,(SELECT count(*) FROM c1)
+ ,(SELECT count(*) FROM c2)
+ ,(SELECT count(*) FROM c3)
 ;
 ----
 0 0 0 0 0 0
@@ -606,12 +659,12 @@ DELETE FROM b1 WHERE id = 'pk2';
 
 query IIIIII
 SELECT
-  (SELECT COUNT(*) FROM a)
- ,(SELECT COUNT(*) FROM b1)
- ,(SELECT COUNT(*) FROM b2)
- ,(SELECT COUNT(*) FROM c1)
- ,(SELECT COUNT(*) FROM c2)
- ,(SELECT COUNT(*) FROM c3)
+  (SELECT count(*) FROM a)
+ ,(SELECT count(*) FROM b1)
+ ,(SELECT count(*) FROM b2)
+ ,(SELECT count(*) FROM c1)
+ ,(SELECT count(*) FROM c2)
+ ,(SELECT count(*) FROM c3)
 ;
 ----
 2 1 2 1 1 2
@@ -644,7 +697,7 @@ statement ok
 DELETE FROM self WHERE id = 1;
 
 query I
-SELECT COUNT(*) FROM self
+SELECT count(*) FROM self
 ----
 0
 
@@ -675,7 +728,7 @@ statement ok
 DELETE FROM self WHERE id = 1;
 
 query I
-SELECT COUNT(*) FROM self
+SELECT count(*) FROM self
 ----
 0
 
@@ -722,8 +775,8 @@ DELETE FROM loop_a WHERE id = 'loop_a-pk1';
 
 query II
 SELECT
-  (SELECT COUNT(*) FROM loop_a)
- ,(SELECT COUNT(*) FROM loop_b)
+  (SELECT count(*) FROM loop_a)
+ ,(SELECT count(*) FROM loop_b)
 ;
 ----
 0 0
@@ -768,8 +821,8 @@ DELETE FROM loop_a WHERE id = 'loop_a-pk1';
 
 query II
 SELECT
-  (SELECT COUNT(*) FROM loop_a)
- ,(SELECT COUNT(*) FROM loop_b)
+  (SELECT count(*) FROM loop_a)
+ ,(SELECT count(*) FROM loop_b)
 ;
 ----
 0 0
@@ -799,7 +852,7 @@ statement ok
 DELETE FROM self_x2 WHERE x = 'pk1';
 
 query I
-SELECT COUNT(*) FROM self_x2
+SELECT count(*) FROM self_x2
 ----
 0
 
@@ -858,11 +911,11 @@ DELETE FROM a WHERE id = 'a1';
 
 query IIIII
 SELECT
-  (SELECT COUNT(*) FROM a)
- ,(SELECT COUNT(*) FROM b)
- ,(SELECT COUNT(*) FROM c)
- ,(SELECT COUNT(*) FROM d)
- ,(SELECT COUNT(*) FROM e)
+  (SELECT count(*) FROM a)
+ ,(SELECT count(*) FROM b)
+ ,(SELECT count(*) FROM c)
+ ,(SELECT count(*) FROM d)
+ ,(SELECT count(*) FROM e)
 ;
 ----
 0 0 0 0 0
@@ -995,47 +1048,6 @@ c2-pk2 updated
 c2-pk3 updated
 c2-pk4 updated
 
-# Update again but this time check show trace
-statement ok
-
-query I
-SELECT COUNT(*) FROM [
-  SHOW KV TRACE FOR UPDATE a SET id = 'updated2' WHERE id = 'updated'
-] WHERE message LIKE 'cascading %';
-----
-5
-
-query T
-SELECT * FROM a;
-----
-updated2
-
-query TT
-SELECT * FROM b1;
-----
-b1-pk1 updated2
-
-query TT
-SELECT * FROM b2;
-----
-b2-pk1 updated2
-
-query TT rowsort
-SELECT * FROM c1;
-----
-c1-pk1 updated2
-c1-pk2 updated2
-c1-pk3 updated2
-c1-pk4 updated2
-
-query TT rowsort
-SELECT * FROM c2;
-----
-c2-pk1 updated2
-c2-pk2 updated2
-c2-pk3 updated2
-c2-pk4 updated2
-
 # Clean up after the test.
 statement ok
 DROP TABLE c3, c2, c1, b2, b1, a;
@@ -1099,7 +1111,7 @@ updated updated updated updated updated
 statement ok
 DROP TABLE c2, c1, b2, b1, a;
 
-subtest UpdateCascade_CompositeFKs
+subtest UpdateCascade_CompositeFKs_MatchSimple
 ### Basic Update Cascade with composite FKs
 #     a
 #    / \
@@ -1150,6 +1162,117 @@ CREATE TABLE c2 (
  ,b_id STRING
  ,x INT
  ,FOREIGN KEY (b_id, x) REFERENCES b1 (id, x) ON UPDATE CASCADE
+);
+
+statement ok
+INSERT INTO a VALUES ('a-pk1', 1);
+INSERT INTO b1 VALUES ('b1-pk1', 'a-pk1', 1, 1), ('b1-pk2', 'a-pk1', 1, 2);
+INSERT INTO b2 VALUES ('b2-pk1', 'a-pk1', 1, 1), ('b2-pk2', 'a-pk1', 1, 2);
+INSERT INTO c1 VALUES
+  ('c1-pk1-b1-pk1', 'b1-pk1', 1)
+ ,('c1-pk2-b1-pk1', 'b1-pk1', 1)
+ ,('c1-pk3-b1-pk2', 'b1-pk2', 1)
+ ,('c1-pk4-b1-pk2', 'b1-pk2', 1)
+;
+INSERT INTO c2 VALUES
+  ('c2-pk1-b1-pk1', 'b1-pk1', 1)
+ ,('c2-pk2-b1-pk1', 'b1-pk1', 1)
+ ,('c2-pk3-b1-pk2', 'b1-pk2', 1)
+ ,('c2-pk4-b1-pk2', 'b1-pk2', 1)
+;
+
+# ON UPDATE CASCADE
+statement ok
+UPDATE a SET x = 2 WHERE x = 1;
+
+query TI
+SELECT * FROM a;
+----
+a-pk1 2
+
+query TTII rowsort
+SELECT * FROM b1;
+----
+b1-pk1  a-pk1  2  1
+b1-pk2  a-pk1  2  2
+
+query TTII rowsort
+SELECT * FROM b2;
+----
+b2-pk1  a-pk1  2  1
+b2-pk2  a-pk1  2  2
+
+query TTI rowsort
+SELECT * FROM c1;
+----
+c1-pk1-b1-pk1  b1-pk1  2
+c1-pk2-b1-pk1  b1-pk1  2
+c1-pk3-b1-pk2  b1-pk2  2
+c1-pk4-b1-pk2  b1-pk2  2
+
+query TTI rowsort
+SELECT * FROM c2;
+----
+c2-pk1-b1-pk1  b1-pk1  2
+c2-pk2-b1-pk1  b1-pk1  2
+c2-pk3-b1-pk2  b1-pk2  2
+c2-pk4-b1-pk2  b1-pk2  2
+
+# Clean up after the test.
+statement ok
+DROP TABLE c2, c1, b2, b1, a;
+
+subtest UpdateCascade_CompositeFKs_MatchFull
+### Basic Update Cascade with composite FKs
+#     a
+#    / \
+#   b1 b2
+#  / \
+# c1  c2
+
+statement ok
+CREATE TABLE a (
+  id STRING PRIMARY KEY
+ ,x INT
+ ,UNIQUE (id, x)
+);
+
+statement ok
+CREATE TABLE b1 (
+  id STRING PRIMARY KEY
+ ,a_id STRING
+ ,x INT
+ ,y INT
+ ,INDEX (a_id, x, y)
+ ,FOREIGN KEY (a_id, x) REFERENCES a (id, x) MATCH FULL ON UPDATE CASCADE
+ ,UNIQUE (id, x)
+);
+
+statement ok
+CREATE TABLE b2 (
+  id STRING PRIMARY KEY
+ ,a_id STRING
+ ,x INT
+ ,y INT
+ ,INDEX (a_id, x, y)
+ ,FOREIGN KEY (a_id, x) REFERENCES a (id, x) MATCH FULL ON UPDATE CASCADE
+ ,UNIQUE (id, x)
+);
+
+statement ok
+CREATE TABLE c1 (
+  id STRING PRIMARY KEY
+ ,b_id STRING
+ ,x INT
+ ,FOREIGN KEY (b_id, x) REFERENCES b1 (id, x) MATCH FULL ON UPDATE CASCADE
+);
+
+statement ok
+CREATE TABLE c2 (
+  id STRING PRIMARY KEY
+ ,b_id STRING
+ ,x INT
+ ,FOREIGN KEY (b_id, x) REFERENCES b1 (id, x) MATCH FULL ON UPDATE CASCADE
 );
 
 statement ok
@@ -2030,45 +2153,6 @@ b3-pk2 untouched
 b4-pk1 NULL
 b4-pk2 NULL
 
-# Perform the same operation but with show trace.
-statement ok
-TRUNCATE a, b1, b2, b3, b4;
-
-statement ok
-INSERT INTO a VALUES ('delete_me'), ('untouched');
-INSERT INTO b1 VALUES ('b1-pk1', 'untouched'), ('b1-pk2', 'untouched');
-INSERT INTO b2 VALUES ('b2-pk1', 'untouched'), ('b2-pk2', 'delete_me');
-INSERT INTO b3 VALUES ('b3-pk1', 'delete_me'), ('b3-pk2', 'untouched');
-INSERT INTO b4 VALUES ('b4-pk1', 'delete_me'), ('b4-pk2', 'delete_me');
-
-# Ensure that show trace adds a cascade message for each of the tables that is
-# cascaded into.
-query I
-SELECT COUNT(*) FROM [
-  SHOW KV TRACE FOR DELETE FROM a WHERE id = 'delete_me'
-] WHERE message LIKE 'cascading %';
-----
-4
-
-query TT rowsort
-  SELECT id, delete_set_null FROM b1
-UNION ALL
-  SELECT id, delete_set_null FROM b2
-UNION ALL
-  SELECT id, delete_set_null FROM b3
-UNION ALL
-  SELECT id, delete_set_null FROM b4
-;
-----
-b1-pk1 untouched
-b1-pk2 untouched
-b2-pk1 untouched
-b2-pk2 NULL
-b3-pk1 NULL
-b3-pk2 untouched
-b4-pk1 NULL
-b4-pk2 NULL
-
 # Clean up after the test.
 statement ok
 DROP TABLE b4, b3, b2, b1, a;
@@ -2164,64 +2248,6 @@ c3-pk4-b2-pk2  NULL
 statement ok
 TRUNCATE c3, c2, c1, b2, b1, a;
 
-# Perform the same operation but with show trace.
-statement ok
-INSERT INTO a VALUES ('a-pk1');
-INSERT INTO b1 VALUES ('b1-pk1', 'a-pk1'), ('b1-pk2', 'a-pk1');
-INSERT INTO b2 VALUES ('b2-pk1', 'a-pk1'), ('b2-pk2', 'a-pk1');
-INSERT INTO c1 VALUES
-  ('c1-pk1-b1-pk1', 'b1-pk1')
- ,('c1-pk2-b1-pk1', 'b1-pk1')
- ,('c1-pk3-b1-pk2', 'b1-pk2')
- ,('c1-pk4-b1-pk2', 'b1-pk2')
-;
-INSERT INTO c2 VALUES
-  ('c2-pk1-b1-pk1', 'b1-pk1')
- ,('c2-pk2-b1-pk1', 'b1-pk1')
- ,('c2-pk3-b1-pk2', 'b1-pk2')
- ,('c2-pk4-b1-pk2', 'b1-pk2')
-;
-INSERT INTO c3 VALUES
-  ('c3-pk1-b2-pk1', 'b2-pk1')
- ,('c3-pk2-b2-pk1', 'b2-pk1')
- ,('c3-pk3-b2-pk2', 'b2-pk2')
- ,('c3-pk4-b2-pk2', 'b2-pk2')
-;
-
-query I
-SELECT COUNT(*) FROM [
-  SHOW KV TRACE FOR DELETE FROM a WHERE id = 'a-pk1'
-] WHERE message LIKE 'cascading %';
-----
-5
-
-query TT rowsort
-  SELECT id, 'empty' FROM a
-UNION ALL
-  SELECT id, delete_cascade FROM b1
-UNION ALL
-  SELECT id, delete_cascade FROM b2
-UNION ALL
-  SELECT id, delete_set_null FROM c1
-UNION ALL
-  SELECT id, delete_set_null FROM c2
-UNION ALL
-  SELECT id, delete_set_null FROM c3
-;
-----
-c1-pk1-b1-pk1  NULL
-c1-pk2-b1-pk1  NULL
-c1-pk3-b1-pk2  NULL
-c1-pk4-b1-pk2  NULL
-c2-pk1-b1-pk1  NULL
-c2-pk2-b1-pk1  NULL
-c2-pk3-b1-pk2  NULL
-c2-pk4-b1-pk2  NULL
-c3-pk1-b2-pk1  NULL
-c3-pk2-b2-pk1  NULL
-c3-pk3-b2-pk2  NULL
-c3-pk4-b2-pk2  NULL
-
 # Clean up after the test.
 statement ok
 DROP TABLE c3, c2, c1, b2, b1, a;
@@ -2262,7 +2288,7 @@ statement ok
 DELETE FROM a WHERE id = 'delete-me';
 
 query I
-SELECT COUNT(*) FROM a;
+SELECT count(*) FROM a;
 ----
 1
 
@@ -2380,45 +2406,6 @@ b3-pk2 untouched
 b4-pk1 NULL
 b4-pk2 NULL
 
-# Perform the same operation but with show trace.
-statement ok
-TRUNCATE a, b1, b2, b3, b4;
-
-statement ok
-INSERT INTO a VALUES ('original'), ('untouched');
-INSERT INTO b1 VALUES ('b1-pk1', 'untouched'), ('b1-pk2', 'untouched');
-INSERT INTO b2 VALUES ('b2-pk1', 'untouched'), ('b2-pk2', 'original');
-INSERT INTO b3 VALUES ('b3-pk1', 'original'), ('b3-pk2', 'untouched');
-INSERT INTO b3 VALUES ('b4-pk1', 'original'), ('b4-pk2', 'original');
-
-# Ensure that show trace adds a cascade message for each of the tables that is
-# cascaded into.
-query I
-SELECT COUNT(*) FROM [
-  SHOW KV TRACE FOR UPDATE a SET id = 'updated' WHERE id = 'original'
-] WHERE message LIKE 'cascading %';
-----
-4
-
-query TT rowsort
-  SELECT id, update_set_null FROM b1
-UNION ALL
-  SELECT id, update_set_null FROM b2
-UNION ALL
-  SELECT id, update_set_null FROM b3
-UNION ALL
-  SELECT id, update_set_null FROM b4
-;
-----
-b1-pk1 untouched
-b1-pk2 untouched
-b2-pk1 untouched
-b2-pk2 NULL
-b3-pk1 NULL
-b3-pk2 untouched
-b4-pk1 NULL
-b4-pk2 NULL
-
 # Clean up after the test.
 statement ok
 DROP TABLE b4, b3, b2, b1, a;
@@ -2482,71 +2469,6 @@ INSERT INTO c3 VALUES
 # ON UPDATE CASCADE
 statement ok
 UPDATE a SET id = 'updated' WHERE id = 'original';
-
-query TT rowsort
-  SELECT id, update_cascade FROM b1
-UNION ALL
-  SELECT id, update_cascade FROM b2
-UNION ALL
-  SELECT id, update_set_null FROM c1
-UNION ALL
-  SELECT id, update_set_null FROM c2
-UNION ALL
-  SELECT id, update_set_null FROM c3
-;
-----
-b1-pk1         updated
-b1-pk2         untouched
-b2-pk1         updated
-b2-pk2         untouched
-c1-pk1-b1-pk1  NULL
-c1-pk2-b1-pk1  NULL
-c1-pk3-b1-pk2  untouched
-c1-pk4-b1-pk2  untouched
-c2-pk1-b1-pk1  NULL
-c2-pk2-b1-pk1  NULL
-c2-pk3-b1-pk2  untouched
-c2-pk4-b1-pk2  untouched
-c3-pk1-b2-pk1  NULL
-c3-pk2-b2-pk1  NULL
-c3-pk3-b2-pk2  untouched
-c3-pk4-b2-pk2  untouched
-
-# Perform the same operation but with show trace.
-statement ok
-TRUNCATE c3, c2, c1, b2, b1, a;
-
-statement ok
-INSERT INTO a VALUES ('original'), ('untouched');
-INSERT INTO b1 VALUES ('b1-pk1', 'original'), ('b1-pk2', 'untouched');
-INSERT INTO b2 VALUES ('b2-pk1', 'original'), ('b2-pk2', 'untouched');
-INSERT INTO c1 VALUES
-  ('c1-pk1-b1-pk1', 'original')
- ,('c1-pk2-b1-pk1', 'original')
- ,('c1-pk3-b1-pk2', 'untouched')
- ,('c1-pk4-b1-pk2', 'untouched')
-;
-INSERT INTO c2 VALUES
-  ('c2-pk1-b1-pk1', 'original')
- ,('c2-pk2-b1-pk1', 'original')
- ,('c2-pk3-b1-pk2', 'untouched')
- ,('c2-pk4-b1-pk2', 'untouched')
-;
-INSERT INTO c3 VALUES
-  ('c3-pk1-b2-pk1', 'original')
- ,('c3-pk2-b2-pk1', 'original')
- ,('c3-pk3-b2-pk2', 'untouched')
- ,('c3-pk4-b2-pk2', 'untouched')
-;
-
-# Ensure that show trace adds a cascade message for each of the tables that is
-# cascaded into.
-query I
-SELECT COUNT(*) FROM [
-  SHOW KV TRACE FOR UPDATE a SET id = 'updated' WHERE id = 'original'
-] WHERE message LIKE 'cascading %';
-----
-5
 
 query TT rowsort
   SELECT id, update_cascade FROM b1
@@ -2731,45 +2653,6 @@ b3-pk2  untouched
 b4-pk1  b4-default
 b4-pk2  b4-default
 
-# Perform the same operation but with show trace.
-statement ok
-TRUNCATE a, b1, b2, b3, b4;
-
-statement ok
-INSERT INTO a VALUES ('delete_me'), ('untouched'), ('b2-default'), ('b3-default'), ('b4-default');
-INSERT INTO b1 VALUES ('b1-pk1', 'untouched'), ('b1-pk2', 'untouched');
-INSERT INTO b2 VALUES ('b2-pk1', 'untouched'), ('b2-pk2', 'delete_me');
-INSERT INTO b3 VALUES ('b3-pk1', 'delete_me'), ('b3-pk2', 'untouched');
-INSERT INTO b4 VALUES ('b4-pk1', 'delete_me'), ('b4-pk2', 'delete_me');
-
-# Ensure that show trace adds a cascade message for each of the tables that is
-# cascaded into.
-query I
-SELECT COUNT(*) FROM [
-  SHOW KV TRACE FOR DELETE FROM a WHERE id = 'delete_me'
-] WHERE message LIKE 'cascading %';
-----
-4
-
-query TT rowsort
-  SELECT id, delete_set_default FROM b1
-UNION ALL
-  SELECT id, delete_set_default FROM b2
-UNION ALL
-  SELECT id, delete_set_default FROM b3
-UNION ALL
-  SELECT id, delete_set_default FROM b4
-;
-----
-b1-pk1  untouched
-b1-pk2  untouched
-b2-pk1  untouched
-b2-pk2  b2-default
-b3-pk1  b3-default
-b3-pk2  untouched
-b4-pk1  b4-default
-b4-pk2  b4-default
-
 # Clean up after the test.
 statement ok
 DROP TABLE b4, b3, b2, b1, a;
@@ -2911,67 +2794,6 @@ c3-pk4-b2-pk2  b2-default
 
 statement ok
 TRUNCATE c3, c2, c1, b2, b1, a;
-
-# Perform the same operation but with show trace.
-statement ok
-INSERT INTO a VALUES ('a-pk1'), ('a-default');
-INSERT INTO b1 VALUES ('b1-pk1', 'a-pk1'), ('b1-pk2', 'a-pk1'), ('b1-default', 'a-default');
-INSERT INTO b2 VALUES ('b2-pk1', 'a-pk1'), ('b2-pk2', 'a-pk1'), ('b2-default', 'a-default');
-INSERT INTO c1 VALUES
-  ('c1-pk1-b1-pk1', 'b1-pk1')
- ,('c1-pk2-b1-pk1', 'b1-pk1')
- ,('c1-pk3-b1-pk2', 'b1-pk2')
- ,('c1-pk4-b1-pk2', 'b1-pk2')
-;
-INSERT INTO c2 VALUES
-  ('c2-pk1-b1-pk1', 'b1-pk1')
- ,('c2-pk2-b1-pk1', 'b1-pk1')
- ,('c2-pk3-b1-pk2', 'b1-pk2')
- ,('c2-pk4-b1-pk2', 'b1-pk2')
-;
-INSERT INTO c3 VALUES
-  ('c3-pk1-b2-pk1', 'b2-pk1')
- ,('c3-pk2-b2-pk1', 'b2-pk1')
- ,('c3-pk3-b2-pk2', 'b2-pk2')
- ,('c3-pk4-b2-pk2', 'b2-pk2')
-;
-
-query I
-SELECT COUNT(*) FROM [
-  SHOW KV TRACE FOR DELETE FROM a WHERE id = 'a-pk1'
-] WHERE message LIKE 'cascading %';
-----
-5
-
-query TT rowsort
-  SELECT id, 'empty' FROM a
-UNION ALL
-  SELECT id, delete_cascade FROM b1
-UNION ALL
-  SELECT id, delete_cascade FROM b2
-UNION ALL
-  SELECT id, delete_set_default FROM c1
-UNION ALL
-  SELECT id, delete_set_default FROM c2
-UNION ALL
-  SELECT id, delete_set_default FROM c3
-;
-----
-a-default      empty
-b1-default     a-default
-b2-default     a-default
-c1-pk1-b1-pk1  b1-default
-c1-pk2-b1-pk1  b1-default
-c1-pk3-b1-pk2  b1-default
-c1-pk4-b1-pk2  b1-default
-c2-pk1-b1-pk1  b1-default
-c2-pk2-b1-pk1  b1-default
-c2-pk3-b1-pk2  b1-default
-c2-pk4-b1-pk2  b1-default
-c3-pk1-b2-pk1  b2-default
-c3-pk2-b2-pk1  b2-default
-c3-pk3-b2-pk2  b2-default
-c3-pk4-b2-pk2  b2-default
 
 # Clean up after the test.
 statement ok
@@ -3280,45 +3102,6 @@ b3-pk2  untouched
 b4-pk1  b3-default
 b4-pk2  b3-default
 
-# Perform the same operation but with show trace.
-statement ok
-TRUNCATE a, b1, b2, b3, b4;
-
-statement ok
-INSERT INTO a VALUES ('original'), ('untouched'), ('b1-default'), ('b2-default'), ('b3-default'), ('b4-default');
-INSERT INTO b1 VALUES ('b1-pk1', 'untouched'), ('b1-pk2', 'untouched');
-INSERT INTO b2 VALUES ('b2-pk1', 'untouched'), ('b2-pk2', 'original');
-INSERT INTO b3 VALUES ('b3-pk1', 'original'), ('b3-pk2', 'untouched');
-INSERT INTO b3 VALUES ('b4-pk1', 'original'), ('b4-pk2', 'original');
-
-# Ensure that show trace adds a cascade message for each of the tables that is
-# cascaded into.
-query I
-SELECT COUNT(*) FROM [
-  SHOW KV TRACE FOR UPDATE a SET id = 'updated' WHERE id = 'original'
-] WHERE message LIKE 'cascading %';
-----
-4
-
-query TT rowsort
-  SELECT id, update_set_null FROM b1
-UNION ALL
-  SELECT id, update_set_null FROM b2
-UNION ALL
-  SELECT id, update_set_null FROM b3
-UNION ALL
-  SELECT id, update_set_null FROM b4
-;
-----
-b1-pk1  untouched
-b1-pk2  untouched
-b2-pk1  untouched
-b2-pk2  b2-default
-b3-pk1  b3-default
-b3-pk2  untouched
-b4-pk1  b3-default
-b4-pk2  b3-default
-
 # Clean up after the test.
 statement ok
 DROP TABLE b4, b3, b2, b1, a;
@@ -3426,73 +3209,6 @@ INSERT INTO c3 VALUES
 # originals should now be set to defaults.
 statement ok
 UPDATE a SET id = 'updated' WHERE id = 'original';
-
-query TT rowsort
-  SELECT id, update_cascade FROM b1
-UNION ALL
-  SELECT id, update_cascade FROM b2
-UNION ALL
-  SELECT id, update_set_null FROM c1
-UNION ALL
-  SELECT id, update_set_null FROM c2
-UNION ALL
-  SELECT id, update_set_null FROM c3
-;
-----
-b1-default     b1-default
-b1-pk1         updated
-b1-pk2         untouched
-b2-default     b2-default
-b2-pk1         updated
-b2-pk2         untouched
-c1-pk1-b1-pk1  b1-default
-c1-pk2-b1-pk1  b1-default
-c1-pk3-b1-pk2  untouched
-c1-pk4-b1-pk2  untouched
-c2-pk1-b1-pk1  b1-default
-c2-pk2-b1-pk1  b1-default
-c2-pk3-b1-pk2  untouched
-c2-pk4-b1-pk2  untouched
-c3-pk1-b2-pk1  b2-default
-c3-pk2-b2-pk1  b2-default
-c3-pk3-b2-pk2  untouched
-c3-pk4-b2-pk2  untouched
-
-# Perform the same operation but with show trace.
-statement ok
-TRUNCATE c3, c2, c1, b2, b1, a;
-
-statement ok
-INSERT INTO a VALUES ('original'), ('untouched'), ('b1-default'), ('b2-default');
-INSERT INTO b1 VALUES ('b1-pk1', 'original'), ('b1-pk2', 'untouched'), ('b1-default', 'b1-default');
-INSERT INTO b2 VALUES ('b2-pk1', 'original'), ('b2-pk2', 'untouched'), ('b2-default', 'b2-default');
-INSERT INTO c1 VALUES
-  ('c1-pk1-b1-pk1', 'original')
- ,('c1-pk2-b1-pk1', 'original')
- ,('c1-pk3-b1-pk2', 'untouched')
- ,('c1-pk4-b1-pk2', 'untouched')
-;
-INSERT INTO c2 VALUES
-  ('c2-pk1-b1-pk1', 'original')
- ,('c2-pk2-b1-pk1', 'original')
- ,('c2-pk3-b1-pk2', 'untouched')
- ,('c2-pk4-b1-pk2', 'untouched')
-;
-INSERT INTO c3 VALUES
-  ('c3-pk1-b2-pk1', 'original')
- ,('c3-pk2-b2-pk1', 'original')
- ,('c3-pk3-b2-pk2', 'untouched')
- ,('c3-pk4-b2-pk2', 'untouched')
-;
-
-# Ensure that show trace adds a cascade message for each of the tables that is
-# cascaded into.
-query I
-SELECT COUNT(*) FROM [
-  SHOW KV TRACE FOR UPDATE a SET id = 'updated' WHERE id = 'original'
-] WHERE message LIKE 'cascading %';
-----
-5
 
 query TT rowsort
   SELECT id, update_cascade FROM b1
@@ -3710,3 +3426,279 @@ UPDATE a SET id = 'updated' WHERE id = 'original';
 # Clean up after the test.
 statement ok
 DROP TABLE b, a;
+
+subtest NoNullCascades_NonComposite
+
+# First with a non-composite index
+statement ok
+CREATE TABLE IF NOT EXISTS example (
+  a INT UNIQUE,
+  b INT REFERENCES example (a) ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+statement ok
+INSERT INTO example VALUES (20, NULL);
+INSERT INTO example VALUES (30, 20);
+INSERT INTO example VALUES (NULL, 30);
+
+statement ok
+DELETE FROM example where a = 30;
+
+query II colnames
+SELECT * FROM example;
+----
+a  b
+20 NULL
+
+# Clean up after the test.
+statement ok
+DROP TABLE example;
+
+subtest NoNullCascades_MatchSimple
+# Note that these matches use a composite index with MATCH SIMPLE.
+
+statement ok
+CREATE TABLE a (
+  x INT
+ ,y INT
+ ,UNIQUE (x, y)
+);
+
+statement ok
+CREATE TABLE b (
+  x INT
+ ,y INT
+ ,INDEX (x, y)
+ ,FOREIGN KEY (x, y) REFERENCES a (x, y) ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+statement ok
+INSERT INTO a VALUES (NULL, NULL), (NULL, 1), (2, NULL), (3, 3);
+INSERT INTO b VALUES (NULL, NULL), (NULL, 1), (2, NULL), (3, 3);
+
+# What we start with.
+query II colnames
+SELECT * FROM b ORDER BY x, y;
+----
+x    y
+NULL NULL
+NULL 1
+2    NULL
+3    3
+
+# Remove everything from a. x=3,y=3 should be the only cascading values.
+statement ok
+DELETE FROM a;
+
+# A match consisting of only NULLs is not cascaded.
+query II colnames
+SELECT * FROM b ORDER BY x, y;
+----
+x    y
+NULL NULL
+NULL 1
+2    NULL
+
+# Make sure that a is now empty.
+query II colnames
+SELECT * FROM a ORDER BY x;
+----
+x    y
+
+# Now try the same with inserts
+statement ok
+TRUNCATE b, a;
+INSERT INTO a VALUES (NULL, NULL), (NULL, 4), (5, NULL), (6, 6);
+INSERT INTO b VALUES (NULL, NULL), (NULL, 4), (5, NULL), (6, 6);
+
+# For this, only x=6,y=6 should cascade.
+statement ok
+UPDATE a SET y = y*10 WHERE y > 0;
+UPDATE a SET x = x*10 WHERE x > 0;
+
+query II colnames
+SELECT * FROM b ORDER BY x, y;
+----
+x    y
+NULL  NULL
+NULL  4
+5     NULL
+60    60
+
+# Clean up after the test.
+statement ok
+DROP TABLE b, a;
+
+subtest NoNullCascades_MatchFull
+# Note that these matches use a composite index with MATCH FULL.
+
+statement ok
+CREATE TABLE a (
+  x INT
+ ,y INT
+ ,UNIQUE (x, y)
+);
+
+statement ok
+CREATE TABLE b (
+  x INT
+ ,y INT
+ ,INDEX (x, y)
+ ,FOREIGN KEY (x, y) REFERENCES a (x, y) MATCH FULL ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+statement ok
+INSERT INTO a VALUES (NULL, NULL), (NULL, 1), (2, NULL), (3, 3);
+INSERT INTO b VALUES (NULL, NULL), (3, 3);
+
+# What we start with
+query II colnames
+SELECT * FROM b ORDER BY x, y;
+----
+x    y
+NULL NULL
+3    3
+
+# Remove everything from a. x=3,y=3 should be the only cascading value.
+statement ok
+DELETE FROM a;
+
+# A match consisting of only NULLs is not cascaded.
+query II colnames
+SELECT * FROM b ORDER BY x, y;
+----
+x    y
+NULL NULL
+
+# Just make sure that a is empty.
+query II colnames
+SELECT * FROM a ORDER BY x;
+----
+x    y
+
+# Now try the same with updates.
+statement ok
+TRUNCATE b, a;
+INSERT INTO a VALUES (NULL, NULL), (NULL, 4), (5, NULL), (6, 6);
+INSERT INTO b VALUES (NULL, NULL), (6, 6);
+
+# For this test, only x=6,y=6 should cascade.
+statement ok
+UPDATE a SET y = y*10 WHERE y > 0;
+UPDATE a SET x = x*10 WHERE x > 0;
+
+query II colnames
+SELECT * FROM b ORDER BY x, y;
+----
+x    y
+NULL  NULL
+60    60
+
+# Clean up after the test.
+statement ok
+DROP TABLE b, a;
+
+subtest MatchFullViaCascade
+# Test to ensure that setting a null value cannot cascade into a MATCH FULL fk
+# reference.
+
+statement ok
+CREATE TABLE a (
+  x INT
+ ,y INT
+ ,UNIQUE (x, y)
+);
+
+statement ok
+CREATE TABLE b (
+  x INT DEFAULT 1
+ ,y INT DEFAULT NULL
+ ,UNIQUE (x, y)
+ ,FOREIGN KEY (x, y) REFERENCES a (x, y) MATCH SIMPLE ON DELETE SET DEFAULT ON UPDATE SET DEFAULT
+);
+
+statement ok
+CREATE TABLE c (
+  x INT
+ ,y INT
+ ,UNIQUE (x, y)
+ ,FOREIGN KEY (x, y) REFERENCES b (x, y) MATCH FULL ON UPDATE CASCADE
+);
+
+statement ok
+INSERT INTO a VALUES (2,2);
+INSERT INTO b VALUES (2,2);
+INSERT INTO c VALUES (2,2);
+
+# C's MATCH FULL should reject this.
+statement error MATCH FULL does not allow mixing of null and nonnull values
+DELETE FROM a;
+
+# Again, for the same reason.
+statement error MATCH FULL does not allow mixing of null and nonnull values
+UPDATE a SET x = 3 WHERE x = 2;
+
+# Ensure nothing has changed.
+query II colnames
+SELECT * from a;
+----
+x y
+2 2
+
+statement ok
+DROP TABLE c, b, a;
+
+# Now repeat the same test but make it ON DELETE SET NULL and ON UPDATE CASCADE.
+
+statement ok
+CREATE TABLE a (
+  x INT
+ ,y INT
+ ,UNIQUE (x, y)
+);
+
+statement ok
+CREATE TABLE b (
+  x INT
+ ,y INT
+ ,UNIQUE (x, y)
+ ,FOREIGN KEY (x, y) REFERENCES a (x, y) MATCH SIMPLE ON DELETE SET NULL ON UPDATE CASCADE
+);
+
+statement ok
+CREATE TABLE c (
+  x INT
+ ,y INT
+ ,UNIQUE (x, y)
+ ,FOREIGN KEY (x, y) REFERENCES b (x, y) MATCH FULL ON UPDATE CASCADE
+);
+
+statement ok
+INSERT INTO a VALUES (2,2), (3,3);
+INSERT INTO b VALUES (2,2), (3,3);
+INSERT INTO c VALUES (2,2), (3,3);
+
+# This will populate b and c with (null, null) where (2,2) used to be.
+statement ok
+DELETE FROM a WHERE x = 2;
+
+# We can't cascade the null value though to c, since it would break MATCH FULL.
+statement error MATCH FULL does not allow mixing of null and nonnull values
+UPDATE a SET x = NULL WHERE x = 3;
+
+statement error MATCH FULL does not allow mixing of null and nonnull values
+UPDATE a SET y = NULL WHERE y = 3;
+
+# Now update (3,3) to (null, null) which should cascade.
+statement ok
+UPDATE a SET x = NULL, y = NULL WHERE x = 3;
+
+query II colnames
+SELECT * from c;
+----
+x     y
+NULL  NULL
+NULL  NULL
+
+statement ok
+DROP TABLE c, b, a;

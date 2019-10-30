@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package rditer
 
@@ -47,21 +43,60 @@ type ReplicaDataIterator struct {
 
 // MakeAllKeyRanges returns all key ranges for the given Range.
 func MakeAllKeyRanges(d *roachpb.RangeDescriptor) []KeyRange {
-	return makeReplicaKeyRanges(d, keys.MakeRangeIDPrefix)
+	return []KeyRange{
+		MakeRangeIDLocalKeyRange(d.RangeID, false /* replicatedOnly */),
+		MakeRangeLocalKeyRange(d),
+		MakeUserKeyRange(d),
+	}
 }
 
-// MakeReplicatedKeyRanges returns all key ranges that are fully Raft replicated
-// for the given Range.
+// MakeReplicatedKeyRanges returns all key ranges that are fully Raft
+// replicated for the given Range.
+//
+// NOTE: The logic for receiving snapshot relies on this function returning the
+// ranges in the following sorted order:
+//
+// 1. Replicated range-id local key range
+// 2. Range-local key range
+// 3. User key range
 func MakeReplicatedKeyRanges(d *roachpb.RangeDescriptor) []KeyRange {
-	return makeReplicaKeyRanges(d, keys.MakeRangeIDReplicatedPrefix)
+	return []KeyRange{
+		MakeRangeIDLocalKeyRange(d.RangeID, true /* replicatedOnly */),
+		MakeRangeLocalKeyRange(d),
+		MakeUserKeyRange(d),
+	}
 }
 
-// makeReplicaKeyRanges returns a slice of 3 key ranges. The last key range in
-// the returned slice corresponds to the actual range data (i.e. not the range
-// metadata).
-func makeReplicaKeyRanges(
-	d *roachpb.RangeDescriptor, metaFunc func(roachpb.RangeID) roachpb.Key,
-) []KeyRange {
+// MakeRangeIDLocalKeyRange returns the range-id local key range. If
+// replicatedOnly is true, then it returns only the replicated keys, otherwise,
+// it only returns both the replicated and unreplicated keys.
+func MakeRangeIDLocalKeyRange(rangeID roachpb.RangeID, replicatedOnly bool) KeyRange {
+	var prefixFn func(roachpb.RangeID) roachpb.Key
+	if replicatedOnly {
+		prefixFn = keys.MakeRangeIDReplicatedPrefix
+	} else {
+		prefixFn = keys.MakeRangeIDPrefix
+	}
+	sysRangeIDKey := prefixFn(rangeID)
+	return KeyRange{
+		Start: engine.MakeMVCCMetadataKey(sysRangeIDKey),
+		End:   engine.MakeMVCCMetadataKey(sysRangeIDKey.PrefixEnd()),
+	}
+}
+
+// MakeRangeLocalKeyRange returns the range local key range. Range-local keys
+// are replicated keys that do not belong to the range they would naturally
+// sort into. For example, /Local/Range/Table/1 would sort into [/Min,
+// /System), but it actually belongs to [/Table/1, /Table/2).
+func MakeRangeLocalKeyRange(d *roachpb.RangeDescriptor) KeyRange {
+	return KeyRange{
+		Start: engine.MakeMVCCMetadataKey(keys.MakeRangeKeyPrefix(d.StartKey)),
+		End:   engine.MakeMVCCMetadataKey(keys.MakeRangeKeyPrefix(d.EndKey)),
+	}
+}
+
+// MakeUserKeyRange returns the user key range.
+func MakeUserKeyRange(d *roachpb.RangeDescriptor) KeyRange {
 	// The first range in the keyspace starts at KeyMin, which includes the
 	// node-local space. We need the original StartKey to find the range
 	// metadata, but the actual data starts at LocalMax.
@@ -69,20 +104,9 @@ func makeReplicaKeyRanges(
 	if d.StartKey.Equal(roachpb.RKeyMin) {
 		dataStartKey = keys.LocalMax
 	}
-	sysRangeIDKey := metaFunc(d.RangeID)
-	return []KeyRange{
-		{
-			Start: engine.MakeMVCCMetadataKey(sysRangeIDKey),
-			End:   engine.MakeMVCCMetadataKey(sysRangeIDKey.PrefixEnd()),
-		},
-		{
-			Start: engine.MakeMVCCMetadataKey(keys.MakeRangeKeyPrefix(d.StartKey)),
-			End:   engine.MakeMVCCMetadataKey(keys.MakeRangeKeyPrefix(d.EndKey)),
-		},
-		{
-			Start: engine.MakeMVCCMetadataKey(dataStartKey),
-			End:   engine.MakeMVCCMetadataKey(d.EndKey.AsRawKey()),
-		},
+	return KeyRange{
+		Start: engine.MakeMVCCMetadataKey(dataStartKey),
+		End:   engine.MakeMVCCMetadataKey(d.EndKey.AsRawKey()),
 	}
 }
 
@@ -90,14 +114,8 @@ func makeReplicaKeyRanges(
 func NewReplicaDataIterator(
 	d *roachpb.RangeDescriptor, e engine.Reader, replicatedOnly bool,
 ) *ReplicaDataIterator {
-	return WrapWithReplicaDataIterator(d, e.NewIterator(engine.IterOptions{}), replicatedOnly)
-}
+	it := e.NewIterator(engine.IterOptions{UpperBound: d.EndKey.AsRawKey()})
 
-// WrapWithReplicaDataIterator creates a ReplicaDataIterator for the given
-// replica that wraps the provided iterator.
-func WrapWithReplicaDataIterator(
-	d *roachpb.RangeDescriptor, it engine.SimpleIterator, replicatedOnly bool,
-) *ReplicaDataIterator {
 	rangeFunc := MakeAllKeyRanges
 	if replicatedOnly {
 		rangeFunc = MakeReplicatedKeyRanges
@@ -128,15 +146,13 @@ func (ri *ReplicaDataIterator) Next() {
 // invalid.
 func (ri *ReplicaDataIterator) advance() {
 	for {
-		if ok, _ := ri.Valid(); !ok || ri.it.UnsafeKey().Less(ri.ranges[ri.curIndex].End) {
+		if ok, _ := ri.Valid(); ok && ri.it.UnsafeKey().Less(ri.ranges[ri.curIndex].End) {
 			return
 		}
 		ri.curIndex++
 		if ri.curIndex < len(ri.ranges) {
 			ri.it.Seek(ri.ranges[ri.curIndex].Start)
 		} else {
-			// Otherwise, seek to end to make iterator invalid.
-			ri.it.Seek(engine.MVCCKeyMax)
 			return
 		}
 	}
@@ -144,7 +160,9 @@ func (ri *ReplicaDataIterator) advance() {
 
 // Valid returns true if the iterator currently points to a valid value.
 func (ri *ReplicaDataIterator) Valid() (bool, error) {
-	return ri.it.Valid()
+	ok, err := ri.it.Valid()
+	ok = ok && ri.curIndex < len(ri.ranges)
+	return ok, err
 }
 
 // Key returns the current key.

@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -62,8 +58,7 @@ func TestUpdateRangeAddressing(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.TODO())
-	store, _ := createTestStore(t, stopper)
-
+	store, _ := createTestStore(t, testStoreOpts{createSystemRanges: false}, stopper)
 	// When split is false, merging treats the right range as the merged
 	// range. With merging, expNewLeft indicates the addressing keys we
 	// expect to be removed.
@@ -141,25 +136,51 @@ func TestUpdateRangeAddressing(t *testing.T) {
 		// interface without sending through a TxnCoordSender (which initializes a
 		// transaction id). Also, we need the TxnCoordSender to clean up the
 		// intents, otherwise the MVCCScan that the test does below fails.
+		actx := testutils.MakeAmbientCtx()
 		tcsf := kv.NewTxnCoordSenderFactory(
-			log.AmbientContext{Tracer: st.Tracer}, st,
-			store.TestSender(), store.cfg.Clock,
-			false, stopper, kv.MakeTxnMetrics(time.Second),
+			kv.TxnCoordSenderFactoryConfig{
+				AmbientCtx: actx,
+				Settings:   st,
+				Clock:      store.cfg.Clock,
+				Stopper:    stopper,
+				Metrics:    kv.MakeTxnMetrics(time.Second),
+			},
+			store.TestSender(),
 		)
-		db := client.NewDB(tcsf, store.cfg.Clock)
-		txn := client.NewTxn(db, 0 /* gatewayNodeID */, client.RootTxn)
+		db := client.NewDB(actx, tcsf, store.cfg.Clock)
 		ctx := context.Background()
+		txn := client.NewTxn(ctx, db, 0 /* gatewayNodeID */, client.RootTxn)
 		if err := txn.Run(ctx, b); err != nil {
 			t.Fatal(err)
 		}
 		if err := txn.Commit(ctx); err != nil {
 			t.Fatal(err)
 		}
-		// Scan meta keys directly from engine.
-		kvs, _, _, err := engine.MVCCScan(ctx, store.Engine(), keys.MetaMin, keys.MetaMax, math.MaxInt64, hlc.MaxTimestamp, true, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
+		// Scan meta keys directly from engine. We put this in a retry loop
+		// because the application of all of a transactions committed writes
+		// is not always synchronous with it committing. Cases where the
+		// application of a write is asynchronous are:
+		// - the write is on a different range than the transaction's record.
+		//   Intent resolution will be asynchronous.
+		// - the transaction performed a parallel commit. Explicitly committing
+		//   the transaction will be asynchronous.
+		// - [not yet implemented] the corresponding Raft log entry is committed
+		//   but not applied before acknowledging the write. Applying the write
+		//   to RocksDB will be asynchronous.
+		var kvs []roachpb.KeyValue
+		testutils.SucceedsSoon(t, func() error {
+			var err error
+			kvs, _, _, err = engine.MVCCScan(ctx, store.Engine(), keys.MetaMin, keys.MetaMax,
+				math.MaxInt64, hlc.MaxTimestamp, engine.MVCCScanOptions{})
+			if err != nil {
+				// Wait for the intent to be resolved.
+				if _, ok := err.(*roachpb.WriteIntentError); ok {
+					return err
+				}
+				t.Fatal(err)
+			}
+			return nil
+		})
 		metas := metaSlice{}
 		for _, kv := range kvs {
 			scannedDesc := &roachpb.RangeDescriptor{}

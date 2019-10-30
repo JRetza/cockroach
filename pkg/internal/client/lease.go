@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package client
 
@@ -19,12 +15,11 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/pkg/errors"
-
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/pkg/errors"
 )
 
 // DefaultLeaseDuration is the duration a lease will be acquired for if no
@@ -55,7 +50,11 @@ type LeaseManager struct {
 // Lease contains the state of a lease on a particular key.
 type Lease struct {
 	key roachpb.Key
-	val *LeaseVal
+	val struct {
+		sem      chan struct{}
+		lease    *LeaseVal
+		leaseRaw roachpb.Value
+	}
 }
 
 // LeaseManagerOptions are used to configure a new LeaseManager.
@@ -92,6 +91,7 @@ func (m *LeaseManager) AcquireLease(ctx context.Context, key roachpb.Key) (*Leas
 	lease := &Lease{
 		key: key,
 	}
+	lease.val.sem = make(chan struct{}, 1)
 	if err := m.db.Txn(ctx, func(ctx context.Context, txn *Txn) error {
 		var val LeaseVal
 		err := txn.GetProto(ctx, key, &val)
@@ -101,11 +101,23 @@ func (m *LeaseManager) AcquireLease(ctx context.Context, key roachpb.Key) (*Leas
 		if !m.leaseAvailable(&val) {
 			return &LeaseNotAvailableError{key: key, expiration: val.Expiration}
 		}
-		lease.val = &LeaseVal{
+		lease.val.lease = &LeaseVal{
 			Owner:      m.clientID,
 			Expiration: m.clock.Now().Add(m.leaseDuration.Nanoseconds(), 0),
 		}
-		return txn.Put(ctx, key, lease.val)
+		var leaseRaw roachpb.Value
+		if err := leaseRaw.SetProto(lease.val.lease); err != nil {
+			return err
+		}
+		if err := txn.Put(ctx, key, &leaseRaw); err != nil {
+			return err
+		}
+		// After using newRaw as an arg to CPut, we're not allowed to modify it.
+		// Passing it back to CPut again (which is the whole point of keeping it
+		// around) will clear and re-init the checksum, so defensively copy it before
+		// we save it.
+		lease.val.leaseRaw = roachpb.Value{RawBytes: append([]byte(nil), leaseRaw.RawBytes...)}
+		return nil
 	}); err != nil {
 		return nil, err
 	}
@@ -118,7 +130,9 @@ func (m *LeaseManager) leaseAvailable(val *LeaseVal) bool {
 
 // TimeRemaining returns the amount of time left on the given lease.
 func (m *LeaseManager) TimeRemaining(l *Lease) time.Duration {
-	return m.timeRemaining(l.val)
+	l.val.sem <- struct{}{}
+	defer func() { <-l.val.sem }()
+	return m.timeRemaining(l.val.lease)
 }
 
 func (m *LeaseManager) timeRemaining(val *LeaseVal) time.Duration {
@@ -134,29 +148,51 @@ func (m *LeaseManager) timeRemaining(val *LeaseVal) time.Duration {
 // ExtendLease attempts to push the expiration time of the lease farther out
 // into the future.
 func (m *LeaseManager) ExtendLease(ctx context.Context, l *Lease) error {
-	if m.TimeRemaining(l) < 0 {
-		return errors.Errorf("can't extend lease that expired at time %s", l.val.Expiration)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case l.val.sem <- struct{}{}:
+	}
+	defer func() { <-l.val.sem }()
+
+	if m.timeRemaining(l.val.lease) < 0 {
+		return errors.Errorf("can't extend lease that expired at time %s", l.val.lease.Expiration)
 	}
 
 	newVal := &LeaseVal{
 		Owner:      m.clientID,
 		Expiration: m.clock.Now().Add(m.leaseDuration.Nanoseconds(), 0),
 	}
-
-	if err := m.db.CPut(ctx, l.key, newVal, l.val); err != nil {
+	var newRaw roachpb.Value
+	if err := newRaw.SetProto(newVal); err != nil {
+		return err
+	}
+	if err := m.db.CPut(ctx, l.key, &newRaw, &l.val.leaseRaw); err != nil {
 		if _, ok := err.(*roachpb.ConditionFailedError); ok {
 			// Something is wrong - immediately expire the local lease state.
-			l.val.Expiration = hlc.Timestamp{}
-			return errors.Wrapf(err, "local lease state %v out of sync with DB state", l.val)
+			l.val.lease.Expiration = hlc.Timestamp{}
+			return errors.Wrapf(err, "local lease state %v out of sync with DB state", l.val.lease)
 		}
 		return err
 	}
-	l.val = newVal
+	l.val.lease = newVal
+	// After using newRaw as an arg to CPut, we're not allowed to modify it.
+	// Passing it back to CPut again (which is the whole point of keeping it
+	// around) will clear and re-init the checksum, so defensively copy it before
+	// we save it.
+	l.val.leaseRaw = roachpb.Value{RawBytes: append([]byte(nil), newRaw.RawBytes...)}
 	return nil
 }
 
 // ReleaseLease attempts to release the given lease so that another process can
 // grab it.
 func (m *LeaseManager) ReleaseLease(ctx context.Context, l *Lease) error {
-	return m.db.CPut(ctx, l.key, nil, l.val)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case l.val.sem <- struct{}{}:
+	}
+	defer func() { <-l.val.sem }()
+
+	return m.db.CPut(ctx, l.key, nil, &l.val.leaseRaw)
 }

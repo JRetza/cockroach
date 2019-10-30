@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package engine
 
@@ -20,12 +16,11 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/gogo/protobuf/proto"
-
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/gogo/protobuf/proto"
 )
 
 var testtime = int64(-446061360000000000)
@@ -36,6 +31,17 @@ type tsSample struct {
 	sum    float64
 	max    float64
 	min    float64
+}
+
+type tsColumnSample struct {
+	offset   int32
+	last     float64
+	count    uint32
+	first    float64
+	sum      float64
+	max      float64
+	min      float64
+	variance float64
 }
 
 func gibberishString(n int) string {
@@ -60,15 +66,16 @@ func appender(s string) []byte {
 	return mustMarshal(v)
 }
 
-// timeSeries generates a simple InternalTimeSeriesData object which starts
-// at the given timestamp and has samples of the given duration. The object is
-// stored in an MVCCMetadata object and marshaled to bytes.
-func timeSeries(start int64, duration int64, samples ...tsSample) []byte {
-	tsv := timeSeriesAsValue(start, duration, samples...)
+// timeSeriesRow generates a simple InternalTimeSeriesData object which starts
+// at the given timestamp and has samples of the given duration. The time series
+// is written using the older sample-row data format. The object is stored in an
+// MVCCMetadata object and marshaled to bytes.
+func timeSeriesRow(start int64, duration int64, samples ...tsSample) []byte {
+	tsv := timeSeriesRowAsValue(start, duration, samples...)
 	return mustMarshal(&enginepb.MVCCMetadata{RawBytes: tsv.RawBytes})
 }
 
-func timeSeriesAsValue(start int64, duration int64, samples ...tsSample) roachpb.Value {
+func timeSeriesRowAsValue(start int64, duration int64, samples ...tsSample) roachpb.Value {
 	ts := &roachpb.InternalTimeSeriesData{
 		StartTimestampNanos: start,
 		SampleDurationNanos: duration,
@@ -92,46 +99,76 @@ func timeSeriesAsValue(start int64, duration int64, samples ...tsSample) roachpb
 	return v
 }
 
-// TestGoMerge tests the function goMerge but not the integration with
-// the storage engines. For that, see the engine tests.
-func TestGoMerge(t *testing.T) {
+func timeSeriesColumn(start int64, duration int64, rollup bool, samples ...tsColumnSample) []byte {
+	tsv := timeSeriesColumnAsValue(start, duration, rollup, samples...)
+	return mustMarshal(&enginepb.MVCCMetadata{RawBytes: tsv.RawBytes})
+}
+
+func timeSeriesColumnAsValue(
+	start int64, duration int64, rollup bool, samples ...tsColumnSample,
+) roachpb.Value {
+	ts := &roachpb.InternalTimeSeriesData{
+		StartTimestampNanos: start,
+		SampleDurationNanos: duration,
+	}
+	for _, sample := range samples {
+		ts.Offset = append(ts.Offset, sample.offset)
+		ts.Last = append(ts.Last, sample.last)
+		if rollup {
+			ts.Sum = append(ts.Sum, sample.sum)
+			ts.Count = append(ts.Count, sample.count)
+			ts.Min = append(ts.Min, sample.min)
+			ts.Max = append(ts.Max, sample.max)
+			ts.First = append(ts.First, sample.first)
+			ts.Variance = append(ts.Variance, sample.variance)
+		}
+	}
+	var v roachpb.Value
+	if err := v.SetProto(ts); err != nil {
+		panic(err)
+	}
+	return v
+}
+
+// TestGoMergeCorruption tests the function goMerge with error inputs but does not test the
+// integration with the storage engines. For that, see the engine tests.
+func TestGoMergeCorruption(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	// Let's start with stuff that should go wrong.
 	badCombinations := []struct {
 		existing, update []byte
 	}{
 		{appender(""), nil},
 		{
-			timeSeries(testtime, 1000, []tsSample{
+			timeSeriesRow(testtime, 1000, []tsSample{
 				{1, 1, 5, 5, 5},
 			}...),
 			nil,
 		},
 		{
-			timeSeries(testtime, 1000, []tsSample{
+			timeSeriesRow(testtime, 1000, []tsSample{
 				{1, 1, 5, 5, 5},
 			}...),
 			appender("a"),
 		},
 		{
 			appender("a"),
-			timeSeries(testtime, 1000, []tsSample{
+			timeSeriesRow(testtime, 1000, []tsSample{
 				{1, 1, 5, 5, 5},
 			}...),
 		},
 		{
-			timeSeries(testtime, 1000, []tsSample{
+			timeSeriesRow(testtime, 1000, []tsSample{
 				{1, 1, 5, 5, 5},
 			}...),
-			timeSeries(testtime+1, 1000, []tsSample{
+			timeSeriesRow(testtime+1, 1000, []tsSample{
 				{1, 1, 5, 5, 5},
 			}...),
 		},
 		{
-			timeSeries(testtime, 1000, []tsSample{
+			timeSeriesRow(testtime, 1000, []tsSample{
 				{1, 1, 5, 5, 5},
 			}...),
-			timeSeries(testtime, 100, []tsSample{
+			timeSeriesRow(testtime, 100, []tsSample{
 				{1, 1, 5, 5, 5},
 			}...),
 		},
@@ -141,8 +178,18 @@ func TestGoMerge(t *testing.T) {
 		if err == nil {
 			t.Errorf("goMerge: %d: expected error", i)
 		}
+		_, err = merge(nil /* key */, c.existing, c.update, nil /* buf */)
+		if err == nil {
+			t.Fatalf("pebble merge: %d: expected error", i)
+		}
 	}
+}
 
+// TestGoMergeAppend tests the function goMerge with the default append operator
+// but does not test the integration with the storage engines. For that, see the
+// engine tests.
+func TestGoMergeAppend(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	gibber1, gibber2 := gibberishString(100), gibberishString(200)
 
 	testCasesAppender := []struct {
@@ -159,7 +206,7 @@ func TestGoMerge(t *testing.T) {
 	for i, c := range testCasesAppender {
 		result, err := goMerge(c.existing, c.update)
 		if err != nil {
-			t.Errorf("goMerge error: %d: %v", i, err)
+			t.Errorf("goMerge error: %d: %+v", i, err)
 			continue
 		}
 		var resultV, expectedV enginepb.MVCCMetadata
@@ -173,119 +220,338 @@ func TestGoMerge(t *testing.T) {
 			t.Errorf("goMerge error: %d: want %+v, got %+v", i, expectedV, resultV)
 		}
 	}
+}
 
-	testCasesTimeSeries := []struct {
-		existing, update, expected []byte
-	}{
+func MergeInternalTimeSeriesDataPebble(
+	sources ...roachpb.InternalTimeSeriesData,
+) (roachpb.InternalTimeSeriesData, error) {
+	srcBytes, err := serializeMergeInputs(sources...)
+	if err != nil {
+		return roachpb.InternalTimeSeriesData{}, nil
+	}
+	merger := MVCCMerger
+	var mergedBytes = srcBytes[0]
+	for _, bytes := range srcBytes[1:] {
+		mergedBytes = merger.Merge(nil /* key */, mergedBytes, bytes, nil /* buf */)
+	}
+	return deserializeMergeOutput(mergedBytes)
+}
+
+// TestGoMergeTimeSeries tests the function goMerge with the timeseries operator
+// but does not test the integration with the storage engines. For that, see
+// the engine tests.
+func TestGoMergeTimeSeries(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	// Each time series test case is a list of byte slice. The last byte slice
+	// is the expected result; all preceding slices will be merged together
+	// to generate the actual result.
+	testCasesTimeSeries := [][][]byte{
 		{
-			nil,
-			timeSeries(testtime, 1000, []tsSample{
+			timeSeriesRow(testtime, 1000, []tsSample{
 				{1, 1, 5, 5, 5},
 			}...),
-			timeSeries(testtime, 1000, []tsSample{
+			timeSeriesRow(testtime, 1000, []tsSample{
 				{1, 1, 5, 5, 5},
 			}...),
 		},
 		{
-			nil,
-			timeSeries(testtime, 1000, []tsSample{
+			timeSeriesRow(testtime, 1000, []tsSample{
 				{2, 1, 5, 5, 5},
 				{1, 1, 5, 5, 5},
 				{2, 1, 5, 5, 5},
 			}...),
-			timeSeries(testtime, 1000, []tsSample{
-				{1, 1, 5, 5, 5},
-				{2, 1, 5, 5, 5},
-			}...),
-		},
-		{
-			timeSeries(testtime, 1000, []tsSample{
-				{1, 1, 5, 5, 5},
-			}...),
-			timeSeries(testtime, 1000, []tsSample{
-				{2, 1, 5, 5, 5},
-			}...),
-			timeSeries(testtime, 1000, []tsSample{
+			timeSeriesRow(testtime, 1000, []tsSample{
 				{1, 1, 5, 5, 5},
 				{2, 1, 5, 5, 5},
 			}...),
 		},
 		{
-			timeSeries(testtime, 1000, []tsSample{
+			timeSeriesRow(testtime, 1000, []tsSample{
+				{1, 1, 5, 5, 5},
+			}...),
+			timeSeriesRow(testtime, 1000, []tsSample{
+				{2, 1, 5, 5, 5},
+			}...),
+			timeSeriesRow(testtime, 1000, []tsSample{
+				{1, 1, 5, 5, 5},
+				{2, 1, 5, 5, 5},
+			}...),
+		},
+		{
+			timeSeriesRow(testtime, 1000, []tsSample{
 				{1, 1, 5, 5, 5},
 				{3, 1, 5, 5, 5},
 			}...),
-			timeSeries(testtime, 1000, []tsSample{
+			timeSeriesRow(testtime, 1000, []tsSample{
 				{2, 1, 5, 5, 5},
 			}...),
-			timeSeries(testtime, 1000, []tsSample{
+			timeSeriesRow(testtime, 1000, []tsSample{
 				{1, 1, 5, 5, 5},
 				{2, 1, 5, 5, 5},
 				{3, 1, 5, 5, 5},
 			}...),
 		},
 		{
-			timeSeries(testtime, 1000, []tsSample{
+			timeSeriesRow(testtime, 1000, []tsSample{
 				{1, 1, 10, 10, 10},
 				{1, 1, 5, 5, 5},
 				{2, 1, 5, 5, 5},
 			}...),
-			timeSeries(testtime, 1000, []tsSample{
+			timeSeriesRow(testtime, 1000, []tsSample{
 				{1, 1, 100, 100, 100},
 				{2, 1, 5, 5, 5},
 				{3, 1, 5, 5, 5},
 			}...),
-			timeSeries(testtime, 1000, []tsSample{
+			timeSeriesRow(testtime, 1000, []tsSample{
 				{1, 1, 100, 100, 100},
 				{2, 1, 5, 5, 5},
 				{3, 1, 5, 5, 5},
 			}...),
 		},
 		{
-			timeSeries(testtime, 1000, []tsSample{
+			timeSeriesRow(testtime, 1000, []tsSample{
 				{1, 1, 5, 5, 5},
 			}...),
-			timeSeries(testtime, 1000, []tsSample{
+			timeSeriesRow(testtime, 1000, []tsSample{
 				{2, 1, 5, 5, 5},
 			}...),
-			timeSeries(testtime, 1000, []tsSample{
+			timeSeriesRow(testtime, 1000, []tsSample{
 				{1, 1, 5, 5, 5},
 				{2, 1, 5, 5, 5},
 			}...),
 		},
+		// Column Tests.
+		// Basic initial merge.
+		{
+			timeSeriesColumn(testtime, 1000, false, []tsColumnSample{
+				{offset: 2, last: 1},
+				{offset: 6, last: 1},
+			}...),
+			timeSeriesColumn(testtime, 1000, false, []tsColumnSample{
+				{offset: 2, last: 1},
+				{offset: 6, last: 1},
+			}...),
+		},
+		// Ensure initial merge sorts and deduplicates.
+		{
+			timeSeriesColumn(testtime, 1000, false, []tsColumnSample{
+				{offset: 6, last: 1},
+				{offset: 2, last: 1},
+				{offset: 2, last: 4},
+				{offset: 3, last: 8},
+				{offset: 2, last: 3},
+				{offset: 8, last: 8},
+				{offset: 6, last: 1},
+			}...),
+			timeSeriesColumn(testtime, 1000, false, []tsColumnSample{
+				{offset: 2, last: 3},
+				{offset: 3, last: 8},
+				{offset: 6, last: 1},
+				{offset: 8, last: 8},
+			}...),
+		},
+		// Specially constructed sort case: ensure permutation sorting system is
+		// working.
+		{
+			timeSeriesColumn(testtime, 1000, false, []tsColumnSample{
+				{offset: 3, last: 3},
+				{offset: 1, last: 1},
+				{offset: 4, last: 4},
+				{offset: 2, last: 2},
+				{offset: 5, last: 5},
+				{offset: 6, last: 6},
+				{offset: 7, last: 7},
+			}...),
+			timeSeriesColumn(testtime, 1000, false, []tsColumnSample{
+				{offset: 1, last: 1},
+				{offset: 2, last: 2},
+				{offset: 3, last: 3},
+				{offset: 4, last: 4},
+				{offset: 5, last: 5},
+				{offset: 6, last: 6},
+				{offset: 7, last: 7},
+			}...),
+		},
+		// Simple merge.
+		{
+			timeSeriesColumn(testtime, 1000, false, []tsColumnSample{
+				{offset: 2, last: 3},
+				{offset: 4, last: 3},
+				{offset: 5, last: 3},
+			}...),
+			timeSeriesColumn(testtime, 1000, false, []tsColumnSample{
+				{offset: 6, last: 1},
+				{offset: 8, last: 1},
+			}...),
+			timeSeriesColumn(testtime, 1000, false, []tsColumnSample{
+				{offset: 2, last: 3},
+				{offset: 4, last: 3},
+				{offset: 5, last: 3},
+				{offset: 6, last: 1},
+				{offset: 8, last: 1},
+			}...),
+		},
+		// Merge with sorting and deduplication.
+		{
+			timeSeriesColumn(testtime, 1000, false, []tsColumnSample{
+				{offset: 2, last: 3},
+				{offset: 4, last: 3},
+				{offset: 5, last: 3},
+			}...),
+			timeSeriesColumn(testtime, 1000, false, []tsColumnSample{
+				{offset: 8, last: 1},
+				{offset: 4, last: 2},
+				{offset: 6, last: 1},
+				{offset: 5, last: 4},
+			}...),
+			timeSeriesColumn(testtime, 1000, false, []tsColumnSample{
+				{offset: 2, last: 3},
+				{offset: 4, last: 2},
+				{offset: 5, last: 4},
+				{offset: 6, last: 1},
+				{offset: 8, last: 1},
+			}...),
+		},
+		// Rollup Merge: all columns present in output.
+		{
+			timeSeriesColumn(testtime, 1000, true, []tsColumnSample{
+				{2, 3, 2, 4, 9, 6, 3, 2},
+				{4, 3, 2, 4, 9, 6, 3, 2},
+				{5, 3, 2, 4, 9, 6, 3, 2},
+			}...),
+			timeSeriesColumn(testtime, 1000, true, []tsColumnSample{
+				{6, 1, 2, 4, 9, 6, 3, 2},
+				{8, 1, 2, 4, 9, 6, 3, 2},
+			}...),
+			timeSeriesColumn(testtime, 1000, true, []tsColumnSample{
+				{2, 3, 2, 4, 9, 6, 3, 2},
+				{4, 3, 2, 4, 9, 6, 3, 2},
+				{5, 3, 2, 4, 9, 6, 3, 2},
+				{6, 1, 2, 4, 9, 6, 3, 2},
+				{8, 1, 2, 4, 9, 6, 3, 2},
+			}...),
+		},
+		// Rollup Merge sort + deduplicate: all columns present in output.
+		{
+			timeSeriesColumn(testtime, 1000, true, []tsColumnSample{
+				{2, 3, 2, 4, 9, 6, 3, 2},
+				{4, 3, 2, 4, 9, 6, 3, 2},
+				{5, 3, 2, 4, 9, 6, 3, 2},
+			}...),
+			timeSeriesColumn(testtime, 1000, true, []tsColumnSample{
+				{8, 1, 2, 4, 9, 6, 3, 2},
+				{4, 5, 4, 6, 10, 7, 4, 3},
+				{6, 1, 2, 4, 9, 6, 3, 2},
+				{3, 1, 1, 1, 1, 1, 1, 1},
+			}...),
+			timeSeriesColumn(testtime, 1000, true, []tsColumnSample{
+				{2, 3, 2, 4, 9, 6, 3, 2},
+				{3, 1, 1, 1, 1, 1, 1, 1},
+				{4, 5, 4, 6, 10, 7, 4, 3},
+				{5, 3, 2, 4, 9, 6, 3, 2},
+				{6, 1, 2, 4, 9, 6, 3, 2},
+				{8, 1, 2, 4, 9, 6, 3, 2},
+			}...),
+		},
+		// Conversion from row format to columnar format - this occurs when one
+		// of the sides is row-formatted, while the other is column formatted. This
+		// process ignores the existing min/max/count columns, as rollups were never
+		// fully implemented over the row-based layout.
+		{
+			timeSeriesRow(testtime, 1000, []tsSample{
+				{2, 1, 3, 5, 5},
+				{4, 1, 3, 5, 5},
+				{5, 1, 3, 5, 5},
+			}...),
+			timeSeriesColumn(testtime, 1000, false, []tsColumnSample{
+				{offset: 8, last: 1},
+				{offset: 4, last: 2},
+				{offset: 6, last: 1},
+				{offset: 5, last: 4},
+			}...),
+			timeSeriesColumn(testtime, 1000, false, []tsColumnSample{
+				{offset: 2, last: 3},
+				{offset: 4, last: 2},
+				{offset: 5, last: 4},
+				{offset: 6, last: 1},
+				{offset: 8, last: 1},
+			}...),
+		},
+		{
+			timeSeriesColumn(testtime, 1000, false, []tsColumnSample{
+				{offset: 2, last: 3},
+				{offset: 4, last: 3},
+				{offset: 5, last: 3},
+			}...),
+			timeSeriesRow(testtime, 1000, []tsSample{
+				{8, 1, 1, 1, 1},
+				{4, 1, 2, 1, 1},
+				{6, 1, 1, 1, 1},
+				{5, 1, 4, 1, 1},
+			}...),
+			timeSeriesColumn(testtime, 1000, false, []tsColumnSample{
+				{offset: 2, last: 3},
+				{offset: 4, last: 2},
+				{offset: 5, last: 4},
+				{offset: 6, last: 1},
+				{offset: 8, last: 1},
+			}...),
+		},
 	}
 
-	for i, c := range testCasesTimeSeries {
-		expectedTS := unmarshalTimeSeries(t, c.expected)
-		updateTS := unmarshalTimeSeries(t, c.update)
-
-		// Directly test the C++ implementation of merging using goMerge.  goMerge
-		// operates directly on marshaled bytes.
-		result, err := goMerge(c.existing, c.update)
-		if err != nil {
-			t.Errorf("goMerge error on case %d: %s", i, err.Error())
-			continue
-		}
-		resultTS := unmarshalTimeSeries(t, result)
-		if a, e := resultTS, expectedTS; !reflect.DeepEqual(a, e) {
-			t.Errorf("goMerge returned wrong result on case %d: expected %v, returned %v", i, e, a)
+	for _, c := range testCasesTimeSeries {
+		expectedTS := unmarshalTimeSeries(t, c[len(c)-1])
+		var operands []roachpb.InternalTimeSeriesData
+		for _, bytes := range c[:len(c)-1] {
+			operands = append(operands, unmarshalTimeSeries(t, bytes))
 		}
 
-		// Test the MergeInternalTimeSeriesData method separately.
-		if c.existing == nil {
-			resultTS, err = MergeInternalTimeSeriesData(updateTS)
-		} else {
-			existingTS := unmarshalTimeSeries(t, c.existing)
-			resultTS, err = MergeInternalTimeSeriesData(existingTS, updateTS)
-		}
-		if err != nil {
-			t.Errorf("MergeInternalTimeSeriesData error on case %d: %s", i, err.Error())
-			continue
-		}
-		if a, e := resultTS, expectedTS; !reflect.DeepEqual(a, e) {
-			t.Errorf("MergeInternalTimeSeriesData returned wrong result on case %d: expected %v, returned %v",
-				i, e, a)
-		}
+		t.Run("", func(t *testing.T) {
+			// Test merging the operands under several conditions:
+			// + With and without using the partial merge operator (which combines
+			// operands quickly with the expectation that they will be properly merged
+			// eventually).
+			// + With and without merging into an initial nil value. Note that some
+			// tests have only one operand and are only run when merging into nil.
+			for _, partialMerge := range []bool{true, false} {
+				for _, mergeIntoNil := range []bool{true, false} {
+					if !mergeIntoNil && len(operands) == 1 {
+						continue
+					}
+
+					resultTS, err := MergeInternalTimeSeriesData(mergeIntoNil, partialMerge, operands...)
+					if err != nil {
+						t.Errorf(
+							"MergeInternalTimeSeriesData mergeIntoNil=%t partial=%t error: %s",
+							mergeIntoNil,
+							partialMerge,
+							err.Error(),
+						)
+					}
+					if a, e := resultTS, expectedTS; !reflect.DeepEqual(a, e) {
+						t.Errorf(
+							"MergeInternalTimeSeriesData  mergeIntoNil=%t partial=%t returned wrong result got %v, wanted %v",
+							mergeIntoNil,
+							partialMerge,
+							a,
+							e,
+						)
+					}
+				}
+			}
+			if len(operands) < 2 {
+				// TODO(ajkr): Pebble merge operator isn't currently called with one operand,
+				// though maybe it should be to match RocksDB behavior.
+				return
+			}
+			resultTS, err := MergeInternalTimeSeriesDataPebble(operands...)
+			if err != nil {
+				t.Errorf("MergeInternalTimeSeriesDataPebble error: %s", err.Error())
+			}
+			if a, e := resultTS, expectedTS; !reflect.DeepEqual(a, e) {
+				t.Errorf("MergeInternalTimeSeriesDataPebble returned wrong result got %v, wanted %v", a, e)
+			}
+		})
 	}
 }
 

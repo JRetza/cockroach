@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import _ from "lodash";
 import React from "react";
 import PropTypes from "prop-types";
@@ -34,6 +44,8 @@ import replicationDashboard from "./dashboards/replication";
 import distributedDashboard from "./dashboards/distributed";
 import queuesDashboard from "./dashboards/queues";
 import requestsDashboard from "./dashboards/requests";
+import hardwareDashboard from "./dashboards/hardware";
+import changefeedsDashboard from "./dashboards/changefeeds";
 
 interface GraphDashboard {
   label: string;
@@ -42,13 +54,15 @@ interface GraphDashboard {
 
 const dashboards: {[key: string]: GraphDashboard} = {
   "overview" : { label: "Overview", component: overviewDashboard },
+  "hardware": { label: "Hardware", component: hardwareDashboard },
   "runtime" : { label: "Runtime", component: runtimeDashboard },
   "sql": { label: "SQL", component: sqlDashboard },
   "storage": { label: "Storage", component: storageDashboard },
   "replication": { label: "Replication", component: replicationDashboard },
   "distributed": { label: "Distributed", component: distributedDashboard },
   "queues": { label: "Queues", component: queuesDashboard },
-  "requests": { label: "Slow Requests", component: requestsDashboard},
+  "requests": { label: "Slow Requests", component: requestsDashboard },
+  "changefeeds": { label: "Changefeeds", component: changefeedsDashboard },
 };
 
 const defaultDashboard = "overview";
@@ -143,7 +157,7 @@ class NodeGraphs extends React.Component<NodeGraphsProps, {}> {
   }
 
   render() {
-    const { params, nodesSummary, hoverState } = this.props;
+    const { params, nodesSummary } = this.props;
     const selectedDashboard = params[dashboardNameAttr];
     const dashboard = _.has(dashboards, selectedDashboard)
       ? selectedDashboard

@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package result
 
@@ -18,7 +14,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
 
@@ -41,11 +37,14 @@ func TestEvalResultIsZero(t *testing.T) {
 			case *LocalResult:
 				f.GossipFirstRange = true
 				defer func() { f.GossipFirstRange = false }()
-			case *storagebase.ReplicatedEvalResult:
+			case *storagepb.ReplicatedEvalResult:
 				f.IsLeaseRequest = true
 				defer func() { f.IsLeaseRequest = false }()
-			case **storagebase.WriteBatch:
-				*f = new(storagebase.WriteBatch)
+			case **storagepb.WriteBatch:
+				*f = new(storagepb.WriteBatch)
+				defer func() { *f = nil }()
+			case **storagepb.LogicalOpLog:
+				*f = new(storagepb.LogicalOpLog)
 				defer func() { *f = nil }()
 			default:
 				tf := v.Type().Field(i)
@@ -60,5 +59,28 @@ func TestEvalResultIsZero(t *testing.T) {
 		if !p.IsZero() {
 			t.Fatalf("%v unexpectedly non-zero", p)
 		}
+	}
+}
+
+func TestMergeAndDestroy(t *testing.T) {
+	var r0, r1, r2 Result
+	r1.Local.Metrics = new(Metrics)
+	r2.Local.Metrics = new(Metrics)
+
+	r1.Local.Metrics.LeaseRequestSuccess = 7
+
+	r2.Local.Metrics.ResolveAbort = 13
+	r2.Local.Metrics.LeaseRequestSuccess = 2
+
+	if err := r0.MergeAndDestroy(r1); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r0.MergeAndDestroy(r2); err != nil {
+		t.Fatal(err)
+	}
+
+	if f, exp := *r1.Local.Metrics, (Metrics{LeaseRequestSuccess: 9, ResolveAbort: 13}); f != exp {
+		t.Fatalf("expected %d, got %d", exp, f)
 	}
 }

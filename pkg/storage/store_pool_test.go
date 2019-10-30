@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -23,9 +19,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kr/pretty"
-	"github.com/pkg/errors"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
@@ -34,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/gossiputil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -41,6 +35,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/kr/pretty"
+	"github.com/pkg/errors"
 )
 
 var uniqueStore = []*roachpb.StoreDescriptor{
@@ -60,18 +57,20 @@ var uniqueStore = []*roachpb.StoreDescriptor{
 
 type mockNodeLiveness struct {
 	syncutil.Mutex
-	defaultNodeStatus NodeLivenessStatus
-	nodes             map[roachpb.NodeID]NodeLivenessStatus
+	defaultNodeStatus storagepb.NodeLivenessStatus
+	nodes             map[roachpb.NodeID]storagepb.NodeLivenessStatus
 }
 
-func newMockNodeLiveness(defaultNodeStatus NodeLivenessStatus) *mockNodeLiveness {
+func newMockNodeLiveness(defaultNodeStatus storagepb.NodeLivenessStatus) *mockNodeLiveness {
 	return &mockNodeLiveness{
 		defaultNodeStatus: defaultNodeStatus,
-		nodes:             map[roachpb.NodeID]NodeLivenessStatus{},
+		nodes:             map[roachpb.NodeID]storagepb.NodeLivenessStatus{},
 	}
 }
 
-func (m *mockNodeLiveness) setNodeStatus(nodeID roachpb.NodeID, status NodeLivenessStatus) {
+func (m *mockNodeLiveness) setNodeStatus(
+	nodeID roachpb.NodeID, status storagepb.NodeLivenessStatus,
+) {
 	m.Lock()
 	defer m.Unlock()
 	m.nodes[nodeID] = status
@@ -79,7 +78,7 @@ func (m *mockNodeLiveness) setNodeStatus(nodeID roachpb.NodeID, status NodeLiven
 
 func (m *mockNodeLiveness) nodeLivenessFunc(
 	nodeID roachpb.NodeID, now time.Time, threshold time.Duration,
-) NodeLivenessStatus {
+) storagepb.NodeLivenessStatus {
 	m.Lock()
 	defer m.Unlock()
 	if status, ok := m.nodes[nodeID]; ok {
@@ -91,7 +90,10 @@ func (m *mockNodeLiveness) nodeLivenessFunc(
 // createTestStorePool creates a stopper, gossip and storePool for use in
 // tests. Stopper must be stopped by the caller.
 func createTestStorePool(
-	timeUntilStoreDeadValue time.Duration, deterministic bool, defaultNodeStatus NodeLivenessStatus,
+	timeUntilStoreDeadValue time.Duration,
+	deterministic bool,
+	nodeCount NodeCountFunc,
+	defaultNodeStatus storagepb.NodeLivenessStatus,
 ) (*stop.Stopper, *gossip.Gossip, *hlc.ManualClock, *StorePool, *mockNodeLiveness) {
 	stopper := stop.NewStopper()
 	mc := hlc.NewManualClock(123)
@@ -101,7 +103,7 @@ func createTestStorePool(
 		log.AmbientContext{Tracer: st.Tracer}, &base.Config{Insecure: true}, clock, stopper,
 		&st.Version)
 	server := rpc.NewServer(rpcContext) // never started
-	g := gossip.NewTest(1, rpcContext, server, stopper, metric.NewRegistry())
+	g := gossip.NewTest(1, rpcContext, server, stopper, metric.NewRegistry(), config.DefaultZoneConfigRef())
 	mnl := newMockNodeLiveness(defaultNodeStatus)
 
 	TimeUntilStoreDead.Override(&st.SV, timeUntilStoreDeadValue)
@@ -110,6 +112,7 @@ func createTestStorePool(
 		st,
 		g,
 		clock,
+		nodeCount,
 		mnl.nodeLivenessFunc,
 		deterministic,
 	)
@@ -121,7 +124,9 @@ func createTestStorePool(
 func TestStorePoolGossipUpdate(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper, g, _, sp, _ := createTestStorePool(
-		TestTimeUntilStoreDead, false /* deterministic */, NodeLivenessStatus_DEAD)
+		TestTimeUntilStoreDead, false, /* deterministic */
+		func() int { return 0 }, /* NodeCount */
+		storagepb.NodeLivenessStatus_DEAD)
 	defer stopper.Stop(context.TODO())
 	sg := gossiputil.NewStoreGossiper(g)
 
@@ -144,14 +149,22 @@ func TestStorePoolGossipUpdate(t *testing.T) {
 func verifyStoreList(
 	sp *StorePool,
 	constraints []config.Constraints,
+	storeIDs roachpb.StoreIDSlice, // optional
 	rangeID roachpb.RangeID,
-	expected []int,
 	filter storeFilter,
+	expected []int,
 	expectedAliveStoreCount int,
 	expectedThrottledStoreCount int,
 ) error {
-	var actual []int
-	sl, aliveStoreCount, throttledStoreCount := sp.getStoreList(rangeID, filter)
+	var sl StoreList
+	var aliveStoreCount int
+	var throttled throttledStoreReasons
+	if storeIDs == nil {
+		sl, aliveStoreCount, throttled = sp.getStoreList(rangeID, filter)
+	} else {
+		sl, aliveStoreCount, throttled = sp.getStoreListFromIDs(storeIDs, rangeID, filter)
+	}
+	throttledStoreCount := len(throttled)
 	sl = sl.filter(constraints)
 	if aliveStoreCount != expectedAliveStoreCount {
 		return errors.Errorf("expected AliveStoreCount %d does not match actual %d",
@@ -161,6 +174,7 @@ func verifyStoreList(
 		return errors.Errorf("expected ThrottledStoreCount %d does not match actual %d",
 			expectedThrottledStoreCount, throttledStoreCount)
 	}
+	var actual []int
 	for _, store := range sl.stores {
 		actual = append(actual, int(store.StoreID))
 	}
@@ -178,7 +192,9 @@ func TestStorePoolGetStoreList(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	// We're going to manually mark stores dead in this test.
 	stopper, g, _, sp, mnl := createTestStorePool(
-		TestTimeUntilStoreDead, false /* deterministic */, NodeLivenessStatus_DEAD)
+		TestTimeUntilStoreDead, false, /* deterministic */
+		func() int { return 10 }, /* nodeCount */
+		storagepb.NodeLivenessStatus_DEAD)
 	defer stopper.Stop(context.TODO())
 	sg := gossiputil.NewStoreGossiper(g)
 	constraints := []config.Constraints{
@@ -227,13 +243,13 @@ func TestStorePoolGetStoreList(t *testing.T) {
 		Node:    roachpb.NodeDescriptor{NodeID: 6},
 		Attrs:   roachpb.Attributes{Attrs: required},
 	}
-	corruptReplicaStore := roachpb.StoreDescriptor{
+	absentStore := roachpb.StoreDescriptor{
 		StoreID: 7,
 		Node:    roachpb.NodeDescriptor{NodeID: 7},
 		Attrs:   roachpb.Attributes{Attrs: required},
 	}
 
-	corruptedRangeID := roachpb.RangeID(1)
+	const rangeID = roachpb.RangeID(1)
 
 	// Gossip and mark all alive initially.
 	sg.GossipStores([]*roachpb.StoreDescriptor{
@@ -243,88 +259,90 @@ func TestStorePoolGetStoreList(t *testing.T) {
 		&emptyStore,
 		&deadStore,
 		&declinedStore,
-		&corruptReplicaStore,
+		// absentStore is purposefully not gossiped.
 	}, t)
 	for i := 1; i <= 7; i++ {
-		mnl.setNodeStatus(roachpb.NodeID(i), NodeLivenessStatus_LIVE)
-	}
-
-	// Add some corrupt replicas that should not affect getStoreList().
-	sp.detailsMu.Lock()
-	sp.detailsMu.storeDetails[matchingStore.StoreID].deadReplicas[roachpb.RangeID(10)] =
-		[]roachpb.ReplicaDescriptor{{
-			StoreID: matchingStore.StoreID,
-			NodeID:  matchingStore.Node.NodeID,
-		}}
-	sp.detailsMu.storeDetails[matchingStore.StoreID].deadReplicas[roachpb.RangeID(11)] =
-		[]roachpb.ReplicaDescriptor{{
-			StoreID: matchingStore.StoreID,
-			NodeID:  matchingStore.Node.NodeID,
-		}}
-	sp.detailsMu.storeDetails[corruptReplicaStore.StoreID].deadReplicas[roachpb.RangeID(10)] =
-		[]roachpb.ReplicaDescriptor{{
-			StoreID: corruptReplicaStore.StoreID,
-			NodeID:  corruptReplicaStore.Node.NodeID,
-		}}
-	sp.detailsMu.Unlock()
-
-	if err := verifyStoreList(
-		sp,
-		constraints,
-		corruptedRangeID,
-		[]int{
-			int(matchingStore.StoreID),
-			int(supersetStore.StoreID),
-			int(deadStore.StoreID),
-			int(declinedStore.StoreID),
-			int(corruptReplicaStore.StoreID),
-		},
-		storeFilterNone,
-		/* expectedAliveStoreCount */ 7,
-		/* expectedThrottledStoreCount */ 0,
-	); err != nil {
-		t.Error(err)
+		mnl.setNodeStatus(roachpb.NodeID(i), storagepb.NodeLivenessStatus_LIVE)
 	}
 
 	// Set deadStore as dead.
-	mnl.setNodeStatus(deadStore.Node.NodeID, NodeLivenessStatus_DEAD)
+	mnl.setNodeStatus(deadStore.Node.NodeID, storagepb.NodeLivenessStatus_DEAD)
 	sp.detailsMu.Lock()
 	// Set declinedStore as throttled.
 	sp.detailsMu.storeDetails[declinedStore.StoreID].throttledUntil = sp.clock.Now().GoTime().Add(time.Hour)
-	// Add a corrupt replica to corruptReplicaStore.
-	sp.detailsMu.storeDetails[corruptReplicaStore.StoreID].deadReplicas[roachpb.RangeID(1)] =
-		[]roachpb.ReplicaDescriptor{{
-			StoreID: corruptReplicaStore.StoreID,
-			NodeID:  corruptReplicaStore.Node.NodeID,
-		}}
 	sp.detailsMu.Unlock()
 
+	// No filter or limited set of store IDs.
 	if err := verifyStoreList(
 		sp,
 		constraints,
-		corruptedRangeID,
+		nil, /* storeIDs */
+		rangeID,
+		storeFilterNone,
 		[]int{
 			int(matchingStore.StoreID),
 			int(supersetStore.StoreID),
 			int(declinedStore.StoreID),
 		},
-		storeFilterNone,
-		/* expectedAliveStoreCount */ 6,
+		/* expectedAliveStoreCount */ 5,
 		/* expectedThrottledStoreCount */ 1,
 	); err != nil {
 		t.Error(err)
 	}
 
+	// Filter out throttled stores but don't limit the set of store IDs.
 	if err := verifyStoreList(
 		sp,
 		constraints,
-		corruptedRangeID,
+		nil, /* storeIDs */
+		rangeID,
+		storeFilterThrottled,
 		[]int{
 			int(matchingStore.StoreID),
 			int(supersetStore.StoreID),
 		},
+		/* expectedAliveStoreCount */ 5,
+		/* expectedThrottledStoreCount */ 1,
+	); err != nil {
+		t.Error(err)
+	}
+
+	limitToStoreIDs := roachpb.StoreIDSlice{
+		matchingStore.StoreID,
+		declinedStore.StoreID,
+		absentStore.StoreID,
+	}
+
+	// No filter but limited to limitToStoreIDs.
+	// Note that supersetStore is not included.
+	if err := verifyStoreList(
+		sp,
+		constraints,
+		limitToStoreIDs,
+		rangeID,
+		storeFilterNone,
+		[]int{
+			int(matchingStore.StoreID),
+			int(declinedStore.StoreID),
+		},
+		/* expectedAliveStoreCount */ 2,
+		/* expectedThrottledStoreCount */ 1,
+	); err != nil {
+		t.Error(err)
+	}
+
+	// Filter out throttled stores and limit to limitToStoreIDs.
+	// Note that supersetStore is not included.
+	if err := verifyStoreList(
+		sp,
+		constraints,
+		limitToStoreIDs,
+		rangeID,
 		storeFilterThrottled,
-		/* expectedAliveStoreCount */ 6,
+		[]int{
+			int(matchingStore.StoreID),
+		},
+		/* expectedAliveStoreCount */ 2,
 		/* expectedThrottledStoreCount */ 1,
 	); err != nil {
 		t.Error(err)
@@ -431,7 +449,9 @@ func TestStorePoolUpdateLocalStore(t *testing.T) {
 	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
 	// We're going to manually mark stores dead in this test.
 	stopper, g, _, sp, _ := createTestStorePool(
-		TestTimeUntilStoreDead, false /* deterministic */, NodeLivenessStatus_DEAD)
+		TestTimeUntilStoreDead, false, /* deterministic */
+		func() int { return 10 }, /* nodeCount */
+		storagepb.NodeLivenessStatus_DEAD)
 	defer stopper.Stop(context.TODO())
 	sg := gossiputil.NewStoreGossiper(g)
 	stores := []*roachpb.StoreDescriptor{
@@ -439,22 +459,26 @@ func TestStorePoolUpdateLocalStore(t *testing.T) {
 			StoreID: 1,
 			Node:    roachpb.NodeDescriptor{NodeID: 1},
 			Capacity: roachpb.StoreCapacity{
-				Capacity:        100,
-				Available:       50,
-				RangeCount:      5,
-				LogicalBytes:    30,
-				WritesPerSecond: 30,
+				Capacity:         100,
+				Available:        50,
+				RangeCount:       5,
+				LeaseCount:       1,
+				LogicalBytes:     30,
+				QueriesPerSecond: 100,
+				WritesPerSecond:  30,
 			},
 		},
 		{
 			StoreID: 2,
 			Node:    roachpb.NodeDescriptor{NodeID: 2},
 			Capacity: roachpb.StoreCapacity{
-				Capacity:        100,
-				Available:       55,
-				RangeCount:      4,
-				LogicalBytes:    25,
-				WritesPerSecond: 25,
+				Capacity:         100,
+				Available:        55,
+				RangeCount:       4,
+				LeaseCount:       2,
+				LogicalBytes:     25,
+				QueriesPerSecond: 50,
+				WritesPerSecond:  25,
 			},
 		},
 	}
@@ -472,33 +496,69 @@ func TestStorePoolUpdateLocalStore(t *testing.T) {
 		rs.record(store.Node.NodeID)
 	}
 	manual.Increment(int64(MinStatsDuration + time.Second))
+	replica.leaseholderStats = rs
 	replica.writeStats = rs
 
-	rangeDesc := &roachpb.RangeDescriptor{
-		RangeID: replica.RangeID,
-	}
+	rangeUsageInfo := rangeUsageInfoForRepl(replica)
 
-	rangeInfo := rangeInfoForRepl(replica, rangeDesc)
-
-	sp.updateLocalStoreAfterRebalance(roachpb.StoreID(1), rangeInfo, roachpb.ADD_REPLICA)
+	sp.updateLocalStoreAfterRebalance(roachpb.StoreID(1), rangeUsageInfo, roachpb.ADD_REPLICA)
 	desc, ok := sp.getStoreDescriptor(roachpb.StoreID(1))
 	if !ok {
 		t.Fatalf("couldn't find StoreDescriptor for Store ID %d", 1)
 	}
-	QPS, _ := replica.writeStats.avgQPS()
-	if expectedBytes, expectedQPS := int64(36), 30+QPS; desc.Capacity.LogicalBytes != expectedBytes || desc.Capacity.WritesPerSecond != expectedQPS {
-		t.Fatalf("expected Logical bytes %d, but got %d, expected WritesPerSecond %f, but got %f",
-			expectedBytes, desc.Capacity.LogicalBytes, expectedQPS, desc.Capacity.WritesPerSecond)
+	QPS, _ := replica.leaseholderStats.avgQPS()
+	WPS, _ := replica.writeStats.avgQPS()
+	if expectedRangeCount := int32(6); desc.Capacity.RangeCount != expectedRangeCount {
+		t.Errorf("expected RangeCount %d, but got %d", expectedRangeCount, desc.Capacity.RangeCount)
+	}
+	if expectedBytes := int64(36); desc.Capacity.LogicalBytes != expectedBytes {
+		t.Errorf("expected logical bytes %d, but got %d", expectedBytes, desc.Capacity.LogicalBytes)
+	}
+	if expectedQPS := float64(100); desc.Capacity.QueriesPerSecond != expectedQPS {
+		t.Errorf("expected QueriesPerSecond %f, but got %f", expectedQPS, desc.Capacity.QueriesPerSecond)
+	}
+	if expectedWPS := 30 + WPS; desc.Capacity.WritesPerSecond != expectedWPS {
+		t.Errorf("expected WritesPerSecond %f, but got %f", expectedWPS, desc.Capacity.WritesPerSecond)
 	}
 
-	sp.updateLocalStoreAfterRebalance(roachpb.StoreID(2), rangeInfo, roachpb.REMOVE_REPLICA)
+	sp.updateLocalStoreAfterRebalance(roachpb.StoreID(2), rangeUsageInfo, roachpb.REMOVE_REPLICA)
 	desc, ok = sp.getStoreDescriptor(roachpb.StoreID(2))
 	if !ok {
 		t.Fatalf("couldn't find StoreDescriptor for Store ID %d", 2)
 	}
-	if expectedBytes, expectedQPS := int64(19), 25-QPS; desc.Capacity.LogicalBytes != expectedBytes || desc.Capacity.WritesPerSecond != expectedQPS {
-		t.Fatalf("expected Logical bytes %d, but got %d, expected WritesPerSecond %f, but got %f",
-			expectedBytes, desc.Capacity.LogicalBytes, expectedQPS, desc.Capacity.WritesPerSecond)
+	if expectedRangeCount := int32(3); desc.Capacity.RangeCount != expectedRangeCount {
+		t.Errorf("expected RangeCount %d, but got %d", expectedRangeCount, desc.Capacity.RangeCount)
+	}
+	if expectedBytes := int64(19); desc.Capacity.LogicalBytes != expectedBytes {
+		t.Errorf("expected logical bytes %d, but got %d", expectedBytes, desc.Capacity.LogicalBytes)
+	}
+	if expectedQPS := float64(50); desc.Capacity.QueriesPerSecond != expectedQPS {
+		t.Errorf("expected QueriesPerSecond %f, but got %f", expectedQPS, desc.Capacity.QueriesPerSecond)
+	}
+	if expectedWPS := 25 - WPS; desc.Capacity.WritesPerSecond != expectedWPS {
+		t.Errorf("expected WritesPerSecond %f, but got %f", expectedWPS, desc.Capacity.WritesPerSecond)
+	}
+
+	sp.updateLocalStoresAfterLeaseTransfer(roachpb.StoreID(1), roachpb.StoreID(2), rangeUsageInfo.QueriesPerSecond)
+	desc, ok = sp.getStoreDescriptor(roachpb.StoreID(1))
+	if !ok {
+		t.Fatalf("couldn't find StoreDescriptor for Store ID %d", 1)
+	}
+	if expectedLeaseCount := int32(0); desc.Capacity.LeaseCount != expectedLeaseCount {
+		t.Errorf("expected LeaseCount %d, but got %d", expectedLeaseCount, desc.Capacity.LeaseCount)
+	}
+	if expectedQPS := 100 - QPS; desc.Capacity.QueriesPerSecond != expectedQPS {
+		t.Errorf("expected QueriesPerSecond %f, but got %f", expectedQPS, desc.Capacity.QueriesPerSecond)
+	}
+	desc, ok = sp.getStoreDescriptor(roachpb.StoreID(2))
+	if !ok {
+		t.Fatalf("couldn't find StoreDescriptor for Store ID %d", 2)
+	}
+	if expectedLeaseCount := int32(3); desc.Capacity.LeaseCount != expectedLeaseCount {
+		t.Errorf("expected LeaseCount %d, but got %d", expectedLeaseCount, desc.Capacity.LeaseCount)
+	}
+	if expectedQPS := 50 + QPS; desc.Capacity.QueriesPerSecond != expectedQPS {
+		t.Errorf("expected QueriesPerSecond %f, but got %f", expectedQPS, desc.Capacity.QueriesPerSecond)
 	}
 }
 
@@ -506,11 +566,14 @@ func TestStorePoolUpdateLocalStore(t *testing.T) {
 // the local copy of store before that store has been gossiped will be a no-op.
 func TestStorePoolUpdateLocalStoreBeforeGossip(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
 	manual := hlc.NewManualClock(123)
 	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
 	stopper, _, _, sp, _ := createTestStorePool(
-		TestTimeUntilStoreDead, false /* deterministic */, NodeLivenessStatus_DEAD)
-	defer stopper.Stop(context.TODO())
+		TestTimeUntilStoreDead, false, /* deterministic */
+		func() int { return 10 }, /* nodeCount */
+		storagepb.NodeLivenessStatus_DEAD)
+	defer stopper.Stop(ctx)
 
 	// Create store.
 	node := roachpb.NodeDescriptor{NodeID: roachpb.NodeID(1)}
@@ -518,7 +581,14 @@ func TestStorePoolUpdateLocalStoreBeforeGossip(t *testing.T) {
 	stopper.AddCloser(eng)
 	cfg := TestStoreConfig(clock)
 	cfg.Transport = NewDummyRaftTransport(cfg.Settings)
-	store := NewStore(cfg, eng, &node)
+	store := NewStore(ctx, cfg, eng, &node)
+	// Fake an ident because this test doesn't want to start the store
+	// but without an Ident there will be NPEs.
+	store.Ident = &roachpb.StoreIdent{
+		ClusterID: uuid.Nil,
+		StoreID:   1,
+		NodeID:    1,
+	}
 
 	// Create replica.
 	rg := roachpb.RangeDescriptor{
@@ -528,17 +598,18 @@ func TestStorePoolUpdateLocalStoreBeforeGossip(t *testing.T) {
 	}
 	replica, err := NewReplica(&rg, store, roachpb.ReplicaID(0))
 	if err != nil {
-		t.Fatalf("make replica error : %s", err)
+		t.Fatalf("make replica error : %+v", err)
 	}
+	replica.leaseholderStats = newReplicaStats(store.Clock(), nil)
 
-	rangeInfo := rangeInfoForRepl(replica, &rg)
+	rangeUsageInfo := rangeUsageInfoForRepl(replica)
 
 	// Update StorePool, which should be a no-op.
 	storeID := roachpb.StoreID(1)
 	if _, ok := sp.getStoreDescriptor(storeID); ok {
 		t.Fatalf("StoreDescriptor not gossiped, should not be found")
 	}
-	sp.updateLocalStoreAfterRebalance(storeID, rangeInfo, roachpb.ADD_REPLICA)
+	sp.updateLocalStoreAfterRebalance(storeID, rangeUsageInfo, roachpb.ADD_REPLICA)
 	if _, ok := sp.getStoreDescriptor(storeID); ok {
 		t.Fatalf("StoreDescriptor still not gossiped, should not be found")
 	}
@@ -547,7 +618,9 @@ func TestStorePoolUpdateLocalStoreBeforeGossip(t *testing.T) {
 func TestStorePoolGetStoreDetails(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper, g, _, sp, _ := createTestStorePool(
-		TestTimeUntilStoreDead, false /* deterministic */, NodeLivenessStatus_DEAD)
+		TestTimeUntilStoreDead, false, /* deterministic */
+		func() int { return 10 }, /* nodeCount */
+		storagepb.NodeLivenessStatus_DEAD)
 	defer stopper.Stop(context.TODO())
 	sg := gossiputil.NewStoreGossiper(g)
 	sg.GossipStores(uniqueStore, t)
@@ -565,7 +638,9 @@ func TestStorePoolGetStoreDetails(t *testing.T) {
 func TestStorePoolFindDeadReplicas(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper, g, _, sp, mnl := createTestStorePool(
-		TestTimeUntilStoreDead, false /* deterministic */, NodeLivenessStatus_DEAD)
+		TestTimeUntilStoreDead, false, /* deterministic */
+		func() int { return 10 }, /* nodeCount */
+		storagepb.NodeLivenessStatus_DEAD)
 	defer stopper.Stop(context.TODO())
 	sg := gossiputil.NewStoreGossiper(g)
 
@@ -622,7 +697,7 @@ func TestStorePoolFindDeadReplicas(t *testing.T) {
 
 	sg.GossipStores(stores, t)
 	for i := 1; i <= 5; i++ {
-		mnl.setNodeStatus(roachpb.NodeID(i), NodeLivenessStatus_LIVE)
+		mnl.setNodeStatus(roachpb.NodeID(i), storagepb.NodeLivenessStatus_LIVE)
 	}
 
 	liveReplicas, deadReplicas := sp.liveAndDeadReplicas(0, replicas)
@@ -633,8 +708,8 @@ func TestStorePoolFindDeadReplicas(t *testing.T) {
 		t.Fatalf("expected no dead replicas initially, found %d (%v)", len(deadReplicas), deadReplicas)
 	}
 	// Mark nodes 4 & 5 as dead.
-	mnl.setNodeStatus(4, NodeLivenessStatus_DEAD)
-	mnl.setNodeStatus(5, NodeLivenessStatus_DEAD)
+	mnl.setNodeStatus(4, storagepb.NodeLivenessStatus_DEAD)
+	mnl.setNodeStatus(5, storagepb.NodeLivenessStatus_DEAD)
 
 	liveReplicas, deadReplicas = sp.liveAndDeadReplicas(0, replicas)
 	if a, e := liveReplicas, replicas[:3]; !reflect.DeepEqual(a, e) {
@@ -645,7 +720,7 @@ func TestStorePoolFindDeadReplicas(t *testing.T) {
 	}
 
 	// Mark node 4 as merely unavailable.
-	mnl.setNodeStatus(4, NodeLivenessStatus_UNAVAILABLE)
+	mnl.setNodeStatus(4, storagepb.NodeLivenessStatus_UNAVAILABLE)
 
 	liveReplicas, deadReplicas = sp.liveAndDeadReplicas(0, replicas)
 	if a, e := liveReplicas, replicas[:3]; !reflect.DeepEqual(a, e) {
@@ -666,7 +741,9 @@ func TestStorePoolFindDeadReplicas(t *testing.T) {
 func TestStorePoolDefaultState(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper, _, _, sp, _ := createTestStorePool(
-		TestTimeUntilStoreDead, false /* deterministic */, NodeLivenessStatus_DEAD)
+		TestTimeUntilStoreDead, false, /* deterministic */
+		func() int { return 10 }, /* nodeCount */
+		storagepb.NodeLivenessStatus_DEAD)
 	defer stopper.Stop(context.TODO())
 
 	liveReplicas, deadReplicas := sp.liveAndDeadReplicas(0, []roachpb.ReplicaDescriptor{{StoreID: 1}})
@@ -681,23 +758,25 @@ func TestStorePoolDefaultState(t *testing.T) {
 	if alive != 0 {
 		t.Errorf("expected no live stores; got a live count of %d", alive)
 	}
-	if throttled != 0 {
-		t.Errorf("expected no live stores; got a throttled count of %d", throttled)
+	if len(throttled) != 0 {
+		t.Errorf("expected no live stores; got throttled %v", throttled)
 	}
 }
 
 func TestStorePoolThrottle(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper, g, _, sp, _ := createTestStorePool(
-		TestTimeUntilStoreDead, false /* deterministic */, NodeLivenessStatus_DEAD)
+		TestTimeUntilStoreDead, false, /* deterministic */
+		func() int { return 10 }, /* nodeCount */
+		storagepb.NodeLivenessStatus_DEAD)
 	defer stopper.Stop(context.TODO())
 
 	sg := gossiputil.NewStoreGossiper(g)
 	sg.GossipStores(uniqueStore, t)
 
 	{
-		expected := sp.clock.Now().GoTime().Add(declinedReservationsTimeout.Get(&sp.st.SV))
-		sp.throttle(throttleDeclined, 1)
+		expected := sp.clock.Now().GoTime().Add(DeclinedReservationsTimeout.Get(&sp.st.SV))
+		sp.throttle(throttleDeclined, "", 1)
 
 		sp.detailsMu.Lock()
 		detail := sp.getStoreDetailLocked(1)
@@ -709,8 +788,8 @@ func TestStorePoolThrottle(t *testing.T) {
 	}
 
 	{
-		expected := sp.clock.Now().GoTime().Add(failedReservationsTimeout.Get(&sp.st.SV))
-		sp.throttle(throttleFailed, 1)
+		expected := sp.clock.Now().GoTime().Add(FailedReservationsTimeout.Get(&sp.st.SV))
+		sp.throttle(throttleFailed, "", 1)
 
 		sp.detailsMu.Lock()
 		detail := sp.getStoreDetailLocked(1)
@@ -725,7 +804,9 @@ func TestStorePoolThrottle(t *testing.T) {
 func TestGetLocalities(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper, g, _, sp, _ := createTestStorePool(
-		TestTimeUntilStoreDead, false /* deterministic */, NodeLivenessStatus_DEAD)
+		TestTimeUntilStoreDead, false, /* deterministic */
+		func() int { return 10 }, /* nodeCount */
+		storagepb.NodeLivenessStatus_DEAD)
 	defer stopper.Stop(context.TODO())
 	sg := gossiputil.NewStoreGossiper(g)
 
@@ -794,7 +875,9 @@ func TestGetLocalities(t *testing.T) {
 func TestStorePoolDecommissioningReplicas(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper, g, _, sp, mnl := createTestStorePool(
-		TestTimeUntilStoreDead, false /* deterministic */, NodeLivenessStatus_DEAD)
+		TestTimeUntilStoreDead, false, /* deterministic */
+		func() int { return 10 }, /* nodeCount */
+		storagepb.NodeLivenessStatus_DEAD)
 	defer stopper.Stop(context.TODO())
 	sg := gossiputil.NewStoreGossiper(g)
 
@@ -851,7 +934,7 @@ func TestStorePoolDecommissioningReplicas(t *testing.T) {
 
 	sg.GossipStores(stores, t)
 	for i := 1; i <= 5; i++ {
-		mnl.setNodeStatus(roachpb.NodeID(i), NodeLivenessStatus_LIVE)
+		mnl.setNodeStatus(roachpb.NodeID(i), storagepb.NodeLivenessStatus_LIVE)
 	}
 
 	liveReplicas, deadReplicas := sp.liveAndDeadReplicas(0, replicas)
@@ -862,9 +945,9 @@ func TestStorePoolDecommissioningReplicas(t *testing.T) {
 		t.Fatalf("expected no dead replicas initially, found %d (%v)", len(deadReplicas), deadReplicas)
 	}
 	// Mark node 4 as decommissioning.
-	mnl.setNodeStatus(4, NodeLivenessStatus_DECOMMISSIONING)
+	mnl.setNodeStatus(4, storagepb.NodeLivenessStatus_DECOMMISSIONING)
 	// Mark node 5 as dead.
-	mnl.setNodeStatus(5, NodeLivenessStatus_DEAD)
+	mnl.setNodeStatus(5, storagepb.NodeLivenessStatus_DEAD)
 
 	liveReplicas, deadReplicas = sp.liveAndDeadReplicas(0, replicas)
 	// Decommissioning replicas are considered live.

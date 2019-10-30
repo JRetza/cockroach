@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -35,7 +31,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
-	version "github.com/hashicorp/go-version"
+	"github.com/cockroachdb/cockroach/pkg/util/version"
 	"github.com/kr/pretty"
 )
 
@@ -66,10 +62,9 @@ var libsRe = func() *regexp.Regexp {
 		regexp.QuoteMeta("librt.so."),
 		regexp.QuoteMeta("libpthread.so."),
 		regexp.QuoteMeta("libdl.so."),
-		regexp.QuoteMeta("libtinfo.so."),
-		regexp.QuoteMeta("libncurses.so."),
 		regexp.QuoteMeta("libm.so."),
 		regexp.QuoteMeta("libc.so."),
+		regexp.QuoteMeta("libresolv.so."),
 		strings.Replace(regexp.QuoteMeta("ld-linux-ARCH.so."), "ARCH", ".*", -1),
 	}, "|")
 	return regexp.MustCompile(libs)
@@ -112,13 +107,13 @@ func main() {
 	var versionStr string
 	var isStableRelease bool
 	if *isRelease {
-		ver, err := version.NewVersion(branch)
+		ver, err := version.Parse(branch)
 		if err != nil {
 			log.Fatalf("refusing to build release with invalid version name '%s' (err: %s)", branch, err)
 		}
 
 		// Prerelease returns anything after the `-` and before metadata. eg: `beta` for `1.0.1-beta+metadata`
-		if ver.Prerelease() == "" {
+		if ver.PreRelease() == "" {
 			isStableRelease = true
 		}
 		versionStr = branch
@@ -163,16 +158,16 @@ func main() {
 	}
 
 	for _, target := range []struct {
-		buildType  string
-		baseSuffix string
+		buildType string
+		suffix    string
 	}{
 		// TODO(tamird): consider shifting this information into the builder
 		// image; it's conceivable that we'll want to target multiple versions
 		// of a given triple.
-		{buildType: "release-darwin", baseSuffix: "darwin-10.9-amd64"},
-		{buildType: "release-linux-gnu", baseSuffix: "linux-2.6.32-gnu-amd64"},
-		{buildType: "release-linux-musl", baseSuffix: "linux-2.6.32-musl-amd64"},
-		{buildType: "release-windows", baseSuffix: "windows-6.2-amd64.exe"},
+		{buildType: "darwin", suffix: ".darwin-10.9-amd64"},
+		{buildType: "linux-gnu", suffix: ".linux-2.6.32-gnu-amd64"},
+		{buildType: "linux-musl", suffix: ".linux-2.6.32-musl-amd64"},
+		{buildType: "windows", suffix: ".windows-6.2-amd64.exe"},
 	} {
 		for i, extraArgs := range []struct {
 			goflags string
@@ -195,9 +190,8 @@ func main() {
 			o.BucketName = bucketName
 			o.Branch = branch
 			o.BuildType = target.buildType
-			o.BaseSuffix = target.baseSuffix
 			o.GoFlags = extraArgs.goflags
-			o.Suffix = extraArgs.suffix
+			o.Suffix = extraArgs.suffix + target.suffix
 			o.Tags = extraArgs.tags
 
 			log.Printf("building %s", pretty.Sprint(o))
@@ -274,9 +268,7 @@ func buildOneCockroach(svc s3putter, o opts) {
 	}()
 
 	{
-		recipe := "build"
-		args := []string{recipe}
-		args = append(args, fmt.Sprintf("%s=%s", "TYPE", o.BuildType))
+		args := []string{o.BuildType}
 		args = append(args, fmt.Sprintf("%s=%s", "GOFLAGS", o.GoFlags))
 		args = append(args, fmt.Sprintf("%s=%s", "SUFFIX", o.Suffix))
 		args = append(args, fmt.Sprintf("%s=%s", "TAGS", o.Tags))
@@ -284,7 +276,7 @@ func buildOneCockroach(svc s3putter, o opts) {
 		if *isRelease {
 			args = append(args, fmt.Sprintf("%s=%s", "BUILD_TAGGED_RELEASE", "true"))
 		}
-		cmd := exec.Command("make", args...)
+		cmd := exec.Command("mkrelease", args...)
 		cmd.Dir = o.PkgDir
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
@@ -295,7 +287,7 @@ func buildOneCockroach(svc s3putter, o opts) {
 	}
 
 	if strings.Contains(o.BuildType, "linux") {
-		binaryName := fmt.Sprintf("./cockroach%s-%s", o.Suffix, o.BaseSuffix)
+		binaryName := "./cockroach" + o.Suffix
 
 		cmd := exec.Command(binaryName, "version")
 		cmd.Dir = o.PkgDir
@@ -332,7 +324,7 @@ func buildOneCockroach(svc s3putter, o opts) {
 		}
 	}
 
-	o.Base = fmt.Sprintf("cockroach%s-%s", o.Suffix, o.BaseSuffix)
+	o.Base = "cockroach" + o.Suffix
 	o.AbsolutePath = filepath.Join(o.PkgDir, o.Base)
 	{
 		var err error
@@ -394,11 +386,10 @@ type opts struct {
 	Branch             string
 	ReleaseVersionStrs []string
 
-	BuildType  string
-	BaseSuffix string
-	GoFlags    string
-	Suffix     string
-	Tags       string
+	BuildType string
+	GoFlags   string
+	Suffix    string
+	Tags      string
 
 	Base         string
 	BucketName   string
@@ -416,9 +407,6 @@ func TrimDotExe(name string) (string, bool) {
 func putNonRelease(svc s3putter, o opts) {
 	const repoName = "cockroach"
 	remoteName, hasExe := TrimDotExe(o.Base)
-	// Replace cockroach{suffix}-{target suffix} with
-	// cockroach{suffix}.{target suffix}.
-	remoteName = strings.Replace(remoteName, "-", ".", 1)
 	// TODO(tamird): do we want to keep doing this? No longer
 	// doing so requires updating cockroachlabs/production, and
 	// possibly cockroachdb/cockroach-go.
@@ -447,9 +435,9 @@ func putNonRelease(svc s3putter, o opts) {
 	}
 	latestKey := fmt.Sprintf("%s/%s.%s", repoName, remoteName, latestSuffix)
 	if _, err := svc.PutObject(&s3.PutObjectInput{
-		Bucket:       &o.BucketName,
-		CacheControl: &noCache,
-		Key:          &latestKey,
+		Bucket:                  &o.BucketName,
+		CacheControl:            &noCache,
+		Key:                     &latestKey,
 		WebsiteRedirectLocation: &versionKey,
 	}); err != nil {
 		log.Fatalf("s3 redirect to %s: %s", versionKey, err)
@@ -457,7 +445,7 @@ func putNonRelease(svc s3putter, o opts) {
 }
 
 func putRelease(svc s3putter, o opts) {
-	targetSuffix, hasExe := TrimDotExe(o.BaseSuffix)
+	targetSuffix, hasExe := TrimDotExe(o.Suffix)
 	// TODO(tamird): remove this weirdness. Requires updating
 	// "users" e.g. docs, cockroachdb/cockroach-go, maybe others.
 	if strings.Contains(o.BuildType, "linux") {
@@ -473,7 +461,7 @@ func putRelease(svc s3putter, o opts) {
 
 	for _, releaseVersionStr := range o.ReleaseVersionStrs {
 		archiveBase := fmt.Sprintf("cockroach-%s", releaseVersionStr)
-		targetArchiveBase := fmt.Sprintf("%s.%s", archiveBase, targetSuffix)
+		targetArchiveBase := archiveBase + targetSuffix
 		var targetArchive string
 		var body bytes.Buffer
 		if hasExe {

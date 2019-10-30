@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package opt
 
@@ -18,6 +14,7 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // Operator describes the type of operation that a memo expression performs.
@@ -25,19 +22,87 @@ import (
 // (and, or, plus, variable).
 type Operator uint16
 
-// MaxOperands is the maximum number of operands that an operator can have.
-// Increasing this limit can have a large memory impact, as every memo
-// expression uses memory for the max number of operands, even if it does not
-// have that many.
-const MaxOperands = 3
-
 // String returns the name of the operator as a string.
-func (i Operator) String() string {
-	if i >= Operator(len(opNames)-1) {
-		return fmt.Sprintf("Operator(%d)", i)
+func (op Operator) String() string {
+	if op >= Operator(len(opNames)-1) {
+		return fmt.Sprintf("Operator(%d)", op)
 	}
+	return opNames[opNameIndexes[op]:opNameIndexes[op+1]]
+}
 
-	return opNames[opIndexes[i]:opIndexes[i+1]]
+// SyntaxTag returns the name of the operator using the SQL syntax that most
+// closely matches it.
+func (op Operator) SyntaxTag() string {
+	// Handle any special cases where default codegen tag isn't best choice as
+	// switch cases.
+	switch op {
+	default:
+		// Use default codegen tag, which is mechanically derived from the
+		// operator name.
+		if op >= Operator(len(opNames)-1) {
+			// Use UNKNOWN.
+			op = 0
+		}
+		return opSyntaxTags[opSyntaxTagIndexes[op]:opSyntaxTagIndexes[op+1]]
+	}
+}
+
+// Expr is a node in an expression tree. It offers methods to traverse and
+// inspect the tree. Each node in the tree has an enumerated operator type, zero
+// or more children, and an optional private value. The entire tree can be
+// easily visited using a pattern like this:
+//
+//   var visit func(e Expr)
+//   visit := func(e Expr) {
+//     for i, n := 0, e.ChildCount(); i < n; i++ {
+//       visit(e.Child(i))
+//     }
+//   }
+//
+type Expr interface {
+	// Op returns the operator type of the expression.
+	Op() Operator
+
+	// ChildCount returns the number of children of the expression.
+	ChildCount() int
+
+	// Child returns the nth child of the expression.
+	Child(nth int) Expr
+
+	// Private returns operator-specific data. Callers are expected to know the
+	// type and format of the data, which will differ from operator to operator.
+	// For example, an operator may choose to return one of its fields, or perhaps
+	// a pointer to itself, or nil if there is nothing useful to return.
+	Private() interface{}
+
+	// String returns a human-readable string representation for the expression
+	// that can be used for debugging and testing.
+	String() string
+}
+
+// ScalarID is the type of the memo-unique identifier given to every scalar
+// expression.
+type ScalarID int
+
+// ScalarExpr is a scalar expression, which is an expression that returns a
+// primitive-typed value like boolean or string rather than rows and columns.
+type ScalarExpr interface {
+	Expr
+
+	// ID is a unique (within the context of a memo) ID that can be
+	// used to define a total order over ScalarExprs.
+	ID() ScalarID
+
+	// DataType is the SQL type of the expression.
+	DataType() *types.T
+}
+
+// MutableExpr is implemented by expressions that allow their children to be
+// updated.
+type MutableExpr interface {
+	// SetChild updates the nth child of the expression to instead be the given
+	// child expression.
+	SetChild(nth int, child Expr)
 }
 
 // ComparisonOpMap maps from a semantic tree comparison operator type to an
@@ -71,6 +136,7 @@ var ComparisonOpReverseMap = map[Operator]tree.ComparisonOperator{
 	JsonExistsOp:     tree.JSONExists,
 	JsonSomeExistsOp: tree.JSONSomeExists,
 	JsonAllExistsOp:  tree.JSONAllExists,
+	OverlapsOp:       tree.Overlaps,
 }
 
 // BinaryOpReverseMap maps from an optimizer operator type to a semantic tree
@@ -105,23 +171,45 @@ var UnaryOpReverseMap = map[Operator]tree.UnaryOperator{
 // AggregateOpReverseMap maps from an optimizer operator type to the name of an
 // aggregation function.
 var AggregateOpReverseMap = map[Operator]string{
-	ArrayAggOp:  "array_agg",
-	AvgOp:       "avg",
-	BoolAndOp:   "bool_and",
-	BoolOrOp:    "bool_or",
-	ConcatAggOp: "concat_agg",
-	CountOp:     "count",
-	CountRowsOp: "count_rows",
-	MaxOp:       "max",
-	MinOp:       "min",
-	SumIntOp:    "sum_int",
-	SumOp:       "sum",
-	SqrDiffOp:   "sqrdiff",
-	VarianceOp:  "variance",
-	StdDevOp:    "stddev",
-	XorAggOp:    "xor_agg",
-	JsonAggOp:   "json_agg",
-	JsonbAggOp:  "jsonb_agg",
+	ArrayAggOp:        "array_agg",
+	AvgOp:             "avg",
+	BitAndAggOp:       "bit_and",
+	BitOrAggOp:        "bit_or",
+	BoolAndOp:         "bool_and",
+	BoolOrOp:          "bool_or",
+	ConcatAggOp:       "concat_agg",
+	CountOp:           "count",
+	CountRowsOp:       "count_rows",
+	MaxOp:             "max",
+	MinOp:             "min",
+	SumIntOp:          "sum_int",
+	SumOp:             "sum",
+	SqrDiffOp:         "sqrdiff",
+	VarianceOp:        "variance",
+	StdDevOp:          "stddev",
+	XorAggOp:          "xor_agg",
+	JsonAggOp:         "json_agg",
+	JsonbAggOp:        "jsonb_agg",
+	StringAggOp:       "string_agg",
+	ConstAggOp:        "any_not_null",
+	ConstNotNullAggOp: "any_not_null",
+	AnyNotNullAggOp:   "any_not_null",
+}
+
+// WindowOpReverseMap maps from an optimizer operator type to the name of a
+// window function.
+var WindowOpReverseMap = map[Operator]string{
+	RankOp:        "rank",
+	RowNumberOp:   "row_number",
+	DenseRankOp:   "dense_rank",
+	PercentRankOp: "percent_rank",
+	CumeDistOp:    "cume_dist",
+	NtileOp:       "ntile",
+	LagOp:         "lag",
+	LeadOp:        "lead",
+	FirstValueOp:  "first_value",
+	LastValueOp:   "last_value",
+	NthValueOp:    "nth_value",
 }
 
 // NegateOpMap maps from a comparison operator type to its negated operator
@@ -161,6 +249,44 @@ func BoolOperatorRequiresNotNullArgs(op Operator) bool {
 		return true
 	}
 	return false
+}
+
+// AggregateIgnoresNulls returns true if the given aggregate operator has a
+// single input, and if it always evaluates to the same result regardless of
+// how many NULL values are included in that input, in any order.
+func AggregateIgnoresNulls(op Operator) bool {
+	switch op {
+	case AvgOp, BitAndAggOp, BitOrAggOp, BoolAndOp, BoolOrOp, CountOp, MaxOp, MinOp,
+		SumIntOp, SumOp, SqrDiffOp, VarianceOp, StdDevOp, XorAggOp, ConstNotNullAggOp,
+		AnyNotNullAggOp, StringAggOp:
+		return true
+	}
+	return false
+}
+
+// AggregateIsNullOnEmpty returns true if the given aggregate operator has a
+// single input, and if it returns NULL when the input set contains no values.
+// This group of aggregates overlaps considerably with the AggregateIgnoresNulls
+// group, with the notable exception of COUNT, which returns zero instead of
+// NULL when its input is empty.
+func AggregateIsNullOnEmpty(op Operator) bool {
+	switch op {
+	case AvgOp, BitAndAggOp, BitOrAggOp, BoolAndOp, BoolOrOp, MaxOp, MinOp, SumIntOp,
+		SumOp, SqrDiffOp, VarianceOp, StdDevOp, XorAggOp, ConstAggOp, ConstNotNullAggOp, ArrayAggOp,
+		ConcatAggOp, JsonAggOp, JsonbAggOp, AnyNotNullAggOp, StringAggOp:
+		return true
+	}
+	return false
+}
+
+// OpaqueMetadata is an object stored in OpaqueRelExpr and passed
+// through to the exec factory.
+type OpaqueMetadata interface {
+	ImplementsOpaqueMetadata()
+
+	// String is a short description used when printing optimizer trees and when
+	// forming error messages; it should be the SQL statement tag.
+	String() string
 }
 
 func init() {

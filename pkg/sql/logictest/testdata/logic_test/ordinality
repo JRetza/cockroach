@@ -1,7 +1,7 @@
-# LogicTest: default opt parallel-stmts distsql distsql-opt distsql-metadata
+# LogicTest: local fakedist fakedist-metadata fakedist-disk fakedist-vec
 
 query TI colnames
-SELECT * FROM (VALUES ('a'), ('b')) WITH ORDINALITY AS X(name, i)
+SELECT * FROM (VALUES ('a'), ('b')) WITH ORDINALITY AS x(name, i)
 ----
 name i
 a 1
@@ -29,11 +29,11 @@ SELECT * FROM foo WITH ORDINALITY LIMIT 1
 a 1
 
 query I
-SELECT MAX(ordinality) FROM foo WITH ORDINALITY
+SELECT max(ordinality) FROM foo WITH ORDINALITY
 ----
 2
 
-query TITI
+query TITI rowsort
 SELECT * FROM foo WITH ORDINALITY AS a, foo WITH ORDINALITY AS b
 ----
 a 1 a 1
@@ -80,3 +80,13 @@ SELECT ordinality = row_number() OVER () FROM foo WITH ORDINALITY
 true
 true
 true
+
+# Regression test for #33659
+statement ok
+TABLE [SHOW ZONE CONFIGURATIONS] WITH ORDINALITY
+
+# Regression test for #41760
+query TI
+SELECT * FROM (SELECT * FROM foo LIMIT 1) WITH ORDINALITY
+----
+a 1

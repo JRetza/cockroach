@@ -14,29 +14,74 @@ import (
 	"fmt"
 	"io/ioutil"
 
-	"github.com/pkg/errors"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl/engineccl"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/batcheval"
+	"github.com/cockroachdb/cockroach/pkg/storage/bulk"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
-	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/pkg/errors"
 )
 
-var importBatchSize = settings.RegisterByteSizeSetting(
-	"kv.import.batch_size",
-	"",
-	32<<20,
-)
+var importBatchSize = func() *settings.ByteSizeSetting {
+	s := settings.RegisterByteSizeSetting(
+		"kv.bulk_ingest.batch_size",
+		"the maximum size of the payload in an AddSSTable request",
+		16<<20,
+	)
+	return s
+}()
+
+var importPKAdderBufferSize = func() *settings.ByteSizeSetting {
+	s := settings.RegisterByteSizeSetting(
+		"kv.bulk_ingest.pk_buffer_size",
+		"the initial size of the BulkAdder buffer handling primary index imports",
+		32<<20,
+	)
+	return s
+}()
+
+var importPKAdderMaxBufferSize = func() *settings.ByteSizeSetting {
+	s := settings.RegisterByteSizeSetting(
+		"kv.bulk_ingest.max_pk_buffer_size",
+		"the maximum size of the BulkAdder buffer handling primary index imports",
+		128<<20,
+	)
+	return s
+}()
+
+var importIndexAdderBufferSize = func() *settings.ByteSizeSetting {
+	s := settings.RegisterByteSizeSetting(
+		"kv.bulk_ingest.index_buffer_size",
+		"the initial size of the BulkAdder buffer handling secondary index imports",
+		32<<20,
+	)
+	return s
+}()
+
+var importIndexAdderMaxBufferSize = func() *settings.ByteSizeSetting {
+	s := settings.RegisterByteSizeSetting(
+		"kv.bulk_ingest.max_index_buffer_size",
+		"the maximum size of the BulkAdder buffer handling secondary index imports",
+		512<<20,
+	)
+	return s
+}()
+
+var importBufferIncrementSize = func() *settings.ByteSizeSetting {
+	s := settings.RegisterByteSizeSetting(
+		"kv.bulk_ingest.buffer_increment",
+		"the size by which the BulkAdder attempts to grow its buffer before flushing",
+		32<<20,
+	)
+	return s
+}()
 
 // commandMetadataEstimate is an estimate of how much metadata Raft will add to
 // an AddSSTable command. It is intentionally a vast overestimate to avoid
@@ -44,7 +89,6 @@ var importBatchSize = settings.RegisterByteSizeSetting(
 const commandMetadataEstimate = 1 << 20 // 1 MB
 
 func init() {
-	importBatchSize.Hide()
 	storage.SetImportCmd(evalImport)
 
 	// Ensure that the user cannot set the maximum raft command size so low that
@@ -69,86 +113,40 @@ func MaxImportBatchSize(st *cluster.Settings) int64 {
 	return desiredSize
 }
 
-type sstBatcher struct {
-	sstWriter     engine.RocksDBSstFileWriter
-	batchStartKey []byte
-	batchEndKey   []byte
-}
-
-func (b *sstBatcher) Add(key engine.MVCCKey, value []byte) error {
-	// Update the range currently represented in this batch, as
-	// necessary.
-	if len(b.batchStartKey) == 0 || bytes.Compare(key.Key, b.batchStartKey) < 0 {
-		b.batchStartKey = append(b.batchStartKey[:0], key.Key...)
+// ImportBufferConfigSizes determines the minimum, maximum and step size for the
+// BulkAdder buffer used in import.
+func ImportBufferConfigSizes(st *cluster.Settings, isPKAdder bool) (int64, int64, int64) {
+	if isPKAdder {
+		return importPKAdderBufferSize.Get(&st.SV),
+			importPKAdderMaxBufferSize.Get(&st.SV),
+			importBufferIncrementSize.Get(&st.SV)
 	}
-	if len(b.batchEndKey) == 0 || bytes.Compare(key.Key, b.batchEndKey) > 0 {
-		b.batchEndKey = append(b.batchEndKey[:0], key.Key...)
-	}
-
-	return b.sstWriter.Add(engine.MVCCKeyValue{Key: key, Value: value})
-}
-
-func (b *sstBatcher) Size() int64 {
-	return b.sstWriter.DataSize
-}
-
-func (b *sstBatcher) Finish(ctx context.Context, db *client.DB) error {
-	start := roachpb.Key(b.batchStartKey)
-	// The end key of the WriteBatch request is exclusive, but batchEndKey is
-	// currently the largest key in the batch. Increment it.
-	end := roachpb.Key(b.batchEndKey).Next()
-
-	sstBytes, err := b.sstWriter.Finish()
-	if err != nil {
-		return errors.Wrapf(err, "finishing constructed sstable")
-	}
-
-	return AddSSTable(ctx, db, start, end, sstBytes)
-}
-
-func (b *sstBatcher) Close() {
-	b.sstWriter.Close()
-}
-
-// AddSSTable retries db.AddSSTable if retryable errors occur.
-func AddSSTable(ctx context.Context, db *client.DB, start, end roachpb.Key, sstBytes []byte) error {
-	const maxAddSSTableRetries = 10
-	for i := 0; ; i++ {
-		log.VEventf(ctx, 2, "sending AddSSTable [%s,%s)", start, end)
-		// TODO(dan): This will fail if the range has split.
-		err := db.AddSSTable(ctx, start, end, sstBytes)
-		if err == nil {
-			return nil
-		}
-		if _, ok := err.(*roachpb.AmbiguousResultError); i == maxAddSSTableRetries || !ok {
-			return errors.Wrapf(err, "addsstable [%s,%s)", start, end)
-		}
-		log.Warningf(ctx, "addsstable [%s,%s) attempt %d failed: %+v",
-			start, end, i, err)
-		continue
-	}
+	return importIndexAdderBufferSize.Get(&st.SV),
+		importIndexAdderMaxBufferSize.Get(&st.SV),
+		importBufferIncrementSize.Get(&st.SV)
 }
 
 // evalImport bulk loads key/value entries.
 func evalImport(ctx context.Context, cArgs batcheval.CommandArgs) (*roachpb.ImportResponse, error) {
 	args := cArgs.Args.(*roachpb.ImportRequest)
 	db := cArgs.EvalCtx.DB()
-	kr, err := MakeKeyRewriter(args.Rekeys)
+	// args.Rekeys could be using table descriptors from either the old or new
+	// foreign key representation on the table descriptor, but this is fine
+	// because foreign keys don't matter for the key rewriter.
+	kr, err := MakeKeyRewriterFromRekeys(args.Rekeys)
 	if err != nil {
 		return nil, errors.Wrap(err, "make key rewriter")
 	}
-
-	if err := cArgs.EvalCtx.GetLimiters().ConcurrentImports.Begin(ctx); err != nil {
+	if err := cArgs.EvalCtx.GetLimiters().ConcurrentImportRequests.Begin(ctx); err != nil {
 		return nil, err
 	}
-	defer cArgs.EvalCtx.GetLimiters().ConcurrentImports.Finish()
+	defer cArgs.EvalCtx.GetLimiters().ConcurrentImportRequests.Finish()
 
-	var rows rowCounter
 	var iters []engine.SimpleIterator
 	for _, file := range args.Files {
-		log.VEventf(ctx, 2, "import file %s %s", file.Path, args.Span.Key)
+		log.VEventf(ctx, 2, "import file %s %s", file.Path, args.Key)
 
-		dir, err := MakeExportStorage(ctx, file.Dir, cArgs.EvalCtx.ClusterSettings())
+		dir, err := cArgs.EvalCtx.GetExternalStorage(ctx, file.Dir)
 		if err != nil {
 			return nil, err
 		}
@@ -174,8 +172,6 @@ func evalImport(ctx context.Context, cArgs batcheval.CommandArgs) (*roachpb.Impo
 		dataSize := int64(len(fileContents))
 		log.Eventf(ctx, "fetched file (%s)", humanizeutil.IBytes(dataSize))
 
-		rows.BulkOpSummary.DataSize += dataSize
-
 		if len(file.Sha512) > 0 {
 			checksum, err := SHA512ChecksumData(fileContents)
 			if err != nil {
@@ -186,7 +182,7 @@ func evalImport(ctx context.Context, cArgs batcheval.CommandArgs) (*roachpb.Impo
 			}
 		}
 
-		iter, err := engineccl.NewMemSSTIterator(fileContents, false)
+		iter, err := engine.NewMemSSTIterator(fileContents, false)
 		if err != nil {
 			return nil, err
 		}
@@ -195,29 +191,16 @@ func evalImport(ctx context.Context, cArgs batcheval.CommandArgs) (*roachpb.Impo
 		iters = append(iters, iter)
 	}
 
-	var batcher *sstBatcher
-	makeBatcher := func() error {
-		if batcher != nil {
-			return errors.New("cannot overwrite a batcher")
-		}
-		sstWriter, err := engine.MakeRocksDBSstFileWriter()
-		if err != nil {
-			return errors.Wrapf(err, "making sstBatcher")
-		}
-		batcher = &sstBatcher{sstWriter: sstWriter}
-		return nil
-	}
-	if err := makeBatcher(); err != nil {
+	batcher, err := bulk.MakeSSTBatcher(ctx, db, uint64(MaxImportBatchSize(cArgs.EvalCtx.ClusterSettings())))
+	if err != nil {
 		return nil, err
 	}
 	defer batcher.Close()
 
-	g := ctxgroup.WithContext(ctx)
 	startKeyMVCC, endKeyMVCC := engine.MVCCKey{Key: args.DataSpan.Key}, engine.MVCCKey{Key: args.DataSpan.EndKey}
-	iter := engineccl.MakeMultiIterator(iters)
+	iter := engine.MakeMultiIterator(iters)
 	defer iter.Close()
 	var keyScratch, valueScratch []byte
-	maxSize := MaxImportBatchSize(cArgs.EvalCtx.ClusterSettings())
 
 	for iter.Seek(startKeyMVCC); ; {
 		ok, err := iter.Valid()
@@ -252,7 +235,7 @@ func evalImport(ctx context.Context, cArgs batcheval.CommandArgs) (*roachpb.Impo
 		value := roachpb.Value{RawBytes: valueScratch}
 		iter.NextKey()
 
-		key.Key, ok, err = kr.RewriteKey(key.Key)
+		key.Key, ok, err = kr.RewriteKey(key.Key, false /* isFromSpan */)
 		if err != nil {
 			return nil, err
 		}
@@ -272,43 +255,14 @@ func evalImport(ctx context.Context, cArgs batcheval.CommandArgs) (*roachpb.Impo
 		if log.V(3) {
 			log.Infof(ctx, "Put %s -> %s", key.Key, value.PrettyPrint())
 		}
-
-		if err := rows.count(key.Key); err != nil {
-			return nil, errors.Wrapf(err, "decoding %s", key.Key)
-		}
-
-		if err := batcher.Add(key, value.RawBytes); err != nil {
+		if err := batcher.AddMVCCKey(ctx, key, value.RawBytes); err != nil {
 			return nil, errors.Wrapf(err, "adding to batch: %s -> %s", key, value.PrettyPrint())
-		}
-
-		if size := batcher.Size(); size > maxSize {
-			finishBatcher := batcher
-			batcher = nil
-			log.Eventf(ctx, "triggering finish of batch of size %s", humanizeutil.IBytes(size))
-			g.GoCtx(func(ctx context.Context) error {
-				defer log.Event(ctx, "finished batch")
-				defer finishBatcher.Close()
-				return errors.Wrapf(finishBatcher.Finish(ctx, db), "import [%s, %s)", startKeyMVCC.Key, endKeyMVCC.Key)
-			})
-			if err := makeBatcher(); err != nil {
-				return nil, err
-			}
 		}
 	}
 	// Flush out the last batch.
-	if batcher.Size() > 0 {
-		g.GoCtx(func(ctx context.Context) error {
-			defer log.Event(ctx, "finished batch")
-			defer batcher.Close()
-			return batcher.Finish(ctx, db)
-		})
-	}
-	log.Event(ctx, "waiting for batchers to finish")
-
-	if err := g.Wait(); err != nil {
+	if err := batcher.Flush(ctx); err != nil {
 		return nil, err
 	}
 	log.Event(ctx, "done")
-
-	return &roachpb.ImportResponse{Imported: rows.BulkOpSummary}, nil
+	return &roachpb.ImportResponse{Imported: batcher.GetSummary()}, nil
 }

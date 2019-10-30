@@ -5,7 +5,6 @@ CockroachDB is a cloud-native SQL database for building global, scalable cloud s
 
 [![TeamCity CI](https://teamcity.cockroachdb.com/guestAuth/app/rest/builds/buildType:(id:Cockroach_UnitTests)/statusIcon.svg)](https://teamcity.cockroachdb.com/viewLog.html?buildTypeId=Cockroach_UnitTests&buildId=lastFinished&guest=1)
 [![GoDoc](https://godoc.org/github.com/cockroachdb/cockroach?status.svg)](https://godoc.org/github.com/cockroachdb/cockroach)
-[![Gitter](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/cockroachdb/cockroach?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge)
 
 - [What is CockroachDB?](#what-is-cockroachdb)
 - [Docs](#docs)
@@ -33,12 +32,6 @@ https://www.cockroachlabs.com/docs/stable/architecture/overview.html).
 Here’s a quick explainer video:
 
 <a href='https://www.youtube.com/watch?v=VgXiMcbGwzQ'> <img src='docs/media/explainer-video-preview.png' width='50%'> </a>
-
-
-## Status
-
-CockroachDB is production-ready. See our
-[Roadmap](https://github.com/cockroachdb/cockroach/wiki/Roadmap) for a list of features planned or in development.
 
 ## Docs
 
@@ -85,15 +78,13 @@ CockroachDB supports the PostgreSQL wire protocol, so you can use any available 
   [Stack Overflow](https://stackoverflow.com/questions/tagged/cockroachdb) - Ask questions,
   find answers, and help other users.
 
-- [Join us on Gitter](https://gitter.im/cockroachdb/cockroach) - This is the most immediate
-  way to connect with CockroachDB engineers.
-
 - For filing bugs, suggesting improvements, or requesting new features, help us out by
   [opening an issue](https://github.com/cockroachdb/cockroach/issues/new).
 
 ## Contributing
 
-We're an open source project and welcome contributions. See our [Contributing Guide](https://www.cockroachlabs.com/docs/stable/contribute-to-cockroachdb.html) for more details.
+We're an open source project and welcome contributions. See our
+[Contributor Wiki](https://wiki.crdb.io/wiki/spaces/CRDB/pages/73204033/Contributing+to+CockroachDB) for more details.
 
 Engineering discussion takes place on our public mailing list,
 [cockroach-db@googlegroups.com](https://groups.google.com/forum/#!forum/cockroach-db).

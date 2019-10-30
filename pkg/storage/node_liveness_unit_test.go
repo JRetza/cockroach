@@ -1,22 +1,19 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
 import (
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
@@ -24,8 +21,8 @@ import (
 func TestShouldReplaceLiveness(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	l := func(epo int64, expiration hlc.Timestamp, draining, decom bool) Liveness {
-		return Liveness{
+	l := func(epo int64, expiration hlc.Timestamp, draining, decom bool) storagepb.Liveness {
+		return storagepb.Liveness{
 			Epoch:           epo,
 			Expiration:      hlc.LegacyTimestamp(expiration),
 			Draining:        draining,
@@ -39,12 +36,12 @@ func TestShouldReplaceLiveness(t *testing.T) {
 	now := hlc.Timestamp{WallTime: 12345}
 
 	for _, test := range []struct {
-		old, new Liveness
+		old, new storagepb.Liveness
 		exp      bool
 	}{
 		{
 			// Epoch update only.
-			Liveness{},
+			storagepb.Liveness{},
 			l(1, hlc.Timestamp{}, false, false),
 			yes,
 		},

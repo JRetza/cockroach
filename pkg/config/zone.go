@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package config
 
@@ -19,11 +15,14 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
 )
 
@@ -76,96 +75,11 @@ func ZoneSpecifierFromID(
 	if err != nil {
 		return tree.ZoneSpecifier{}, err
 	}
-	tn := tree.NewTableName(tree.Name(db), tree.Name(name))
 	return tree.ZoneSpecifier{
-		TableOrIndex: tree.TableNameWithIndex{
-			Table: tree.NormalizableTableName{TableNameReference: tn},
+		TableOrIndex: tree.TableIndexName{
+			Table: tree.MakeTableName(tree.Name(db), tree.Name(name)),
 		},
 	}, nil
-}
-
-// ParseCLIZoneSpecifier converts a single string s identifying a zone, as would
-// be used to name a zone on the command line, to a ZoneSpecifier. A valid CLI
-// zone specifier is either 1) a database or table reference of the form
-// DATABASE[.TABLE[.PARTITION|@INDEX]], or 2) a special named zone of the form
-// .NAME.
-func ParseCLIZoneSpecifier(s string) (tree.ZoneSpecifier, error) {
-	if len(s) > 0 && s[0] == '.' {
-		name := s[1:]
-		if name == "" {
-			return tree.ZoneSpecifier{}, errors.New("missing zone name")
-		}
-		return tree.ZoneSpecifier{NamedZone: tree.UnrestrictedName(name)}, nil
-	}
-	// ParseTableNameWithIndex is not vulnerable to SQL injection, so passing s
-	// directly is safe. See #8389 for details.
-	parsed, err := parser.ParseTableNameWithIndex(s)
-	if err != nil {
-		return tree.ZoneSpecifier{}, fmt.Errorf("malformed name: %q", s)
-	}
-	parsed.SearchTable = false
-	var partition tree.Name
-	if un := parsed.Table.TableNameReference.(*tree.UnresolvedName); un.NumParts == 1 {
-		// Unlike in SQL, where a name with one part indicates a table in the
-		// current database, if a CLI specifier has just one name part, it indicates
-		// a database.
-		return tree.ZoneSpecifier{Database: tree.Name(un.Parts[0])}, nil
-	} else if un.NumParts == 3 {
-		// If a CLI specifier has three name parts, the last name is a partition.
-		// Pop it off so TableNameReference.Normalize sees only the table name
-		// below.
-		partition = tree.Name(un.Parts[0])
-		un.Parts[0], un.Parts[1], un.Parts[2] = un.Parts[1], un.Parts[2], un.Parts[3]
-		un.NumParts--
-	}
-	// We've handled the special cases for named zones, databases and partitions;
-	// have TableNameReference.Normalize tell us whether what remains is a valid
-	// table or index name.
-	tn, err := parsed.Table.Normalize()
-	if err != nil {
-		return tree.ZoneSpecifier{}, err
-	}
-	if parsed.Index != "" && partition != "" {
-		return tree.ZoneSpecifier{}, fmt.Errorf(
-			"index and partition cannot be specified simultaneously: %q", s)
-	}
-	// Table prefixes in CLI zone specifiers always have the form
-	// "table" or "db.table" and do not know about schemas. They never
-	// refer to virtual schemas. So migrate the db part to the catalog
-	// position.
-	if tn.ExplicitSchema {
-		tn.ExplicitCatalog = true
-		tn.CatalogName = tn.SchemaName
-		tn.SchemaName = tree.PublicSchemaName
-	}
-	return tree.ZoneSpecifier{
-		TableOrIndex: parsed,
-		Partition:    partition,
-	}, nil
-}
-
-// CLIZoneSpecifier converts a tree.ZoneSpecifier to a CLI zone specifier as
-// described in ParseCLIZoneSpecifier.
-func CLIZoneSpecifier(zs *tree.ZoneSpecifier) string {
-	if zs.NamedZone != "" {
-		return "." + string(zs.NamedZone)
-	}
-	if zs.Database != "" {
-		return zs.Database.String()
-	}
-	ti := zs.TableOrIndex
-
-	// The table name may have a schema specifier. CLI zone specifiers
-	// do not support this, so strip it.
-	tn := ti.Table.TableName()
-	if zs.Partition == "" {
-		ti.Table.TableNameReference = tree.NewUnresolvedName(tn.Catalog(), tn.Table())
-	} else {
-		// The index is redundant when the partition is specified, so omit it.
-		ti.Table.TableNameReference = tree.NewUnresolvedName(tn.Catalog(), tn.Table(), string(zs.Partition))
-		ti.Index = ""
-	}
-	return tree.AsStringWithFlags(&ti, tree.FmtAlwaysQualifyTableNames)
 }
 
 // ResolveZoneSpecifier converts a zone specifier to the ID of most specific
@@ -193,12 +107,9 @@ func ResolveZoneSpecifier(
 
 	// Third case: a table or index name. We look up the table part here.
 
-	tn, err := zs.TableOrIndex.Table.Normalize()
-	if err != nil {
-		return 0, err
-	}
+	tn := &zs.TableOrIndex.Table
 	if tn.SchemaName != tree.PublicSchemaName {
-		return 0, pgerror.NewErrorf(pgerror.CodeReservedNameError,
+		return 0, pgerror.Newf(pgcode.ReservedName,
 			"only schema \"public\" is supported: %q", tree.ErrString(tn))
 	}
 	databaseID, err := resolveName(keys.RootNamespaceID, tn.Catalog())
@@ -250,49 +161,111 @@ func (c *Constraint) FromString(short string) error {
 	return nil
 }
 
-// minRangeMaxBytes is the minimum value for range max bytes.
-const minRangeMaxBytes = 64 << 10 // 64 KB
-
-// defaultZoneConfig is the default zone configuration used when no custom
+// NewZoneConfig is the zone configuration used when no custom
 // config has been specified.
-var defaultZoneConfig = ZoneConfig{
-	NumReplicas:   3,
-	RangeMinBytes: 1 << 20,  // 1 MB
-	RangeMaxBytes: 64 << 20, // 64 MB
-	GC: GCPolicy{
-		// Use 25 hours instead of the previous 24 to make users successful by
-		// default. Users desiring to take incremental backups every 24h may
-		// incorrectly assume that the previous default 24h was sufficient to do
-		// that. But the equation for incremental backups is:
-		// 	GC TTLSeconds >= (desired backup interval) + (time to perform incremental backup)
-		// We think most new users' incremental backups will complete within an
-		// hour, and larger clusters will have more experienced operators and will
-		// understand how to change these settings if needed.
-		TTLSeconds: 25 * 60 * 60,
-	},
+func NewZoneConfig() *ZoneConfig {
+	return &ZoneConfig{
+		InheritedConstraints:      true,
+		InheritedLeasePreferences: true,
+	}
+}
+
+// EmptyCompleteZoneConfig is the zone configuration where
+// all fields are set but set to their respective zero values.
+func EmptyCompleteZoneConfig() *ZoneConfig {
+	return &ZoneConfig{
+		NumReplicas:               proto.Int32(0),
+		RangeMinBytes:             proto.Int64(0),
+		RangeMaxBytes:             proto.Int64(0),
+		GC:                        &GCPolicy{TTLSeconds: 0},
+		InheritedConstraints:      true,
+		InheritedLeasePreferences: true,
+	}
 }
 
 // DefaultZoneConfig is the default zone configuration used when no custom
 // config has been specified.
 func DefaultZoneConfig() ZoneConfig {
-	testingLock.Lock()
-	defer testingLock.Unlock()
-	return defaultZoneConfig
+	return ZoneConfig{
+		NumReplicas:   proto.Int32(3),
+		RangeMinBytes: proto.Int64(16 << 20), // 16 MB
+		RangeMaxBytes: proto.Int64(64 << 20), // 64 MB
+		GC: &GCPolicy{
+			// Use 25 hours instead of the previous 24 to make users successful by
+			// default. Users desiring to take incremental backups every 24h may
+			// incorrectly assume that the previous default 24h was sufficient to do
+			// that. But the equation for incremental backups is:
+			// 	GC TTLSeconds >= (desired backup interval) + (time to perform incremental backup)
+			// We think most new users' incremental backups will complete within an
+			// hour, and larger clusters will have more experienced operators and will
+			// understand how to change these settings if needed.
+			TTLSeconds: 25 * 60 * 60,
+		},
+	}
 }
 
-// TestingSetDefaultZoneConfig is a testing-only function that changes the
-// default zone config and returns a function that reverts the change.
-func TestingSetDefaultZoneConfig(cfg ZoneConfig) func() {
-	testingLock.Lock()
-	oldConfig := defaultZoneConfig
-	defaultZoneConfig = cfg
-	testingLock.Unlock()
+// DefaultZoneConfigRef is the default zone configuration used when no custom
+// config has been specified.
+func DefaultZoneConfigRef() *ZoneConfig {
+	zoneConfig := DefaultZoneConfig()
+	return &zoneConfig
+}
 
-	return func() {
-		testingLock.Lock()
-		defaultZoneConfig = oldConfig
-		testingLock.Unlock()
+// DefaultSystemZoneConfig is the default zone configuration used when no custom
+// config has been specified.
+func DefaultSystemZoneConfig() ZoneConfig {
+	return ZoneConfig{
+		NumReplicas:   proto.Int32(5),
+		RangeMinBytes: proto.Int64(16 << 20), // 16 MB
+		RangeMaxBytes: proto.Int64(64 << 20), // 64 MB
+		GC: &GCPolicy{
+			// Use 25 hours instead of the previous 24 to make users successful by
+			// default. Users desiring to take incremental backups every 24h may
+			// incorrectly assume that the previous default 24h was sufficient to do
+			// that. But the equation for incremental backups is:
+			// 	GC TTLSeconds >= (desired backup interval) + (time to perform incremental backup)
+			// We think most new users' incremental backups will complete within an
+			// hour, and larger clusters will have more experienced operators and will
+			// understand how to change these settings if needed.
+			TTLSeconds: 25 * 60 * 60,
+		},
 	}
+}
+
+// DefaultSystemZoneConfigRef is the default zone configuration used when no custom
+// config has been specified.
+func DefaultSystemZoneConfigRef() *ZoneConfig {
+	systemZoneConfig := DefaultSystemZoneConfig()
+	return &systemZoneConfig
+}
+
+// IsComplete returns whether all the fields are set.
+func (z *ZoneConfig) IsComplete() bool {
+	return ((z.NumReplicas != nil) && (z.RangeMinBytes != nil) &&
+		(z.RangeMaxBytes != nil) && (z.GC != nil) &&
+		(!z.InheritedConstraints) && (!z.InheritedLeasePreferences))
+}
+
+// ValidateTandemFields returns an error if the ZoneConfig to be written
+// specifies a configuration that could cause problems with the introduction
+// of cascading zone configs.
+func (z *ZoneConfig) ValidateTandemFields() error {
+	var numConstrainedRepls int32
+	for _, constraint := range z.Constraints {
+		numConstrainedRepls += constraint.NumReplicas
+	}
+
+	if numConstrainedRepls > 0 && z.NumReplicas == nil {
+		return fmt.Errorf("when per-replica constraints are set, num_replicas must be set as well")
+	}
+	if (z.RangeMinBytes != nil || z.RangeMaxBytes != nil) &&
+		(z.RangeMinBytes == nil || z.RangeMaxBytes == nil) {
+		return fmt.Errorf("range_min_bytes and range_max_bytes must be set together")
+	}
+	if !z.InheritedLeasePreferences && z.InheritedConstraints {
+		return fmt.Errorf("lease preferences can not be set unless the constraints are explicitly set as well")
+	}
+	return nil
 }
 
 // Validate returns an error if the ZoneConfig specifies a known-dangerous or
@@ -304,36 +277,38 @@ func (z *ZoneConfig) Validate() error {
 		}
 	}
 
-	switch {
-	case z.NumReplicas < 0:
-		return fmt.Errorf("at least one replica is required")
-	case z.NumReplicas == 0:
-		if len(z.Subzones) > 0 {
-			// NumReplicas == 0 is allowed when this ZoneConfig is a subzone
-			// placeholder. See IsSubzonePlaceholder.
-			return nil
+	if z.NumReplicas != nil {
+		switch {
+		case *z.NumReplicas < 0:
+			return fmt.Errorf("at least one replica is required")
+		case *z.NumReplicas == 0:
+			if len(z.Subzones) > 0 {
+				// NumReplicas == 0 is allowed when this ZoneConfig is a subzone
+				// placeholder. See IsSubzonePlaceholder.
+				return nil
+			}
+			return fmt.Errorf("at least one replica is required")
+		case *z.NumReplicas == 2:
+			return fmt.Errorf("at least 3 replicas are required for multi-replica configurations")
 		}
-		return fmt.Errorf("at least one replica is required")
-	case z.NumReplicas == 2:
-		return fmt.Errorf("at least 3 replicas are required for multi-replica configurations")
 	}
 
-	if z.RangeMaxBytes < minRangeMaxBytes {
+	if z.RangeMaxBytes != nil && *z.RangeMaxBytes < base.MinRangeMaxBytes {
 		return fmt.Errorf("RangeMaxBytes %d less than minimum allowed %d",
-			z.RangeMaxBytes, minRangeMaxBytes)
+			*z.RangeMaxBytes, base.MinRangeMaxBytes)
 	}
 
-	if z.RangeMinBytes < 0 {
-		return fmt.Errorf("RangeMinBytes %d less than minimum allowed 0", z.RangeMinBytes)
+	if z.RangeMinBytes != nil && *z.RangeMinBytes < 0 {
+		return fmt.Errorf("RangeMinBytes %d less than minimum allowed 0", *z.RangeMinBytes)
 	}
-	if z.RangeMinBytes >= z.RangeMaxBytes {
+	if z.RangeMinBytes != nil && z.RangeMaxBytes != nil && *z.RangeMinBytes >= *z.RangeMaxBytes {
 		return fmt.Errorf("RangeMinBytes %d is greater than or equal to RangeMaxBytes %d",
-			z.RangeMinBytes, z.RangeMaxBytes)
+			*z.RangeMinBytes, *z.RangeMaxBytes)
 	}
 
 	// Reserve the value 0 to potentially have some special meaning in the future,
 	// such as to disable GC.
-	if z.GC.TTLSeconds < 1 {
+	if z.GC != nil && z.GC.TTLSeconds < 1 {
 		return fmt.Errorf("GC.TTLSeconds %d less than minimum allowed 1", z.GC.TTLSeconds)
 	}
 
@@ -359,16 +334,16 @@ func (z *ZoneConfig) Validate() error {
 			for _, constraint := range constraints.Constraints {
 				// TODO(a-robinson): Relax this constraint to allow prohibited replicas,
 				// as discussed on #23014.
-				if constraint.Type != Constraint_REQUIRED && constraints.NumReplicas != z.NumReplicas {
+				if constraint.Type != Constraint_REQUIRED && z.NumReplicas != nil && constraints.NumReplicas != *z.NumReplicas {
 					return fmt.Errorf(
 						"only required constraints (prefixed with a '+') can be applied to a subset of replicas")
 				}
 			}
 		}
-		if numConstrainedRepls > int64(z.NumReplicas) {
+		if z.NumReplicas != nil && numConstrainedRepls > int64(*z.NumReplicas) {
 			return fmt.Errorf("the number of replicas specified in constraints (%d) cannot be greater "+
 				"than the number of replicas configured for the zone (%d)",
-				numConstrainedRepls, z.NumReplicas)
+				numConstrainedRepls, *z.NumReplicas)
 		}
 	}
 
@@ -387,9 +362,88 @@ func (z *ZoneConfig) Validate() error {
 	return nil
 }
 
-// StoreMatchesConstraint returns whether a store matches the given constraint.
-func StoreMatchesConstraint(store roachpb.StoreDescriptor, constraint Constraint) bool {
-	hasConstraint := storeHasConstraint(store, constraint)
+// InheritFromParent hydrates a zones missing fields from its parent.
+func (z *ZoneConfig) InheritFromParent(parent *ZoneConfig) {
+	// Allow for subzonePlaceholders to inherit fields from parents if needed.
+	if z.NumReplicas == nil || (z.NumReplicas != nil && *z.NumReplicas == 0) {
+		if parent.NumReplicas != nil {
+			z.NumReplicas = proto.Int32(*parent.NumReplicas)
+		}
+	}
+	if z.RangeMinBytes == nil {
+		if parent.RangeMinBytes != nil {
+			z.RangeMinBytes = proto.Int64(*parent.RangeMinBytes)
+		}
+	}
+	if z.RangeMaxBytes == nil {
+		if parent.RangeMaxBytes != nil {
+			z.RangeMaxBytes = proto.Int64(*parent.RangeMaxBytes)
+		}
+	}
+	if z.GC == nil {
+		if parent.GC != nil {
+			tempGC := *parent.GC
+			z.GC = &tempGC
+		}
+	}
+	if z.InheritedConstraints {
+		if !parent.InheritedConstraints {
+			z.Constraints = parent.Constraints
+			z.InheritedConstraints = false
+		}
+	}
+	if z.InheritedLeasePreferences {
+		if !parent.InheritedLeasePreferences {
+			z.LeasePreferences = parent.LeasePreferences
+			z.InheritedLeasePreferences = false
+		}
+	}
+}
+
+// CopyFromZone copies over the specified fields from the other zone.
+func (z *ZoneConfig) CopyFromZone(other ZoneConfig, fieldList []tree.Name) {
+	for _, fieldName := range fieldList {
+		if fieldName == "num_replicas" {
+			z.NumReplicas = nil
+			if other.NumReplicas != nil {
+				z.NumReplicas = proto.Int32(*other.NumReplicas)
+			}
+		}
+		if fieldName == "range_min_bytes" {
+			z.RangeMinBytes = nil
+			if other.RangeMinBytes != nil {
+				z.RangeMinBytes = proto.Int64(*other.RangeMinBytes)
+			}
+		}
+		if fieldName == "range_max_bytes" {
+			z.RangeMaxBytes = nil
+			if other.RangeMaxBytes != nil {
+				z.RangeMaxBytes = proto.Int64(*other.RangeMaxBytes)
+			}
+		}
+		if fieldName == "gc.ttlseconds" {
+			z.GC = nil
+			if other.GC != nil {
+				tempGC := *other.GC
+				z.GC = &tempGC
+			}
+		}
+		if fieldName == "constraints" {
+			z.Constraints = other.Constraints
+			z.InheritedConstraints = other.InheritedConstraints
+		}
+		if fieldName == "lease_preferences" {
+			z.LeasePreferences = other.LeasePreferences
+			z.InheritedLeasePreferences = other.InheritedLeasePreferences
+		}
+	}
+}
+
+// StoreSatisfiesConstraint checks whether a store satisfies the given constraint.
+// If the constraint is of the PROHIBITED type, satisfying it means the store
+// not matching the constraint's spec.
+func StoreSatisfiesConstraint(store roachpb.StoreDescriptor, constraint Constraint) bool {
+	hasConstraint := StoreMatchesConstraint(store, constraint)
 	if (constraint.Type == Constraint_REQUIRED && !hasConstraint) ||
 		(constraint.Type == Constraint_PROHIBITED && hasConstraint) {
 		return false
@@ -397,10 +451,11 @@ func StoreMatchesConstraint(store roachpb.StoreDescriptor, constraint Constraint
 	return true
 }
 
-// storeHasConstraint returns whether a store's attributes or node's locality
-// matches the key value pair in the constraint. It notably ignores whether
-// the constraint is required, prohibited, positive, or otherwise.
-func storeHasConstraint(store roachpb.StoreDescriptor, c Constraint) bool {
+// StoreMatchesConstraint returns whether a store's attributes or node's
+// locality match the constraint's spec. It notably ignores whether the
+// constraint is required, prohibited, positive, or otherwise.
+// Also see StoreSatisfiesConstraint().
+func StoreMatchesConstraint(store roachpb.StoreDescriptor, c Constraint) bool {
 	if c.Key == "" {
 		for _, attrs := range []roachpb.Attributes{store.Attrs, store.Node.Attrs} {
 			for _, attr := range attrs.Attrs {
@@ -409,11 +464,11 @@ func storeHasConstraint(store roachpb.StoreDescriptor, c Constraint) bool {
 				}
 			}
 		}
-	} else {
-		for _, tier := range store.Node.Locality.Tiers {
-			if c.Key == tier.Key && c.Value == tier.Value {
-				return true
-			}
+		return false
+	}
+	for _, tier := range store.Node.Locality.Tiers {
+		if c.Key == tier.Key && c.Value == tier.Value {
+			return true
 		}
 	}
 	return false
@@ -421,12 +476,14 @@ func storeHasConstraint(store roachpb.StoreDescriptor, c Constraint) bool {
 
 // DeleteTableConfig removes any configuration that applies to the table
 // targeted by this ZoneConfig, leaving only its subzone configs, if any. After
-// calling DeleteTableConfig, IsZubzonePlaceholder will return true.
+// calling DeleteTableConfig, IsSubzonePlaceholder will return true.
 //
 // Only table zones can have subzones, so it does not make sense to call this
 // method on non-table ZoneConfigs.
 func (z *ZoneConfig) DeleteTableConfig() {
 	*z = ZoneConfig{
+		// Have to set NumReplicas to 0 so it is recognized as a placeholder.
+		NumReplicas:  proto.Int32(0),
 		Subzones:     z.Subzones,
 		SubzoneSpans: z.SubzoneSpans,
 	}
@@ -440,7 +497,7 @@ func (z *ZoneConfig) IsSubzonePlaceholder() bool {
 	// A ZoneConfig with zero replicas is otherwise invalid, so we repurpose it to
 	// indicate that a ZoneConfig is a placeholder for subzones rather than
 	// introducing a dedicated IsPlaceholder flag.
-	return z.NumReplicas == 0
+	return z.NumReplicas != nil && *z.NumReplicas == 0
 }
 
 // GetSubzone returns the most specific Subzone that applies to the specified
@@ -450,7 +507,8 @@ func (z *ZoneConfig) IsSubzonePlaceholder() bool {
 func (z *ZoneConfig) GetSubzone(indexID uint32, partition string) *Subzone {
 	for _, s := range z.Subzones {
 		if s.IndexID == indexID && s.PartitionName == partition {
-			return &s
+			copySubzone := s
+			return &copySubzone
 		}
 	}
 	if partition != "" {
@@ -459,19 +517,33 @@ func (z *ZoneConfig) GetSubzone(indexID uint32, partition string) *Subzone {
 	return nil
 }
 
+// GetSubzoneExact is similar to GetSubzone but does not find the most specific
+// subzone that applies to a specified index and partition, as it finds either the
+// exact config that applies, or returns nil.
+func (z *ZoneConfig) GetSubzoneExact(indexID uint32, partition string) *Subzone {
+	for _, s := range z.Subzones {
+		if s.IndexID == indexID && s.PartitionName == partition {
+			copySubzone := s
+			return &copySubzone
+		}
+	}
+	return nil
+}
+
 // GetSubzoneForKeySuffix returns the ZoneConfig for the subzone that contains
-// keySuffix, if it exists.
-func (z ZoneConfig) GetSubzoneForKeySuffix(keySuffix []byte) *Subzone {
+// keySuffix, if it exists and its position in the subzones slice.
+func (z ZoneConfig) GetSubzoneForKeySuffix(keySuffix []byte) (*Subzone, int32) {
 	// TODO(benesch): Use binary search instead.
 	for _, s := range z.SubzoneSpans {
 		// The span's Key is stored with the prefix removed, so we can compare
 		// directly to keySuffix. An unset EndKey implies Key.PrefixEnd().
 		if (s.Key.Compare(keySuffix) <= 0) &&
 			((s.EndKey == nil && bytes.HasPrefix(keySuffix, s.Key)) || s.EndKey.Compare(keySuffix) > 0) {
-			return &z.Subzones[s.SubzoneIndex]
+			copySubzone := z.Subzones[s.SubzoneIndex]
+			return &copySubzone, s.SubzoneIndex
 		}
 	}
-	return nil
+	return nil, -1
 }
 
 // SetSubzone installs subzone into the ZoneConfig, overwriting any existing
@@ -529,4 +601,64 @@ func (z ZoneConfig) subzoneSplits() []roachpb.RKey {
 		// the maximum possible value.
 	}
 	return out
+}
+
+// ReplicaConstraintsCount is part of the cat.Zone interface.
+func (z *ZoneConfig) ReplicaConstraintsCount() int {
+	return len(z.Constraints)
+}
+
+// ReplicaConstraints is part of the cat.Zone interface.
+func (z *ZoneConfig) ReplicaConstraints(i int) cat.ReplicaConstraints {
+	return &z.Constraints[i]
+}
+
+// LeasePreferenceCount is part of the cat.Zone interface.
+func (z *ZoneConfig) LeasePreferenceCount() int {
+	return len(z.LeasePreferences)
+}
+
+// LeasePreference is part of the cat.Zone interface.
+func (z *ZoneConfig) LeasePreference(i int) cat.ConstraintSet {
+	return &z.LeasePreferences[i]
+}
+
+// ConstraintCount is part of the cat.LeasePreference interface.
+func (l *LeasePreference) ConstraintCount() int {
+	return len(l.Constraints)
+}
+
+// Constraint is part of the cat.LeasePreference interface.
+func (l *LeasePreference) Constraint(i int) cat.Constraint {
+	return &l.Constraints[i]
+}
+
+// ReplicaCount is part of the cat.ReplicaConstraints interface.
+func (c *Constraints) ReplicaCount() int32 {
+	return c.NumReplicas
+}
+
+// ConstraintCount is part of the cat.ReplicaConstraints interface.
+func (c *Constraints) ConstraintCount() int {
+	return len(c.Constraints)
+}
+
+// Constraint is part of the cat.ReplicaConstraints interface.
+func (c *Constraints) Constraint(i int) cat.Constraint {
+	return &c.Constraints[i]
+}
+
+// IsRequired is part of the cat.Constraint interface.
+func (c *Constraint) IsRequired() bool {
+	return c.Type == Constraint_REQUIRED
+}
+
+// GetKey is part of the cat.Constraint interface.
+func (c *Constraint) GetKey() string {
+	return c.Key
+}
+
+// GetValue is part of the cat.Constraint interface.
+func (c *Constraint) GetValue() string {
+	return c.Value
 }

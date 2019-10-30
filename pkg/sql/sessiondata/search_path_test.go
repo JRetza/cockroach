@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sessiondata
 
@@ -18,6 +14,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestImpliedSearchPath(t *testing.T) {
@@ -37,7 +35,7 @@ func TestImpliedSearchPath(t *testing.T) {
 			searchPath := MakeSearchPath(tc.explicitSearchPath)
 			actualSearchPath := make([]string, 0)
 			iter := searchPath.Iter()
-			for p, ok := iter(); ok; p, ok = iter() {
+			for p, ok := iter.Next(); ok; p, ok = iter.Next() {
 				actualSearchPath = append(actualSearchPath, p)
 			}
 			if !reflect.DeepEqual(tc.expectedSearchPath, actualSearchPath) {
@@ -49,7 +47,7 @@ func TestImpliedSearchPath(t *testing.T) {
 			searchPath := MakeSearchPath(tc.explicitSearchPath)
 			actualSearchPath := make([]string, 0)
 			iter := searchPath.IterWithoutImplicitPGCatalog()
-			for p, ok := iter(); ok; p, ok = iter() {
+			for p, ok := iter.Next(); ok; p, ok = iter.Next() {
 				actualSearchPath = append(actualSearchPath, p)
 			}
 			if !reflect.DeepEqual(tc.expectedSearchPathWithoutImplicitPgCatalog, actualSearchPath) {
@@ -57,4 +55,25 @@ func TestImpliedSearchPath(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSearchPathEquals(t *testing.T) {
+	a1 := MakeSearchPath([]string{"x", "y", "z"})
+	a2 := MakeSearchPath([]string{"x", "y", "z"})
+	assert.True(t, a1.Equals(&a1))
+	assert.True(t, a2.Equals(&a2))
+
+	assert.True(t, a1.Equals(&a2))
+	assert.True(t, a2.Equals(&a1))
+
+	b := MakeSearchPath([]string{"x", "z", "y"})
+	assert.False(t, a1.Equals(&b))
+
+	c1 := MakeSearchPath([]string{"x", "y", "pg_catalog"})
+	c2 := MakeSearchPath([]string{"x", "y", "pg_catalog"})
+	assert.True(t, c1.Equals(&c2))
+	assert.False(t, a1.Equals(&c1))
+
+	d := MakeSearchPath([]string{"x"})
+	assert.False(t, a1.Equals(&d))
 }

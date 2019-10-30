@@ -1,128 +1,125 @@
-# LogicTest: 5node-distsql 5node-distsql-metadata
-
-########################
-#  LOOKUP JOIN FORCED  #
-########################
-statement ok
-SET experimental_force_lookup_join = true;
+# LogicTest: fakedist local
 
 statement ok
-CREATE TABLE data (a INT, b INT, c INT, d INT, PRIMARY KEY (a, b, c, d))
-
-# Split into ten parts.
-statement ok
-ALTER TABLE data SPLIT AT SELECT i FROM GENERATE_SERIES(1, 9) AS g(i)
-
-# Relocate the ten parts to the five nodes.
-statement ok
-ALTER TABLE data TESTING_RELOCATE
-  SELECT ARRAY[i%5+1], i FROM GENERATE_SERIES(0, 9) AS g(i)
-
-# Generate all combinations of values 1 to 10.
-statement ok
-INSERT INTO data SELECT a, b, c, d FROM
-   GENERATE_SERIES(1, 10) AS A(a),
-   GENERATE_SERIES(1, 10) AS B(b),
-   GENERATE_SERIES(1, 10) AS C(c),
-   GENERATE_SERIES(1, 10) AS D(d)
-
+CREATE TABLE abc (a INT, b INT, c INT, PRIMARY KEY (a, c));
+INSERT INTO abc VALUES (1, 1, 2), (2, 1, 1), (2, NULL, 2)
 
 statement ok
-CREATE TABLE distsql_lookup_test_1 (a INT, b INT, c INT, PRIMARY KEY (a, c)); INSERT INTO distsql_lookup_test_1 VALUES (1, 1, 2), (2, 1, 1), (2, NULL, 2)
-
+CREATE TABLE def (d INT, e INT, f INT, PRIMARY KEY (f, e));
+INSERT INTO def VALUES (1, 1, 2), (2, 1, 1), (NULL, 2, 1)
 
 statement ok
-CREATE TABLE distsql_lookup_test_2 (d INT, e INT, f INT, PRIMARY KEY (f, e)); INSERT INTO distsql_lookup_test_2 VALUES (1, 1, 2), (2, 1, 1), (NULL, 2, 1)
+CREATE TABLE gh (g INT, h INT, INDEX g_idx (g));
+INSERT INTO gh VALUES (NULL, 1)
 
+# Set up the statistics as if the first table is much smaller than the second.
+# This will make lookup join into the second table be the best plan.
+statement ok
+ALTER TABLE abc INJECT STATISTICS '[
+  {
+    "columns": ["a"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 100,
+    "distinct_count": 100
+  }
+]'
+
+statement ok
+ALTER TABLE def INJECT STATISTICS '[
+  {
+    "columns": ["f"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 10000,
+    "distinct_count": 10000
+  }
+]'
+
+statement ok
+ALTER TABLE gh INJECT STATISTICS '[
+  {
+    "columns": ["g"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 10000,
+    "distinct_count": 10000
+  }
+]'
 
 query IIIIII rowsort
-SELECT * FROM distsql_lookup_test_1 JOIN distsql_lookup_test_2 ON f = b
+SELECT * FROM abc JOIN def ON f = b
 ----
-1  1  2  2  1  1
-2  1  1  2  1  1
+1  1  2  2     1  1
+2  1  1  2     1  1
 1  1  2  NULL  2  1
 2  1  1  NULL  2  1
 
+query IIIIII rowsort
+SELECT * FROM abc JOIN def ON f = b AND e = c
+----
+1  1  2  NULL  2  1
+2  1  1  2     1  1
 
 query IIIIII rowsort
-SELECT * FROM distsql_lookup_test_1 JOIN distsql_lookup_test_2 ON f = b WHERE a > 1 AND e > 1
+SELECT * FROM abc JOIN def ON f = b WHERE a > 1 AND e > 1
 ----
 2  1  1  NULL  2  1
 
-
 query IIIIII rowsort
-SELECT * FROM distsql_lookup_test_1 JOIN distsql_lookup_test_2 ON f = b AND a > 1 AND e > 1
+SELECT * FROM abc JOIN def ON f = b AND a > 1 AND e > 1
 ----
 2  1  1  NULL  2  1
-
 
 # Filter right side of a lookup join with a restriction on an indexed column.
 query IIIIII rowsort
-SELECT * FROM distsql_lookup_test_1 JOIN distsql_lookup_test_2 ON f = a WHERE f > 1
+SELECT * FROM abc JOIN def ON f = a WHERE f > 1
 ----
 2  1  1  1  1  2
 2  NULL  2  1  1  2
 
-
 # Test lookup join with restriction relating the left and right side.
 query IIIIII rowsort
-SELECT * FROM distsql_lookup_test_1 JOIN distsql_lookup_test_2 ON f = b WHERE a >= e
+SELECT * FROM abc JOIN def ON f = b WHERE a >= e
 ----
 1  1  2  2  1  1
 2  1  1  2  1  1
 2  1  1  NULL  2  1
 
-
 # Test lookup join with restriction relating the left and right side.
 query IIIIII rowsort
-SELECT * FROM distsql_lookup_test_1 JOIN distsql_lookup_test_2 ON f = b AND a >= e
+SELECT * FROM abc JOIN def ON f = b AND a >= e
 ----
 1  1  2  2  1  1
 2  1  1  2  1  1
 2  1  1  NULL  2  1
-
 
 # Test lookup join with selecting a subset of the columns.
 query III rowsort
-SELECT a, b, e FROM distsql_lookup_test_1 JOIN distsql_lookup_test_2 ON f = b WHERE a >= e
+SELECT a, b, e FROM abc JOIN def ON f = b WHERE a >= e
 ----
 1  1  1
 2  1  1
 2  1  2
 
-
-# Ensure lookup join is planned.
-query T rowsort
-SELECT "URL" FROM [EXPLAIN (DISTSQL) SELECT * FROM distsql_lookup_test_1 JOIN distsql_lookup_test_2 ON f = b]
-----
-https://cockroachdb.github.io/distsqlplan/decode.html?eJyUkcFq8zAQhO__U5g9708sp-lBJ11TSlJCb8UY1VqCWkerSjK0BL97sVVoUoibHne0386gOYJjQxt9oAjyCQQgrKBG8IFbipHDKOeltXkHWSJY5_s0yjVCy4FAHiHZ1BFI2PB_9osKEAwlbbtpbUDgPn1DMek9gVwOeHJYzB9-1M8d7UgbCovy7Dz4YA86fChjY4pvXdMxv_a-SRRTI-CSu_iL-x1b92Uurjcfv-F-mosXtq5gJws1its-yUIJVBWqJaobVCtUtxejVmdRf2lgR9Gzi3RVBeVQI5DZU245ch9aegjcTjZ53E7cJBiKKb8u87B2-WkMeAqLWbiah6tZuPwB18O_zwAAAP__2Q3qzg==
-
-
-query T rowsort
-SELECT "URL" FROM [EXPLAIN (DISTSQL) SELECT * FROM distsql_lookup_test_1 JOIN distsql_lookup_test_2 ON f = b WHERE a > 1 AND e > 1]
-----
-https://cockroachdb.github.io/distsqlplan/decode.html?eJyUkkFr4zAQhe_7K8ScdmGWWPZmDzrpVHApSQm5tSa41pCqdTSuJENC8H8vtgtNCnHT47yZ7z2PR0dwbGhR7iiAegAJCHMoEBrPFYXAvpfHodzsQSUI1jVt7OUCoWJPoI4QbawJFCz4LzezFBAMxdLWw1iHwG38hEIstwQq6_DEWE4br8unmlZUGvKz5MweGm93pT9oY0MMb_WmZn5tm02kEDcSLqXLn6TfsnUf4fL68P433A21eGHrBDsldC_mztD-xtaRfK-IxzZJMhJSKZUv1uK3t9vnKII1JNjVhz-AsGyjElqiTlFnqP-hnqP-f3G79Gy7b462otCwC3TV1ZKuQCCzpfFhBG59RfeeqyFmLJcDNwiGQhy72Vjkbmz1H3gKy0k4nYbTSTj5Ahfdr_cAAAD__8vq-nE=
-
-
-# Ensure lookup join is planned on a multi-node cluster.
-query T rowsort
-SELECT "URL" FROM [EXPLAIN (DISTSQL) SELECT * FROM data JOIN data AS data2 on data.b = data2.a]
-----
-https://cockroachdb.github.io/distsqlplan/decode.html?eJzElE-LnTAUxff9FHLXt4zx33NcZTulzJShu-IiNZfB9k2uJBFaBr97UQvje7yJgguXJjn-Ts4J9w0Ma3pUr-Sg-gECEBJASAEhA4QcaoTOckPOsR2PzIIH_QeqGKE1Xe_H5RqhYUtQvYFv_Zmggu_q55meSWmydzEgaPKqPU-Yzravyv6VWnkF9YDAvX__kfPqhaASA26HfeHW_GflARbCV-bffRf94tZEbKpIjtd96n0VSYEyQZmizFDmKAuUJ5Tlh_6SD_292-oNW02W9IWnerhxg0f-zN2diK9O3manF2yxvQixu4gV2KKI4pAiku1hJLvDWIEtwjgdEka6PYx0dxgrsEUY5SFhZNvDyHaHsQJbhHF_-Ly64e-ZXMfG0aZpFI_zjPQLzcPPcW8b-ma5mTDz59OkmxY0OT_vivnjwcxbo8GlWATFyYVYXIuTMHkFnQbVWVic7fGdB8VFmFzsIZ-C4jJMLveQ78NdxSvPJPzIrtn18OlfAAAA__8Afujr
-
-
-# Ensure join performs properly on input that has more than 100 rows.
+# Test lookup join on NULL column. (https://github.com/cockroachdb/cockroach/issues/27032)
 query I
-SELECT COUNT(*) FROM data as d1 NATURAL JOIN data as d2
+SELECT h FROM abc JOIN gh ON b = g
 ----
-10000
 
+statement ok
+CREATE TABLE data (a INT, b INT, c INT, d INT, PRIMARY KEY (a, b, c, d))
 
-query T
-SELECT "URL" FROM [EXPLAIN (DISTSQL) SELECT COUNT(*) FROM data as d1 NATURAL JOIN data as d2]
+# Generate all combinations of values 1 to 10.
+statement ok
+INSERT INTO data SELECT a, b, c, d FROM
+   generate_series(1, 10) AS a(a),
+   generate_series(1, 10) AS b(b),
+   generate_series(1, 10) AS c(c),
+   generate_series(1, 10) AS d(d)
+
+# Ensure lookup join performs properly on input that has more than 100 rows.
+query I
+SELECT count(*) FROM (SELECT * FROM data WHERE c = 1) AS l NATURAL JOIN data AS r
 ----
-https://cockroachdb.github.io/distsqlplan/decode.html?eJy8lV9r2zAUxd_3KcJ96kDQXNtJEz957CljS0aasodhihZdjLdUMpIMGyXffTgeVDGN5KGSR_85Oke_e-A-g1SC1vyJDOTfAYFBAgxSYJABgxmUDBqt9mSM0t0vvWAlfkM-ZVDLprXd65LBXmmC_BlsbQ8EOez4jwNtiQvSt1NgIMjy-nCyaXT9xPWfQnDLoTwyUK19OchYXhHkeGTjzT6pWv7zmnm8GHxW6lfbTH6qWk6UzCcFsiJhRcqK7r6b1uaTtZJ0MVXyP6k-VJWmilulb3GA4OPmYb173G6-3d-8v2iWXjR78Wil0oI0ibPzy2MgzoDS_cOXx9V6d1Pg5TTZWRocP32Mnn7AzJn-_IrTD6RycWP09JPxvJNo3gEzh_fdFXkHUrm8k2je6XjeaTTvgJnDe3FF3oFULu80mnc2nncWzTtg5vBeXpF3IJXLO3vTbfKK2ZZMo6ShwVZ5_eRpt21IVNSvJqNavaevWu1PNv3j5qQ7vRBkbP8V-4eV7D91AV0xesWJX5x4xemZGIfi1B977rfOvOqZXzzzigPO85hL33nFC7_zwite-sXLmNgY6FioZP6WYaBmGNUzDBQtC5j7m4aBqqG_a8Ps5fHd3wAAAP__1CT_Hg==
-
+1000
 
 statement ok
 CREATE TABLE foo (a int, b int); INSERT INTO foo VALUES (0, 1), (0, 2), (1, 1)
@@ -137,182 +134,144 @@ SELECT * FROM foo NATURAL JOIN bar
 0  2  1
 1  1  2
 
-
-query T
-SELECT "URL" FROM [EXPLAIN (DISTSQL) SELECT * FROM foo NATURAL JOIN bar]
-----
-https://cockroachdb.github.io/distsqlplan/decode.html?eJyUkTFPwzAQhXd-RfXmQ01SWDxlLUItqthQBjc-KkPrs2xHAlX57ygxEi2iAUa_u--9p_MRTgyv9IEj1BNKEG7REHyQlmOUMMh5aWneoAqCdb5Lg9wQWgkMdUSyac9QWMm1-HkFguGk7X5c6wnSpS8oJr1jqEVPJ8bltPGj3u55w9pwmBdn9vDBHnR4r59FQFh3Sc3qkuoKl4LL_wTfiXWfueXPuVsdQLgXee387EWsm4kbKpyVofrmYp_qrM8vF95w9OIi_-nERd8Q2Ow4_2KULrT8EKQdY_JzPXKjYDimPF3kx9Ll0VDwFC4n4Woaribh4hvc9FcfAQAA__97bt0c
-
-
-# Ensure lookup join is not planned when no index is available.
-query T
-SELECT "URL" FROM [EXPLAIN (DISTSQL) SELECT * FROM bar NATURAL JOIN foo]
-----
-https://cockroachdb.github.io/distsqlplan/decode.html?eJyckjFrwzAQhff-inJTCyqx7HQRFDw2HZISupUMinVJBI7OnGRoCf7vxdaQ2MRO20063XfvPXEncGRwqY_oQX2CBAHPsBFQMRXoPXFbjk0L8wUqEWBdVYe2vBFQECOoEwQbSgQFS3qiapaBAINB27JrawRQHc6QD3qPoOaNuBgspwd_6G2Ja9QGeZb0xkPF9qj5O99qhjEt-V8teV1rRwQCVnVQ97kUeToqnI4Kn_VqR2yQ0Qy_7XbLFfev2h_eyDrkWdo3X-IuPOTy8YXt_tCdehlEPh-NkfVi3FiCNfqKnMdfbUHSZkCzx_gnnmou8J2p6GTiddVxXcGgD_F1Hi8LF59ag5ewnISzHiyHcPoHOB3C2SScDGxvmrufAAAA___gtCho
-
+statement ok
+CREATE TABLE books (title STRING, edition INT, shelf INT, PRIMARY KEY (title, edition));
+INSERT INTO books VALUES
+  ('SICP', 1, 2),
+  ('Intro to Algo', 1, 1),
+  ('Intro to Algo', 2, 1),
+  ('Intro to Algo', 3, 2),
+  ('Art of Computer Programming', 1, 2),
+  ('Art of Computer Programming', 2, 2)
 
 statement ok
-CREATE TABLE books (title STRING, edition INT, shelf INT, PRIMARY KEY (title, edition)); INSERT INTO books VALUES ('SICP', 1, 2), ('Intro to Algo', 1, 1), ('Intro to Algo', 2, 1), ('Intro to Algo', 3, 2), ('Art of Computer Programming', 1, 2), ('Art of Computer Programming', 2, 2)
-
+CREATE TABLE books2 (title STRING, edition INT, shelf INT, PRIMARY KEY (title, edition));
+INSERT INTO books2 VALUES
+  ('SICP', 1, 2),
+  ('Intro to Algo', 1, 1),
+  ('Intro to Algo', 2, 1),
+  ('Intro to Algo', 3, 2),
+  ('Art of Computer Programming', 1, 2),
+  ('Art of Computer Programming', 2, 2)
 
 statement ok
-CREATE TABLE authors (name STRING, book STRING); INSERT INTO authors VALUES ('Hal Abelson', 'SICP'), ('Geral Jay Sussman', 'SICP'), ('Thomas H Cormen', 'Intro to Algo'), ('Charles E Leiserson', 'Intro to Algo'), ('Ronald Rivest', 'Intro to Algo'), ('Clifford Stein', 'Intro to Algo'), ('Donald Knuth', 'Art of Computer Programming')
+ALTER TABLE books INJECT STATISTICS '[
+  {
+    "columns": ["title"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 100,
+    "distinct_count": 100
+  }
+]'
 
+statement ok
+ALTER TABLE books2 INJECT STATISTICS '[
+  {
+    "columns": ["title"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 10000,
+    "distinct_count": 1000
+  }
+]'
 
-query T rowsort
-SELECT DISTINCT(b1.title) FROM books as b1 JOIN books as b2 ON b1.title = b2.title WHERE b1.shelf <> b2.shelf
-----
-Intro to Algo
+statement ok
+CREATE TABLE authors (name STRING, book STRING);
+INSERT INTO authors VALUES
+  ('Hal Abelson', 'SICP'),
+  ('Geral Jay Sussman', 'SICP'),
+  ('Thomas H Cormen', 'Intro to Algo'),
+  ('Charles E Leiserson', 'Intro to Algo'),
+  ('Ronald Rivest', 'Intro to Algo'),
+  ('Clifford Stein', 'Intro to Algo'),
+  ('Donald Knuth', 'Art of Computer Programming')
 
+statement ok
+ALTER TABLE authors INJECT STATISTICS '[
+  {
+    "columns": ["name"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 100,
+    "distinct_count": 100
+  }
+]'
 
 # Filter on a column that is not returned or in the equality columns.
 query T rowsort
-SELECT DISTINCT(b1.title) FROM books as b1 JOIN books as b2 USING(title) WHERE b1.shelf <> b2.shelf
+SELECT DISTINCT b1.title FROM books as b1 JOIN books2 as b2 ON b1.title = b2.title WHERE b1.shelf <> b2.shelf
 ----
 Intro to Algo
 
-
 query T rowsort
-SELECT DISTINCT(authors.name) FROM authors, books AS b1, books AS b2 WHERE b1.title = b2.title AND authors.book = b1.title AND b1.shelf <> b2.shelf
+SELECT DISTINCT authors.name FROM books AS b1, books2 as b2, authors WHERE b1.title = b2.title AND authors.book = b1.title AND b1.shelf <> b2.shelf
 ----
 Thomas H Cormen
 Charles E Leiserson
 Ronald Rivest
 Clifford Stein
 
-query T rowsort
-SELECT "URL" FROM [EXPLAIN (DISTSQL) SELECT DISTINCT(authors.name) FROM authors, books AS b1, books AS b2 WHERE b1.title = b2.title AND authors.book = b1.title AND b1.shelf <> b2.shelf]
-----
-https://cockroachdb.github.io/distsqlplan/decode.html?eJycks-O2jAQh-99CjQnkFwlzh8OkSrl0EOpKqhQbxUHE8-Cl-CJbEfaFeLdV0lWgkTEwB5jzzffbyY-gSaJS3FEC9l_4MAghQ2DylCB1pJpjruihXyDLGSgdFW75njDoCCDkJ3AKVciZLCk71QFKTCQ6IQq27IzA6rdBbJO7BCy-ZldNeb-xv_EtsQ1CokmCHvtoTLqKMx7Lmq3b_IyWNUum-Sc5RGMyflX5fy2fEt06KnjUXX0jPo3Kf1pjvzmP0SHupq8ktIT0k2IS5zRLPFolkuEWpORaFAO_-r9khsD_RJ23wyFJoj7A5X44qZ5NPth1G7vpjmfPTBA8swyfyrrlC5ckPTNnv5pr_-d179GW5G2-NDzD5vtoNxht21LtSnwr6Gi1XSfq5ZrDyRa193Ou4-F7q6agNcw98JJD-ZDOPLCsd8cP2GOhnDihVO_OfXC4QDenL99BAAA__8qCKK2
-
-
-query TTTTT colnames
-EXPLAIN (VERBOSE) SELECT DISTINCT(authors.name) FROM authors, books AS b1, books AS b2 WHERE b1.title = b2.title AND authors.book = b1.title AND b1.shelf <> b2.shelf
-----
-Tree                      Field           Description               Columns                                                                                                                                           Ordering
-distinct                  ·               ·                         ("(authors.name)")                                                                                                                                weak-key("(authors.name)")
- └── render               ·               ·                         ("(authors.name)")                                                                                                                                ·
-      │                   render 0        test.public.authors.name  ·                                                                                                                                                 ·
-      └── join            ·               ·                         (name, book[omitted], rowid[hidden,omitted], title[omitted], edition[omitted], shelf[omitted], title[omitted], edition[omitted], shelf[omitted])  ·
-           │              type            inner                     ·                                                                                                                                                 ·
-           │              equality        (book) = (title)          ·                                                                                                                                                 ·
-           ├── scan       ·               ·                         (name, book, rowid[hidden,omitted])                                                                                                               rowid!=NULL; key(rowid)
-           │              table           authors@primary           ·                                                                                                                                                 ·
-           │              spans           ALL                       ·                                                                                                                                                 ·
-           └── join       ·               ·                         (title, edition[omitted], shelf[omitted], title[omitted], edition[omitted], shelf[omitted])                                                       title=title; title!=NULL
-                │         type            inner                     ·                                                                                                                                                 ·
-                │         equality        (title) = (title)         ·                                                                                                                                                 ·
-                │         mergeJoinOrder  +"(title=title)"          ·                                                                                                                                                 ·
-                │         pred            b1.shelf != b2.shelf      ·                                                                                                                                                 ·
-                ├── scan  ·               ·                         (title, edition[omitted], shelf)                                                                                                                  title!=NULL; edition!=NULL; key(title,edition); +title
-                │         table           books@primary             ·                                                                                                                                                 ·
-                │         spans           ALL                       ·                                                                                                                                                 ·
-                └── scan  ·               ·                         (title, edition[omitted], shelf)                                                                                                                  title!=NULL; edition!=NULL; key(title,edition); +title
-·                         table           books@primary             ·                                                                                                                                                 ·
-·                         spans           ALL                       ·                                                                                                                                                 ·
-
-
-
-# Ensure lookup join preserves sort from the left side.
+# Ensure lookup join preserves ordering from the left side.
 query T
-SELECT DISTINCT(a.name) FROM (SELECT * FROM authors ORDER BY name) AS a JOIN books AS b1 ON a.book = b1.title
+SELECT a.name FROM authors AS a JOIN books2 AS b2 ON a.book = b2.title ORDER BY a.name
 ----
 Charles E Leiserson
+Charles E Leiserson
+Charles E Leiserson
 Clifford Stein
-Ronald Rivest
-Thomas H Cormen
+Clifford Stein
+Clifford Stein
+Donald Knuth
 Donald Knuth
 Geral Jay Sussman
 Hal Abelson
-
-
-# Cross joins should not be planned as lookup joins.
-query T
-SELECT "URL" FROM [EXPLAIN (DISTSQL) SELECT * FROM books as b1 CROSS JOIN books as b2]
-----
-https://cockroachdb.github.io/distsqlplan/decode.html?eJyckTFvszAQhvfvV3y6-apgIB08eWw6JFXUrWJw8ClFJT5kG6lVxH-vwEMCKqTN6PM99z66O4NlQ1t9Ig_yDQQgrKFAaByX5D27vhybNuYTZIJQ2aYNfblAKNkRyDOEKtQEErb8wM0qAwRDQVf10NYhcBsukA_6SCDzDq8Gi-XBr_pQ0560IbdKRuOhcdVJuy91YP7wMJcm7k0T96Sls2mXkNayM-TITLd1u-UH5Sft35-5suRW6dh41wb5XwlUKaoMVY5qjepxVj0bqd-49558w9bTrw6e9N5kjhT34Ll1Jb04LoeY-NwN3FAw5EP8zeNjY-NXL3gNi0U4G8FiCqd_gNMpnC3CyUS76P59BwAA__9upyMC
-
-
-query T rowsort
-SELECT "URL" FROM [EXPLAIN (DISTSQL) SELECT * FROM authors INNER JOIN books ON books.edition = 1 WHERE books.title = authors.book]
-----
-https://cockroachdb.github.io/distsqlplan/decode.html?eJyUkUFLAzEQhe_-ijAnhUg3W3sJCDkJK9JK6U32kG6GNnabWZIstJT975JdwVbsqse8mW_eTN4JHBmc6z0GkG8ggMMMSg6NpwpDIJ_koakwB5AZB-uaNia55FCRR5AniDbWCBLmdE_NJAcOBqO2dd_WcaA2fkEh6g2CnHb8bLAYH7zS6xqXqA36SXYxHhpv99oflW7jNu3LYdFGyZTgKodr5uI_5s9k3ae3-Nl7TbRLzi9Eu7Zh72QdIyeZSl9ROIOHJ1tH9Elhj0xIKYv5it16u9lGFqxBRq4-3l0sz9WUqweuZlevyC-u-CWbJYaGXMA_hZN1JQc0GxzyD9T6Cl89Vb3N8Fz0XC8YDHGoTodH4YZSWvAcFqNwPg7no3D2DS67m48AAAD__5V27x8=
-
-
-statement ok
-CREATE TABLE players (id DECIMAL PRIMARY KEY, name STRING, team INT); INSERT INTO players VALUES (1.0, 'ready', 0)
-
-
-query B
-SELECT p1.team = p2.team FROM players p1 JOIN players p2 ON p1.id = p2.id;
-----
-true
-
-
-statement ok
-SET experimental_force_lookup_join = false;
-
-
-##########################
-#  LOOKUP JOIN DISABLED  #
-##########################
-
-
-# Simple joins should no longer be planned as lookup joins.
-query T
-SELECT "URL" FROM [EXPLAIN (DISTSQL) SELECT * FROM foo JOIN bar USING(a)]
-----
-https://cockroachdb.github.io/distsqlplan/decode.html?eJycksFqwzAMhu97iqHTBh6Nk-5iGOS47tCOstvowY3V1pBaQXZgo-TdR-JDm9Ck2262pE__L6ETODK41Ef0oD5BgoBn2AiomAr0nrgNx6KF-QKVCLCuqkMb3ggoiBHUCYINJYKCJT1RNctAgMGgbdmVNQKoDmfIB71HUPNGXDSW040_9LbENWqDPEt67aFie9T8ne-IQMCqDuo-lyJPYUxY_ldYXhfeah7VSke1zhK1IzbIaIZru11yxfCr9oc3sg55lvb9lrgLD7l8fGG7P3Sv3r5EPh8dI-uNceMI1ugrch5_dQVJOwOaPcadeKq5wHemopOJ31XHdQGDPsTsPH4WLqZag5ewnISzHiyHcPoHOB3C2SScDGxvmrufAAAA__9feSho
-
+Ronald Rivest
+Ronald Rivest
+Ronald Rivest
+Thomas H Cormen
+Thomas H Cormen
+Thomas H Cormen
 
 ####################################
 #  LOOKUP JOIN ON SECONDARY INDEX  #
 ####################################
-statement ok
-SET experimental_force_lookup_join = true
 
-# Create a table with a secondary index which stores another column.
 statement ok
-CREATE TABLE multiples (a INT, b INT, c INT, d INT, PRIMARY KEY (a, b), INDEX bc (b) STORING (c))
+CREATE TABLE small (a INT PRIMARY KEY, b INT, c INT, d INT)
 
-# Split into ten parts.
 statement ok
-ALTER TABLE multiples SPLIT AT SELECT i FROM GENERATE_SERIES(1, 9) AS g(i)
+CREATE TABLE large (a INT, b INT, c INT, d INT, PRIMARY KEY (a, b), INDEX bc (b) STORING (c))
 
-# Relocate the ten parts to the five nodes.
+# Generate 10 rows for both tables.
 statement ok
-ALTER TABLE multiples TESTING_RELOCATE
-  SELECT ARRAY[i%5+1], i FROM GENERATE_SERIES(0, 9) AS g(i)
+INSERT INTO small SELECT x, 2*x, 3*x, 4*x FROM
+  generate_series(1, 10) AS a(x)
 
-# Generate 10 rows.
 statement ok
-INSERT INTO multiples SELECT x, 2*x, 3*x, 4*x FROM
-  GENERATE_SERIES(1, 10) AS A(x)
+INSERT INTO large SELECT x, 2*x, 3*x, 4*x FROM
+  generate_series(1, 10) AS a(x)
+
+statement ok
+ALTER TABLE small INJECT STATISTICS '[
+  {
+    "columns": ["a"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 100,
+    "distinct_count": 100
+  }
+]'
+
+statement ok
+ALTER TABLE large INJECT STATISTICS '[
+  {
+    "columns": ["a"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 10000,
+    "distinct_count": 10000
+  }
+]'
 
 # Lookup join on covering secondary index
-query TTT colnames
-EXPLAIN SELECT t1.a, t2.c FROM multiples t1 JOIN multiples@bc t2 ON t1.a = t2.b
-----
-Tree            Field           Description
-render          ·               ·
- └── join       ·               ·
-      │         type            inner
-      │         equality        (a) = (b)
-      │         mergeJoinOrder  +"(a=b)"
-      ├── scan  ·               ·
-      │         table           multiples@primary
-      │         spans           ALL
-      └── scan  ·               ·
-·               table           multiples@bc
-·               spans           ALL
-
-query T
-SELECT "URL" FROM [EXPLAIN (DISTSQL) SELECT t1.a, t2.c FROM multiples t1 JOIN multiples@bc t2 ON t1.a = t2.b]
-----
-https://cockroachdb.github.io/distsqlplan/decode.html?eJy8lM1qg0AUhfd9inDXU-Ko-XOVbUpJSuiuuDDOJdiauTIzQkvw3YtaGg3JKERczs-Z73DOcM8gSeA2OqGG4AM4MHCBgQcMfGAwg5BBpihGrUmVV2rBRnxD4DBIZJabcjtkEJNCCM5gEpMiBPAeHVLcYyRQTR1gINBESVphMpWcIvWzPuWpSbIUNTDY5SaYrDmEBQPKzeVdbaIjQsAL1p_9Qon8Q8_a6EPcor4SfeXZ5JMSOSFZGfi3wtb-XTfuXTcXE7kkJVChaDkIixt-t_RM2ZQ7Vzdvs70Wm_dvgQ_dQge70cJ8hBbc_km4QyfRwW4ksRghCa9_Et7QSXSwG0ksR0jC75-EP3QSHexGEquRZ9QNN3vUGUmNvSaQU84wFEesB56mXMX4piiuMPVyV-mqDYHa1Ke8XmxkfVQabIq5Vey2xPxa7NrJHWjPqvbtYv8R3zOreG4nzx8hL6zipZ28fIS8snfldHwT-ye7ZofF028AAAD__2gv7bk=
-
 query II rowsort
-SELECT t1.a, t2.c FROM multiples t1 JOIN multiples@bc t2 ON t1.a = t2.b
+SELECT small.a, large.c FROM small JOIN large ON small.a = large.b
 ----
 2   3
 4   6
@@ -321,34 +280,8 @@ SELECT t1.a, t2.c FROM multiples t1 JOIN multiples@bc t2 ON t1.a = t2.b
 10  15
 
 # Lookup join on non-covering secondary index
-# The index join should be subsumed by joinreader, which takes care of the
-# primary index lookups.
-query TTT colnames
-EXPLAIN SELECT t1.a, t2.d FROM multiples t1 JOIN multiples@bc t2 ON t1.a = t2.b
-----
-Tree                  Field           Description
-render                ·               ·
- └── join             ·               ·
-      │               type            inner
-      │               equality        (a) = (b)
-      │               mergeJoinOrder  +"(a=b)"
-      ├── scan        ·               ·
-      │               table           multiples@primary
-      │               spans           ALL
-      └── index-join  ·               ·
-           ├── scan   ·               ·
-           │          table           multiples@bc
-           │          spans           ALL
-           └── scan   ·               ·
-·                     table           multiples@primary
-
-query T
-SELECT "URL" FROM [EXPLAIN (DISTSQL) SELECT t1.a, t2.d FROM multiples t1 JOIN multiples@bc t2 ON t1.a = t2.b]
-----
-https://cockroachdb.github.io/distsqlplan/decode.html?eJy8lM2LqzAUxffvryh3nUeNH_1w1W0fj3YosxtcWHMpzthcSSLMUPzfB3WYammjUHGZj5Pf4ZxwLyBJ4C4-o4bwDTgwcIGBBwx8YBBAxCBXlKDWpKorjWArPiF0GKQyL0y1HTFISCGEFzCpyRBCeI2PGR4wFqjmDjAQaOI0qzG5Ss-x-tqci8ykeYYaGOwLE842HKKSARXm-q428Qkh5CUbzv5HqfxBB130MelQ_xN9FPnsnVI5I1kb-LXCNsFDN-5DN1cThSQlUKHoOIjKO3539JfyOXdubt5nex02H94CH7uFHnarhcUELbjDk3DHTqKH3UpiOUES3vAkvLGT6GG3klhNkIQ_PAl_7CR62K0k1hPPqDtuDqhzkhoHTSCnmmEoTtgMPE2FSvBFUVJjmuW-1tUbArVpTnmz2MrmqDLYFnOr2O2I-a3YtZN70J5V7dvF_jO-A6t4YScvniEvreKVnbx6hry2d-X0fBP7J7tlR-Wf7wAAAP__gsjtvg==
-
 query II rowsort
-SELECT t1.a, t2.d FROM multiples t1 JOIN multiples@bc t2 ON t1.a = t2.b
+SELECT small.a, large.d FROM small JOIN large ON small.a = large.b
 ----
 2   4
 4   8
@@ -359,84 +292,350 @@ SELECT t1.a, t2.d FROM multiples t1 JOIN multiples@bc t2 ON t1.a = t2.b
 ############################
 #  LEFT OUTER LOOKUP JOIN  #
 ############################
-statement ok
-create table t (a int primary key, b int, c int, d int, index bc (b, c));
-
-statement ok
-insert into t values
-  (1, 10, 100, 1000),
-  (2, 10, 200, 2000),
-  (3, 20, 300, 3000)
 
 # Left join against primary index
-query T
-SELECT "URL" FROM [EXPLAIN (DISTSQL) SELECT x, a FROM (VALUES (1), (3)) AS v(x) LEFT JOIN t ON x = a]
-----
-https://cockroachdb.github.io/distsqlplan/decode.html?eJyUUE9LwzAUv_spwjspBNYWTzkVYULHWKVUL9JDaB4zrssL-QOO0e8uaQ46YaK3vN_L7987gyGFO3lED-IVShg4WEcjek8uQflDoz5AFBy0sTEkeOAwkkMQZwg6TAgCXuQU0a8K4KAwSD0tivfsgd1WbHyL5uDvYJg5UAxfKj7IPYIoZv53pw1p06FU6FblpVt_sijYdv3Ys_a5X3ds0zY7SJX0UbpTHYDDlugQLXsnbRgZweqk0caQXryurkYs_xOxQ2_JeLyId738wAHVHvPBPUU34pOjcbHJY7vwFkChD3lb5qExeZUCfieXv5KrH-RhvvkMAAD__w9jqsA=
-
 query II rowsort
-SELECT x, b FROM (VALUES (2), (99)) AS v(x) LEFT JOIN t ON x = a
+SELECT small.b, large.a FROM small LEFT JOIN large ON small.b = large.a
 ----
-2 10
-99 NULL
+2 2
+4 4
+6 6
+8 8
+10 10
+12 NULL
+14 NULL
+16 NULL
+18 NULL
+20 NULL
+
+# Left join should preserve input order.
+query II
+SELECT t1.a, t2.b FROM small t1 LEFT JOIN large t2 ON t1.a = t2.a AND t2.b % 6 = 0 ORDER BY t1.a
+----
+1   NULL
+2   NULL
+3   6
+4   NULL
+5   NULL
+6   12
+7   NULL
+8   NULL
+9   18
+10  NULL
 
 # Left join against covering secondary index
-query T
-SELECT "URL" FROM [EXPLAIN (DISTSQL) SELECT x, c FROM (VALUES (1), (10)) AS v(x) LEFT JOIN t@bc ON x = b]
-----
-https://cockroachdb.github.io/distsqlplan/decode.html?eJyUkE9Lw0AUxO9-imVOCgttSk97CkKFlNJIiF4kh7j7qLFxX9g_oJR8d0n2oBUqets3b38zs3uCZUP79o081BMyNBKDY03es5ukdKEw71BLic4OMUxyI6HZEdQJoQs9QeGx7SP5xRIShkLb9bPjWtyK65XQL9Ee_Q2aUYJj-HLxoT0Q1HKUf0_acmcrag25RXaeVn8MpMRuc1eL8qHeVGJbFntIPOs8QGLHfIyDeOXOCrZK5BNexjCdZL6-2C77T7uK_MDW01mzy-9uJMgcKP215-g03TvWc0way5mbBUM-pG2WhsKm1VTwO5z9Cq9-wM149RkAAP__EYCogw==
-
 query II rowsort
-SELECT x, c FROM (VALUES (1), (10)) AS v(x) LEFT JOIN t@bc ON x = b
+SELECT small.c, large.c FROM small LEFT JOIN large ON small.c = large.b
 ----
-1 NULL
-10 100
-10 200
+3   NULL
+6   9
+9   NULL
+12  18
+15  NULL
+18  27
+21  NULL
+24  NULL
+27  NULL
+30  NULL
 
 # Left join against non-covering secondary index
-query T
-SELECT "URL" FROM [EXPLAIN (DISTSQL) SELECT x, d FROM (VALUES (1), (10)) AS v(x) LEFT JOIN t@bc ON x = b]
-----
-https://cockroachdb.github.io/distsqlplan/decode.html?eJyUkE9Lw0AUxO9-imVOCgttil72FIQKKaWREL1IDnH3UWPjvrB_QCn57pLsQStU9LZv3v5mZvcIy4Z27Rt5qCdkaCQGx5q8ZzdJ6UJh3qGWEp0dYpjkRkKzI6gjQhd6gsJj20fyiyUkDIW262fHa3ErLldCv0R78FdoRgmO4cvFh3ZPUMtR_j1pw52tqDXkFtlpWv0xkBLb9V0tyod6XYlNWewg8azzAIkt8yEO4pU7K9gqkU94GcN0kvnN2XbZf9pV5Ae2nk6anX93I0FmT-mvPUen6d6xnmPSWM7cLBjyIW2zNBQ2raaC3-HsV3j1A27Gi88AAAD__xJ9qIQ=
-
 query II rowsort
-SELECT x, d FROM (VALUES (1), (10)) AS v(x) LEFT JOIN t@bc ON x = b
+SELECT small.c, large.d FROM small LEFT JOIN large ON small.c = large.b
 ----
-1 NULL
-10 1000
-10 2000
+3   NULL
+6   12
+9   NULL
+12  24
+15  NULL
+18  36
+21  NULL
+24  NULL
+27  NULL
+30  NULL
 
 # Left join with ON filter on covering index
-query T
-SELECT "URL" FROM [EXPLAIN (DISTSQL) SELECT x, c FROM (VALUES (10), (20)) AS v(x) LEFT JOIN t@bc ON x = b AND c < 300]
-----
-https://cockroachdb.github.io/distsqlplan/decode.html?eJyUkU9r4zAQxe_7KYY5JSCInOSkk1lIwCHES_DuZeuDKw2JGldj9AcSQr57sX1oU0hpj_NGv_f0pCs6NrRrXimg-o8Z1gI7z5pCYN9L44HCnFFJgdZ1KfZyLVCzJ1RXjDa2hAr_NW2iMJMo0FBsbDs4LuE3TOagj8mdwhTrm0BO8d0lxOZAqORNfD9pw9btqTHkZ9l9WnXpSMF2ta6g_Fut9rApix0KfNZ5RIFb5lPq4IWtA3YK8h4vnKHz2raRvIJ8AU9JyoWGhZRKqWJXwcTbwzFCsIaAXXuZosAyxR4X-fJhpewnlfYUOnaB7uo8fqxaIJkDjR8UOHlNfzzrIWYcy4EbBEMhjttsHAo3rvoLfoSzL-H5J7i-_XoLAAD__xfiuIc=
-
 query II rowsort
-SELECT x, c FROM (VALUES (10), (20)) AS v(x) LEFT JOIN t@bc ON x = b AND c < 200
+SELECT small.c, large.c FROM small LEFT JOIN large ON small.c = large.b AND large.c < 20
 ----
-10 100
-20 NULL
+3   NULL
+6   9
+9   NULL
+12  18
+15  NULL
+18  NULL
+21  NULL
+24  NULL
+27  NULL
+30  NULL
 
-# Left join with ON filter on non-covering index
-query T
-SELECT "URL" FROM [EXPLAIN (DISTSQL) SELECT x, d FROM (VALUES (10), (20)) AS v(x) LEFT JOIN t@bc ON x = b AND d < 3000]
-----
-https://cockroachdb.github.io/distsqlplan/decode.html?eJyUkU9rwkAQxe_9FMOcFBbcqL3sKRQUImKKpL20OaTZQbemO2H_gCJ-95Lk0FqwtMd5s7_39u2e0bKmTfVBHtULJlgKbB3X5D27ThoOZPqISgo0to2hk0uBNTtCdcZgQkOo8LlqIvmJRIGaQmWa3nEODzCaQr2P9uDHWF4EcgxfLj5UO0IlL-LvSSs2dkuVJjdJrtOKU0sK1otlAflTsdjCKs82KPCtTgMKXDMfYgvvbCywVZB2eGY1HZemCeQUpHN4jVLOaphJKZVS2aaAkTO7fQBvNAHb5jRGgXkMHS_S-5udkv902pJv2Xq66nP7tUqBpHc0_JDn6Gp6dFz3McOY91wvaPJh2CbDkNlh1V3wO5z8Ck9_wOXl7jMAAP__qcy4uQ==
-
+## Left join with ON filter on non-covering index
 query II rowsort
-SELECT x, d FROM (VALUES (10), (20)) AS v(x) LEFT JOIN t@bc ON x = b AND d < 2000
+SELECT small.c, large.d FROM small LEFT JOIN large ON small.c = large.b AND large.d < 30
 ----
-10 1000
-20 NULL
+3   NULL
+6   12
+9   NULL
+12  24
+15  NULL
+18  NULL
+21  NULL
+24  NULL
+27  NULL
+30  NULL
 
-# Left join with ON filter and WHERE clause
+# Lookup joins against interleaved tables. Regression test for #28981.
+# This is now tested more thoroughly by joinreader_test.go.
+
+statement ok
+CREATE TABLE parent (a INT, b INT, PRIMARY KEY(a, b))
+
+statement ok
+CREATE TABLE child (a INT, b INT, c INT, PRIMARY KEY(a, b, c)) INTERLEAVE IN PARENT parent(a, b)
+
+statement ok
+CREATE TABLE source (a INT)
+
+statement ok
+ALTER TABLE source INJECT STATISTICS '[
+  {
+    "columns": ["a"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 1,
+    "distinct_count": 1
+  }
+]'
+
+statement ok
+ALTER TABLE child INJECT STATISTICS '[
+  {
+    "columns": ["a", "b", "c"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 10,
+    "distinct_count": 10
+  }
+]'
+
+statement ok
+INSERT INTO child VALUES(1, 2, 3)
+
+statement ok
+INSERT INTO source VALUES(1)
+
+query IIII
+SELECT * FROM source JOIN child ON source.a = child.a
+----
+1 1 2 3
+
+###########################################################
+#  LOOKUP JOINS ON IMPLICIT INDEX KEY COLUMNS             #
+#  https://github.com/cockroachdb/cockroach/issues/31777  #
+###########################################################
+statement ok
+CREATE TABLE t (a INT, b INT, c INT, d INT, e INT)
+
+statement ok
+CREATE TABLE u (a INT, b INT, c INT, d INT, e INT, PRIMARY KEY (a DESC, b, c))
+
+statement ok
+INSERT INTO t VALUES
+  (1, 2, 3, 4, 5)
+
+statement ok
+INSERT INTO u VALUES
+  (1, 2, 3, 4, 5),
+  (2, 3, 4, 5, 6),
+  (3, 4, 5, 6, 7)
+
+# Test index with all primary key columns implicit.
+statement ok
+CREATE INDEX idx ON u (d)
+
+query I
+SELECT u.a FROM t JOIN u ON t.d = u.d AND t.a = u.a WHERE t.e = 5
+----
+1
+
+# Test unique version of same index. (Lookup join should not use column a.)
+statement ok
+DROP INDEX u@idx
+
+statement ok
+CREATE UNIQUE INDEX idx ON u (d)
+
+query I
+SELECT u.a FROM t JOIN u ON t.d = u.d AND t.a = u.a WHERE t.e = 5
+----
+1
+
+# Test index with first primary key column explicit and the rest implicit.
+statement ok
+DROP INDEX u@idx CASCADE
+
+statement ok
+CREATE INDEX idx ON u (d, a)
+
+query I
+SELECT u.a FROM t JOIN u ON t.d = u.d AND t.a = u.a AND t.b = u.b WHERE t.e = 5
+----
+1
+
+# Test index with middle primary key column explicit and the rest implicit.
+statement ok
+DROP INDEX u@idx
+
+statement ok
+CREATE INDEX idx ON u (d, b)
+
+query I
+SELECT u.a FROM t JOIN u ON t.d = u.d AND t.a = u.a AND t.b = u.b WHERE t.e = 5
+----
+1
+
+# Test index with last primary key column explicit and the rest implicit.
+statement ok
+DROP INDEX u@idx
+
+statement ok
+CREATE INDEX idx ON u (d, c)
+
+query I
+SELECT u.a FROM t JOIN u ON t.d = u.d AND t.a = u.a AND t.d = u.d WHERE t.e = 5
+----
+1
+
+query IIIIII colnames,partialsort(4)
+SELECT * FROM def JOIN abc ON a=f ORDER BY a
+----
+d     e  f  a  b     c
+2     1  1  1  1     2
+NULL  2  1  1  1     2
+1     1  2  2  NULL  2
+1     1  2  2  1     1
+
+# Test lookup semi and anti join.
+query III rowsort
+SELECT * from abc WHERE EXISTS (SELECT * FROM def WHERE a=f)
+----
+1  1     2
+2  1     1
+2  NULL  2
+
+query III rowsort
+SELECT * from abc WHERE NOT EXISTS (SELECT * FROM def WHERE a=f)
+----
+
+query III rowsort
+SELECT * from abc WHERE EXISTS (SELECT * FROM def WHERE a=f AND c=e)
+----
+1  1  2
+2  1  1
+
+query III rowsort
+SELECT * from abc WHERE NOT EXISTS (SELECT * FROM def WHERE a=f AND c=e)
+----
+2  NULL  2
+
+query III rowsort
+SELECT * from abc WHERE EXISTS (SELECT * FROM def WHERE a=f AND d+b>1)
+----
+1  1  2
+2  1  1
+
+query III rowsort
+SELECT * from abc WHERE NOT EXISTS (SELECT * FROM def WHERE a=f AND d+b>1)
+----
+2  NULL  2
+
+query II
+SELECT a,b from small WHERE EXISTS (SELECT a FROM data WHERE small.a=data.a) ORDER BY a
+----
+1   2
+2   4
+3   6
+4   8
+5   10
+6   12
+7   14
+8   16
+9   18
+10  20
+
+query II
+SELECT a,b from small WHERE a+b<20 AND EXISTS (SELECT a FROM data WHERE small.a=data.a AND small.b+data.c>15) ORDER BY a
+----
+3  6
+4  8
+5  10
+6  12
+
+# The following tests check that if the joiners can separate a row request
+# into separate families that it does, and generates spans for each family
+# instead of reading the entire row when it doesn't need to.
+
+statement ok
+CREATE TABLE family_split_1 (x INT, PRIMARY KEY (x))
+
+statement ok
+INSERT INTO family_split_1 VALUES (1)
+
+statement ok
+CREATE TABLE family_split_2 (x INT, y INT, z INT, PRIMARY KEY (x), FAMILY f1 (x), FAMILY f2 (y), FAMILY f3 (z))
+
+statement ok
+INSERT INTO family_split_2 VALUES (1, 2, 3)
+
+statement ok
+SET tracing = on; SELECT family_split_2.x, family_split_2.z FROM family_split_1 INNER LOOKUP JOIN family_split_2 ON family_split_1.x = family_split_2.x; SET tracing = off
+
 query T
-SELECT "URL" FROM [EXPLAIN (DISTSQL) SELECT x, d FROM (VALUES (10), (20)) AS v(x) LEFT JOIN t@bc ON x = b WHERE d < 2000]
+SELECT message FROM [SHOW TRACE FOR SESSION] WHERE message LIKE 'Scan /Table/70/1/1/{0-1}, /Table/70/1/1/2/{1-2}'
 ----
-https://cockroachdb.github.io/distsqlplan/decode.html?eJyUkU9Lw0AQxe9-iuWdFBa6qfaypyC0kFIaKdGL5hA3Q42NO2H_gFLy3SXJQStU9Dhv5vfeY_cIyzVtqzfy0I9IUEp0jg15z26QpoOsfodWEo3tYhjkUsKwI-gjQhNagsZD1UbyMwWJmkLVtKPjjbgVl3NhXqI9-CuUvQTH8OXiQ7UnaNXLvyetubE7qmpys-Q0rfjoSIvNclWI_L5Y7sQ6z7aQeDZpgMSG-RA78cqNFWy1SAd81bSBnBbpQjxFpa6NmCultNbZtoBEHsNwKNPF2fLJf8rvyHdsPZ0UP_8spQTVe5q-wnN0hu4cmzFmGvORG4WafJi2yTRkdloNBb_Dya_w_Adc9hefAQAA__-6pLCL
+Scan /Table/70/1/1/{0-1}, /Table/70/1/1/2/{1-2}
 
-query II rowsort
-SELECT x, d FROM (VALUES (10), (20)) AS v(x) LEFT JOIN t@bc ON x = b WHERE d < 2000
+statement ok
+CREATE TABLE family_index_join (x INT PRIMARY KEY, y INT, z INT, w INT, INDEX (y), FAMILY f1 (x), FAMILY f2 (y), FAMILY f3 (z), FAMILY f4(w))
+
+statement ok
+INSERT INTO family_index_join VALUES (1, 2, 3, 4)
+
+statement ok
+SET tracing = on
+
+query II
+SELECT y,w FROM family_index_join@family_index_join_y_idx WHERE y = 2
 ----
-10 1000
+2 4
+
+statement ok
+SET tracing = off
+
+query T
+SELECT message FROM [SHOW TRACE FOR SESSION] WHERE message LIKE 'Scan /Table/71/1/%'
+----
+Scan /Table/71/1/1/{0-1/2}, /Table/71/1/1/3/{1-2}
+
+# Test generating tighter spans on interleaved tables.
+statement ok
+CREATE TABLE family_interleave_1 (x INT, y INT, z INT, PRIMARY KEY (x), FAMILY f1 (x), FAMILY f2 (y), FAMILY f3 (z))
+
+statement ok
+CREATE TABLE family_interleave_2 (x INT, y INT, PRIMARY KEY (x, y)) INTERLEAVE IN PARENT family_interleave_1 (x)
+
+statement ok
+INSERT INTO family_interleave_1 VALUES (1, 2, 3)
+
+statement ok
+INSERT INTO family_interleave_2 VALUES (1, 3)
+
+statement ok
+SET TRACING = on
+
+query II
+SELECT family_interleave_1.x, family_interleave_1.z FROM family_interleave_2 INNER LOOKUP JOIN family_interleave_1 ON family_interleave_1.x = family_interleave_2.x
+----
+1 3
+
+query T
+SELECT message FROM [SHOW TRACE FOR SESSION] WHERE message LIKE 'Scan /Table/72/1/1/{0-1}, /Table/72/1/1/2/{1-2}'
+----
+Scan /Table/72/1/1/{0-1}, /Table/72/1/1/2/{1-2}

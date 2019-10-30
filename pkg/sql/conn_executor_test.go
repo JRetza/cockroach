@@ -1,21 +1,18 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql_test
 
 import (
 	"context"
+	gosql "database/sql"
 	"database/sql/driver"
 	"fmt"
 	"net/url"
@@ -23,8 +20,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/lib/pq"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -39,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/lib/pq"
 )
 
 func TestAnonymizeStatementsForReporting(t *testing.T) {
@@ -57,11 +53,11 @@ select * from crdb_internal.node_runtime_info;
 
 	const (
 		expMessage = "panic while testing 2 statements: INSERT INTO _(_, _) VALUES " +
-			"(_, _, _, _); SELECT * FROM _._; caused by i'm not safe"
+			"(_, _, __more2__); SELECT * FROM _._; caused by i'm not safe"
 		expSafeRedactedMessage = "?:0: panic while testing 2 statements: INSERT INTO _(_, _) VALUES " +
-			"(_, _, _, _); SELECT * FROM _._: caused by <redacted>"
+			"(_, _, __more2__); SELECT * FROM _._: caused by <redacted>"
 		expSafeSafeMessage = "?:0: panic while testing 2 statements: INSERT INTO _(_, _) VALUES " +
-			"(_, _, _, _); SELECT * FROM _._: caused by something safe"
+			"(_, _, __more2__); SELECT * FROM _._: caused by something safe"
 	)
 
 	actMessage := safeErr.Error()
@@ -84,33 +80,30 @@ select * from crdb_internal.node_runtime_info;
 
 // Test that a connection closed abruptly while a SQL txn is in progress results
 // in that txn being rolled back.
+//
+// TODO(andrei): This test terminates a client connection by calling Close() on
+// a driver.Conn(), which sends a MsgTerminate. We should also have a test that
+// closes the connection more abruptly than that.
 func TestSessionFinishRollsBackTxn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	aborter := NewTxnAborter()
 	defer aborter.Close(t)
 	params, _ := tests.CreateTestServerParams()
-	var activateKnobs func()
-	params.Knobs.SQLExecutor, activateKnobs = aborter.executorKnobs()
+	params.Knobs.SQLExecutor = aborter.executorKnobs()
 	s, mainDB, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.TODO())
 	{
 		pgURL, cleanup := sqlutils.PGUrl(
-			t, s.ServingAddr(), "TestSessionFinishRollsBackTxn", url.User(security.RootUser))
+			t, s.ServingSQLAddr(), "TestSessionFinishRollsBackTxn", url.User(security.RootUser))
 		defer cleanup()
 		if err := aborter.Init(pgURL); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	// After this point, the abort knob is active. This also means that
-	// the AST is checked for modification. So we have to use fully
-	// qualified table names throughout to avoid a mismatch due to table
-	// qualification.
-	activateKnobs()
-
 	if _, err := mainDB.Exec(`
 CREATE DATABASE t;
-CREATE TABLE t.public.test (k INT PRIMARY KEY, v TEXT);
+CREATE TABLE t.test (k INT PRIMARY KEY, v TEXT);
 `); err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +119,7 @@ CREATE TABLE t.public.test (k INT PRIMARY KEY, v TEXT);
 		t.Run(state, func(t *testing.T) {
 			// Create a low-level lib/pq connection so we can close it at will.
 			pgURL, cleanupDB := sqlutils.PGUrl(
-				t, s.ServingAddr(), state, url.User(security.RootUser))
+				t, s.ServingSQLAddr(), state, url.User(security.RootUser))
 			defer cleanupDB()
 			c, err := pq.Open(pgURL.String())
 			if err != nil {
@@ -201,6 +194,7 @@ CREATE TABLE t.public.test (k INT PRIMARY KEY, v TEXT);
 			// any errors.
 			// TODO(andrei): Figure out a better way to test for non-blocking.
 			// Use a trace when the client-side tracing story gets good enough.
+			// There's a bit of difficulty because the cleanup is async.
 			txCheck, err := mainDB.Begin()
 			if err != nil {
 				t.Fatal(err)
@@ -212,7 +206,7 @@ CREATE TABLE t.public.test (k INT PRIMARY KEY, v TEXT);
 			}
 			ts := timeutil.Now()
 			var count int
-			if err := txCheck.QueryRow("SELECT count(1) FROM t.public.test").Scan(&count); err != nil {
+			if err := txCheck.QueryRow("SELECT count(1) FROM t.test").Scan(&count); err != nil {
 				t.Fatal(err)
 			}
 			// CommitWait actually committed, so we'll need to clean up.
@@ -221,7 +215,7 @@ CREATE TABLE t.public.test (k INT PRIMARY KEY, v TEXT);
 					t.Fatalf("expected no rows, got: %d", count)
 				}
 			} else {
-				if _, err := txCheck.Exec("DELETE FROM t.public.test"); err != nil {
+				if _, err := txCheck.Exec("DELETE FROM t.test"); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -352,5 +346,47 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v TEXT);
 	if atomic.LoadInt64(&injectedErr) == 0 {
 		t.Fatal("test didn't inject the error; it must have failed to find " +
 			"the EndTransaction with the expected key")
+	}
+}
+
+func TestAppNameStatisticsInitialization(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	params, _ := tests.CreateTestServerParams()
+	params.Insecure = true
+	s, _, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.TODO())
+
+	// Prepare a session with a custom application name.
+	pgURL := url.URL{
+		Scheme:   "postgres",
+		User:     url.User(security.RootUser),
+		Host:     s.ServingSQLAddr(),
+		RawQuery: "sslmode=disable&application_name=mytest",
+	}
+	rawSQL, err := gosql.Open("postgres", pgURL.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rawSQL.Close()
+	sqlDB := sqlutils.MakeSQLRunner(rawSQL)
+
+	// Issue a query to be registered in stats.
+	sqlDB.Exec(t, "SELECT version()")
+
+	// Verify the query shows up in stats.
+	rows := sqlDB.Query(t, "SELECT application_name, key FROM crdb_internal.node_statement_statistics")
+	defer rows.Close()
+
+	counts := map[string]int{}
+	for rows.Next() {
+		var appName, key string
+		if err := rows.Scan(&appName, &key); err != nil {
+			t.Fatal(err)
+		}
+		counts[appName+":"+key]++
+	}
+	if counts["mytest:SELECT version()"] == 0 {
+		t.Fatalf("query was not counted properly: %+v", counts)
 	}
 }

@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -22,6 +18,9 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/kr/pretty"
 )
+
+// Whether to run slow tests.
+var slow bool
 
 func init() {
 	if err := os.Setenv("AWS_ACCESS_KEY_ID", "testing"); err != nil {
@@ -53,7 +52,9 @@ func mockPutter(p s3putter) func() {
 }
 
 func TestMain(t *testing.T) {
-	t.Skip("only to be run manually via `./build/builder.sh go test -timeout 1h -v ./pkg/cmd/publish-artifacts`")
+	if !slow {
+		t.Skip("only to be run manually via `./build/builder.sh go test -tags slow -timeout 1h -v ./pkg/cmd/publish-artifacts`")
+	}
 	r := &recorder{}
 	undo := mockPutter(r)
 	defer undo()
@@ -71,9 +72,9 @@ func TestMain(t *testing.T) {
 			Key:                "/cockroach/cockroach.darwin-amd64." + shaStub,
 		},
 		{
-			Bucket:       "cockroach",
-			CacheControl: "no-cache",
-			Key:          "cockroach/cockroach.darwin-amd64.LATEST",
+			Bucket:                  "cockroach",
+			CacheControl:            "no-cache",
+			Key:                     "cockroach/cockroach.darwin-amd64.LATEST",
 			WebsiteRedirectLocation: "/cockroach/cockroach.darwin-amd64." + shaStub,
 		},
 		{
@@ -82,9 +83,9 @@ func TestMain(t *testing.T) {
 			Key:                "/cockroach/cockroach.linux-gnu-amd64." + shaStub,
 		},
 		{
-			Bucket:       "cockroach",
-			CacheControl: "no-cache",
-			Key:          "cockroach/cockroach.linux-gnu-amd64.LATEST",
+			Bucket:                  "cockroach",
+			CacheControl:            "no-cache",
+			Key:                     "cockroach/cockroach.linux-gnu-amd64.LATEST",
 			WebsiteRedirectLocation: "/cockroach/cockroach.linux-gnu-amd64." + shaStub,
 		},
 		{
@@ -93,9 +94,9 @@ func TestMain(t *testing.T) {
 			Key:                "/cockroach/cockroach.race.linux-gnu-amd64." + shaStub,
 		},
 		{
-			Bucket:       "cockroach",
-			CacheControl: "no-cache",
-			Key:          "cockroach/cockroach.race.linux-gnu-amd64.LATEST",
+			Bucket:                  "cockroach",
+			CacheControl:            "no-cache",
+			Key:                     "cockroach/cockroach.race.linux-gnu-amd64.LATEST",
 			WebsiteRedirectLocation: "/cockroach/cockroach.race.linux-gnu-amd64." + shaStub,
 		},
 		{
@@ -104,9 +105,9 @@ func TestMain(t *testing.T) {
 			Key:                "/cockroach/cockroach.linux-musl-amd64." + shaStub,
 		},
 		{
-			Bucket:       "cockroach",
-			CacheControl: "no-cache",
-			Key:          "cockroach/cockroach.linux-musl-amd64.LATEST",
+			Bucket:                  "cockroach",
+			CacheControl:            "no-cache",
+			Key:                     "cockroach/cockroach.linux-musl-amd64.LATEST",
 			WebsiteRedirectLocation: "/cockroach/cockroach.linux-musl-amd64." + shaStub,
 		},
 		{
@@ -115,17 +116,78 @@ func TestMain(t *testing.T) {
 			Key:                "/cockroach/cockroach.windows-amd64." + shaStub + ".exe",
 		},
 		{
-			Bucket:       "cockroach",
-			CacheControl: "no-cache",
-			Key:          "cockroach/cockroach.windows-amd64.LATEST",
+			Bucket:                  "cockroach",
+			CacheControl:            "no-cache",
+			Key:                     "cockroach/cockroach.windows-amd64.LATEST",
 			WebsiteRedirectLocation: "/cockroach/cockroach.windows-amd64." + shaStub + ".exe",
+		},
+		{
+			Bucket:             "cockroach",
+			ContentDisposition: "attachment; filename=workload." + shaStub,
+			Key:                "/cockroach/workload." + shaStub,
+		},
+		{
+			Bucket:                  "cockroach",
+			CacheControl:            "no-cache",
+			Key:                     "cockroach/workload.LATEST",
+			WebsiteRedirectLocation: "/cockroach/workload." + shaStub,
+		},
+		{
+			Bucket: "binaries.cockroachdb.com",
+			Key:    "cockroach-v42.42.42.src.tgz",
+		},
+		{
+			Bucket:       "binaries.cockroachdb.com",
+			CacheControl: "no-cache",
+			Key:          "cockroach-latest.src.tgz",
+		},
+		{
+			Bucket: "binaries.cockroachdb.com",
+			Key:    "cockroach-v42.42.42.darwin-10.9-amd64.tgz",
+		},
+		{
+			Bucket:       "binaries.cockroachdb.com",
+			CacheControl: "no-cache",
+			Key:          "cockroach-latest.darwin-10.9-amd64.tgz",
+		},
+		{
+			Bucket: "binaries.cockroachdb.com",
+			Key:    "cockroach-v42.42.42.linux-amd64.tgz",
+		},
+		{
+			Bucket:       "binaries.cockroachdb.com",
+			CacheControl: "no-cache",
+			Key:          "cockroach-latest.linux-amd64.tgz",
+		},
+		{
+			Bucket: "binaries.cockroachdb.com",
+			Key:    "cockroach-v42.42.42.linux-musl-amd64.tgz",
+		},
+		{
+			Bucket:       "binaries.cockroachdb.com",
+			CacheControl: "no-cache",
+			Key:          "cockroach-latest.linux-musl-amd64.tgz",
+		},
+		{
+			Bucket: "binaries.cockroachdb.com",
+			Key:    "cockroach-v42.42.42.windows-6.2-amd64.zip",
+		},
+		{
+			Bucket:       "binaries.cockroachdb.com",
+			CacheControl: "no-cache",
+			Key:          "cockroach-latest.windows-6.2-amd64.zip",
 		},
 	}
 
 	if err := os.Setenv("TC_BUILD_BRANCH", "master"); err != nil {
 		t.Fatal(err)
 	}
+	main()
 
+	if err := os.Setenv("TC_BUILD_BRANCH", "v42.42.42"); err != nil {
+		t.Fatal(err)
+	}
+	*isRelease = true
 	main()
 
 	var acts []testCase

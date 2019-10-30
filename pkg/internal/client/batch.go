@@ -1,25 +1,22 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package client
 
 import (
 	"context"
 
-	"github.com/pkg/errors"
-
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/pkg/errors"
 )
 
 const (
@@ -167,8 +164,8 @@ func (b *Batch) fillResults(ctx context.Context) {
 						// instead; this effectively just leaks here.
 						// TODO(tschottdorf): returning an error here seems
 						// to get swallowed.
-						panic(errors.Errorf("not enough responses for calls: %+v, %+v",
-							b.reqs, b.response))
+						panic(errors.Errorf("not enough responses for calls: (%T) %+v\nresponses: %+v",
+							args, args, b.response))
 					}
 				}
 			}
@@ -243,20 +240,22 @@ func (b *Batch) fillResults(ctx context.Context) {
 						reply, args)
 				}
 
-				// Nothing to do for all methods below as they do not generate
-				// any rows.
+			// Nothing to do for all methods below as they do not generate
+			// any rows.
 			case *roachpb.BeginTransactionRequest:
 			case *roachpb.EndTransactionRequest:
 			case *roachpb.AdminMergeRequest:
 			case *roachpb.AdminSplitRequest:
+			case *roachpb.AdminUnsplitRequest:
 			case *roachpb.AdminTransferLeaseRequest:
 			case *roachpb.AdminChangeReplicasRequest:
+			case *roachpb.AdminRelocateRangeRequest:
 			case *roachpb.HeartbeatTxnRequest:
 			case *roachpb.GCRequest:
 			case *roachpb.LeaseInfoRequest:
 			case *roachpb.PushTxnRequest:
 			case *roachpb.QueryTxnRequest:
-			case *roachpb.DeprecatedRangeLookupRequest:
+			case *roachpb.QueryIntentRequest:
 			case *roachpb.ResolveIntentRequest:
 			case *roachpb.ResolveIntentRangeRequest:
 			case *roachpb.MergeRequest:
@@ -270,7 +269,7 @@ func (b *Batch) fillResults(ctx context.Context) {
 			}
 			// Fill up the resume span.
 			if result.Err == nil && reply != nil && reply.Header().ResumeSpan != nil {
-				result.ResumeSpan = *reply.Header().ResumeSpan
+				result.ResumeSpan = reply.Header().ResumeSpan
 				result.ResumeReason = reply.Header().ResumeReason
 				// The ResumeReason might be missing when talking to a 1.1 node; assume
 				// it's the key limit (which was the only reason why 1.1 would return a
@@ -414,7 +413,55 @@ func (b *Batch) PutInline(key, value interface{}) {
 //
 // key can be either a byte slice or a string. value can be any key type, a
 // protoutil.Message or any Go primitive type (bool, int, etc).
-func (b *Batch) CPut(key, value, expValue interface{}) {
+func (b *Batch) CPut(key, value interface{}, expValue *roachpb.Value) {
+	b.cputInternal(key, value, expValue, false)
+}
+
+// CPutDeprecated conditionally sets the value for a key if the existing value is equal
+// to expValue. To conditionally set a value only if there is no existing entry
+// pass nil for expValue. Note that this must be an interface{}(nil), not a
+// typed nil value (e.g. []byte(nil)).
+//
+// A new result will be appended to the batch which will contain a single row
+// and Result.Err will indicate success or failure.
+//
+// key can be either a byte slice or a string. value can be any key type, a
+// protoutil.Message or any Go primitive type (bool, int, etc).
+func (b *Batch) CPutDeprecated(key, value, expValue interface{}) {
+	b.cputInternalDeprecated(key, value, expValue, false)
+}
+
+// CPutAllowingIfNotExists is like CPut except it also allows the Put when the
+// existing entry does not exist -- i.e. it succeeds if there is no existing
+// entry or the existing entry has the expected value.
+func (b *Batch) CPutAllowingIfNotExists(key, value interface{}, expValue *roachpb.Value) {
+	b.cputInternal(key, value, expValue, true)
+}
+
+func (b *Batch) cputInternal(key, value interface{}, expValue *roachpb.Value, allowNotExist bool) {
+	k, err := marshalKey(key)
+	if err != nil {
+		b.initResult(0, 1, notRaw, err)
+		return
+	}
+	v, err := marshalValue(value)
+	if err != nil {
+		b.initResult(0, 1, notRaw, err)
+		return
+	}
+	var ev roachpb.Value
+	if expValue != nil {
+		ev = *expValue
+		// This expected value is assumed to come from a kv read or from writing a
+		// roachpb.Value. In both cases it will have a checksum set. Instead of
+		// requiring callers to clear it, do it for them.
+		ev.ClearChecksum()
+	}
+	b.appendReqs(roachpb.NewConditionalPut(k, v, ev, allowNotExist))
+	b.initResult(1, 1, notRaw, nil)
+}
+
+func (b *Batch) cputInternalDeprecated(key, value, expValue interface{}, allowNotExist bool) {
 	k, err := marshalKey(key)
 	if err != nil {
 		b.initResult(0, 1, notRaw, err)
@@ -430,7 +477,7 @@ func (b *Batch) CPut(key, value, expValue interface{}) {
 		b.initResult(0, 1, notRaw, err)
 		return
 	}
-	b.appendReqs(roachpb.NewConditionalPut(k, v, ev))
+	b.appendReqs(roachpb.NewConditionalPut(k, v, ev, allowNotExist))
 	b.initResult(1, 1, notRaw, nil)
 }
 
@@ -516,24 +563,6 @@ func (b *Batch) ReverseScan(s, e interface{}) {
 	b.scan(s, e, true)
 }
 
-// CheckConsistency creates a batch request to check the consistency of the
-// ranges holding the span of keys from s to e. It logs a diff of all the
-// keys that are inconsistent when withDiff is set to true.
-func (b *Batch) CheckConsistency(s, e interface{}, withDiff bool) {
-	begin, err := marshalKey(s)
-	if err != nil {
-		b.initResult(0, 0, notRaw, err)
-		return
-	}
-	end, err := marshalKey(e)
-	if err != nil {
-		b.initResult(0, 0, notRaw, err)
-		return
-	}
-	b.appendReqs(roachpb.NewCheckConsistency(begin, end, withDiff))
-	b.initResult(1, 0, notRaw, nil)
-}
-
 // Del deletes one or more keys.
 //
 // A new result will be appended to the batch and each key will have a
@@ -584,7 +613,7 @@ func (b *Batch) adminMerge(key interface{}) {
 		return
 	}
 	req := &roachpb.AdminMergeRequest{
-		Span: roachpb.Span{
+		RequestHeader: roachpb.RequestHeader{
 			Key: k,
 		},
 	}
@@ -594,7 +623,7 @@ func (b *Batch) adminMerge(key interface{}) {
 
 // adminSplit is only exported on DB. It is here for symmetry with the
 // other operations.
-func (b *Batch) adminSplit(spanKeyIn, splitKeyIn interface{}) {
+func (b *Batch) adminSplit(spanKeyIn, splitKeyIn interface{}, expirationTime hlc.Timestamp) {
 	spanKey, err := marshalKey(spanKeyIn)
 	if err != nil {
 		b.initResult(0, 0, notRaw, err)
@@ -606,11 +635,26 @@ func (b *Batch) adminSplit(spanKeyIn, splitKeyIn interface{}) {
 		return
 	}
 	req := &roachpb.AdminSplitRequest{
-		Span: roachpb.Span{
+		RequestHeader: roachpb.RequestHeader{
 			Key: spanKey,
 		},
+		SplitKey:       splitKey,
+		ExpirationTime: expirationTime,
 	}
-	req.SplitKey = splitKey
+	b.appendReqs(req)
+	b.initResult(1, 0, notRaw, nil)
+}
+
+func (b *Batch) adminUnsplit(splitKeyIn interface{}) {
+	splitKey, err := marshalKey(splitKeyIn)
+	if err != nil {
+		b.initResult(0, 0, notRaw, err)
+	}
+	req := &roachpb.AdminUnsplitRequest{
+		RequestHeader: roachpb.RequestHeader{
+			Key: splitKey,
+		},
+	}
 	b.appendReqs(req)
 	b.initResult(1, 0, notRaw, nil)
 }
@@ -624,7 +668,7 @@ func (b *Batch) adminTransferLease(key interface{}, target roachpb.StoreID) {
 		return
 	}
 	req := &roachpb.AdminTransferLeaseRequest{
-		Span: roachpb.Span{
+		RequestHeader: roachpb.RequestHeader{
 			Key: k,
 		},
 		Target: target,
@@ -636,7 +680,7 @@ func (b *Batch) adminTransferLease(key interface{}, target roachpb.StoreID) {
 // adminChangeReplicas is only exported on DB. It is here for symmetry with the
 // other operations.
 func (b *Batch) adminChangeReplicas(
-	key interface{}, changeType roachpb.ReplicaChangeType, targets []roachpb.ReplicationTarget,
+	key interface{}, expDesc roachpb.RangeDescriptor, chgs []roachpb.ReplicationChange,
 ) {
 	k, err := marshalKey(key)
 	if err != nil {
@@ -644,11 +688,30 @@ func (b *Batch) adminChangeReplicas(
 		return
 	}
 	req := &roachpb.AdminChangeReplicasRequest{
-		Span: roachpb.Span{
+		RequestHeader: roachpb.RequestHeader{
 			Key: k,
 		},
-		ChangeType: changeType,
-		Targets:    targets,
+		ExpDesc: expDesc,
+	}
+	req.AddChanges(chgs...)
+
+	b.appendReqs(req)
+	b.initResult(1, 0, notRaw, nil)
+}
+
+// adminRelocateRange is only exported on DB. It is here for symmetry with the
+// other operations.
+func (b *Batch) adminRelocateRange(key interface{}, targets []roachpb.ReplicationTarget) {
+	k, err := marshalKey(key)
+	if err != nil {
+		b.initResult(0, 0, notRaw, err)
+		return
+	}
+	req := &roachpb.AdminRelocateRangeRequest{
+		RequestHeader: roachpb.RequestHeader{
+			Key: k,
+		},
+		Targets: targets,
 	}
 	b.appendReqs(req)
 	b.initResult(1, 0, notRaw, nil)
@@ -668,16 +731,22 @@ func (b *Batch) writeBatch(s, e interface{}, data []byte) {
 	}
 	span := roachpb.Span{Key: begin, EndKey: end}
 	req := &roachpb.WriteBatchRequest{
-		Span:     span,
-		DataSpan: span,
-		Data:     data,
+		RequestHeader: roachpb.RequestHeaderFromSpan(span),
+		DataSpan:      span,
+		Data:          data,
 	}
 	b.appendReqs(req)
 	b.initResult(1, 0, notRaw, nil)
 }
 
 // addSSTable is only exported on DB.
-func (b *Batch) addSSTable(s, e interface{}, data []byte) {
+func (b *Batch) addSSTable(
+	s, e interface{},
+	data []byte,
+	disallowShadowing bool,
+	stats *enginepb.MVCCStats,
+	ingestAsWrites bool,
+) {
 	begin, err := marshalKey(s)
 	if err != nil {
 		b.initResult(0, 0, notRaw, err)
@@ -688,10 +757,15 @@ func (b *Batch) addSSTable(s, e interface{}, data []byte) {
 		b.initResult(0, 0, notRaw, err)
 		return
 	}
-	span := roachpb.Span{Key: begin, EndKey: end}
 	req := &roachpb.AddSSTableRequest{
-		Span: span,
-		Data: data,
+		RequestHeader: roachpb.RequestHeader{
+			Key:    begin,
+			EndKey: end,
+		},
+		Data:              data,
+		DisallowShadowing: disallowShadowing,
+		MVCCStats:         stats,
+		IngestAsWrites:    ingestAsWrites,
 	}
 	b.appendReqs(req)
 	b.initResult(1, 0, notRaw, nil)

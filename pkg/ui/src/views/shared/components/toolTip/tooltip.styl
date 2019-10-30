@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 @require "~styl/base/palette.styl"
 @require "~styl/base/layout-vars.styl"
 
@@ -18,7 +28,7 @@
 
   dt
     margin-top 10px
-    font-family Lato-Heavy
+    font-family Lato-Bold
 
 &.viz-tooltip
   width 250px
@@ -30,9 +40,11 @@
 
 .hover-tooltip
   position relative
+  width 100%
+  height 100%
 
   &__text
-    visibility hidden
+    display none
     z-index $z-index-tooltip
     position absolute
     top -10px
@@ -47,8 +59,12 @@
     text-align left
     color $body-color
 
+  &--short &__text
+    width unset
+    max-width 400px
+
   &--hovered &__text
-    visibility visible
+    display block
 
   a
     color $link-color

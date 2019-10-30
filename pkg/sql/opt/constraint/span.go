@@ -1,21 +1,19 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package constraint
 
 import (
 	"bytes"
+
+	"github.com/cockroachdb/errors"
 )
 
 // SpanBoundary specifies whether a span endpoint is inclusive or exclusive of
@@ -65,7 +63,10 @@ var UnconstrainedSpan = Span{}
 // before Set is called. Unconstrained spans cannot be used in constraints,
 // since the absence of a constraint is equivalent to an unconstrained span.
 func (sp *Span) IsUnconstrained() bool {
-	return sp.start.IsEmpty() && sp.end.IsEmpty()
+	startUnconstrained := sp.start.IsEmpty() || (sp.start.IsNull() && sp.startBoundary == IncludeBoundary)
+	endUnconstrained := sp.end.IsEmpty()
+
+	return startUnconstrained && endUnconstrained
 }
 
 // StartKey returns the start key.
@@ -95,11 +96,11 @@ func (sp *Span) EndBoundary() SpanBoundary {
 func (sp *Span) Init(start Key, startBoundary SpanBoundary, end Key, endBoundary SpanBoundary) {
 	if start.IsEmpty() && startBoundary == ExcludeBoundary {
 		// Enforce one representation for empty boundary.
-		panic("an empty start boundary must be inclusive")
+		panic(errors.AssertionFailedf("an empty start boundary must be inclusive"))
 	}
 	if end.IsEmpty() && endBoundary == ExcludeBoundary {
 		// Enforce one representation for empty boundary.
-		panic("an empty end boundary must be inclusive")
+		panic(errors.AssertionFailedf("an empty end boundary must be inclusive"))
 	}
 
 	sp.start = start

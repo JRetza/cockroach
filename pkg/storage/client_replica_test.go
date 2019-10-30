@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage_test
 
@@ -19,13 +15,12 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"math/rand"
 	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
@@ -36,18 +31,30 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/pkg/errors"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.etcd.io/etcd/raft/raftpb"
 )
+
+func strToValue(s string) *roachpb.Value {
+	v := roachpb.MakeValueFromBytes([]byte(s))
+	return &v
+}
 
 // TestRangeCommandClockUpdate verifies that followers update their
 // clocks when executing a command, even if the lease holder's clock is far
@@ -62,7 +69,13 @@ func TestRangeCommandClockUpdate(t *testing.T) {
 		manuals = append(manuals, hlc.NewManualClock(1))
 		clocks = append(clocks, hlc.NewClock(manuals[i].UnixNano, 100*time.Millisecond))
 	}
-	mtc := &multiTestContext{clocks: clocks}
+	mtc := &multiTestContext{
+		clocks: clocks,
+		// This test was written before the multiTestContext started creating many
+		// system ranges at startup, and hasn't been update to take that into
+		// account.
+		startWithSingleRange: true,
+	}
 	defer mtc.Stop()
 	mtc.Start(t, numNodes)
 	mtc.replicateRange(1, 1, 2)
@@ -80,7 +93,8 @@ func TestRangeCommandClockUpdate(t *testing.T) {
 	testutils.SucceedsSoon(t, func() error {
 		values := []int64{}
 		for _, eng := range mtc.engines {
-			val, _, err := engine.MVCCGet(context.Background(), eng, roachpb.Key("a"), clocks[0].Now(), true, nil)
+			val, _, err := engine.MVCCGet(context.Background(), eng, roachpb.Key("a"), clocks[0].Now(),
+				engine.MVCCGetOptions{})
 			if err != nil {
 				return err
 			}
@@ -146,7 +160,8 @@ func TestRejectFutureCommand(t *testing.T) {
 	if advance := ts3.GoTime().Sub(ts2.GoTime()); advance != 0 {
 		t.Fatalf("expected clock not to advance, but it advanced by %s", advance)
 	}
-	val, _, err := engine.MVCCGet(context.Background(), mtc.engines[0], key, ts3, true, nil)
+	val, _, err := engine.MVCCGet(context.Background(), mtc.engines[0], key, ts3,
+		engine.MVCCGetOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,10 +234,8 @@ func TestTxnPutOutOfOrder(t *testing.T) {
 		}
 	eng := engine.NewInMem(roachpb.Attributes{}, 10<<20)
 	stopper.AddCloser(eng)
-	store := createTestStoreWithEngine(t,
-		eng,
-		true,
-		cfg,
+	store := createTestStoreWithOpts(t,
+		testStoreOpts{eng: eng, cfg: &cfg},
 		stopper,
 	)
 
@@ -230,7 +243,7 @@ func TestTxnPutOutOfOrder(t *testing.T) {
 	initVal := []byte("initVal")
 	err := store.DB().Put(context.TODO(), key, initVal)
 	if err != nil {
-		t.Fatalf("failed to put: %s", err)
+		t.Fatalf("failed to put: %+v", err)
 	}
 
 	waitPut := make(chan struct{})
@@ -260,8 +273,8 @@ func TestTxnPutOutOfOrder(t *testing.T) {
 			}
 
 			updatedVal := []byte("updatedVal")
-			if err := txn.CPut(ctx, key, updatedVal, "initVal"); err != nil {
-				log.Errorf(context.TODO(), "failed put value: %s", err)
+			if err := txn.CPut(ctx, key, updatedVal, strToValue("initVal")); err != nil {
+				log.Errorf(context.TODO(), "failed put value: %+v", err)
 				return err
 			}
 
@@ -302,7 +315,7 @@ func TestTxnPutOutOfOrder(t *testing.T) {
 	manual.Increment(100)
 
 	priority := roachpb.UserPriority(-math.MaxInt32)
-	requestHeader := roachpb.Span{
+	requestHeader := roachpb.RequestHeader{
 		Key: roachpb.Key(key),
 	}
 	h := roachpb.Header{
@@ -310,17 +323,17 @@ func TestTxnPutOutOfOrder(t *testing.T) {
 		UserPriority: priority,
 	}
 	if _, err := client.SendWrappedWith(
-		context.Background(), store.TestSender(), h, &roachpb.GetRequest{Span: requestHeader},
+		context.Background(), store.TestSender(), h, &roachpb.GetRequest{RequestHeader: requestHeader},
 	); err != nil {
-		t.Fatalf("failed to get: %s", err)
+		t.Fatalf("failed to get: %+v", err)
 	}
 	// Write to the restart key so that the Writer's txn must restart.
 	putReq := &roachpb.PutRequest{
-		Span:  roachpb.Span{Key: roachpb.Key(restartKey)},
-		Value: roachpb.MakeValueFromBytes([]byte("restart-value")),
+		RequestHeader: roachpb.RequestHeader{Key: roachpb.Key(restartKey)},
+		Value:         roachpb.MakeValueFromBytes([]byte("restart-value")),
 	}
 	if _, err := client.SendWrappedWith(context.Background(), store.TestSender(), h, putReq); err != nil {
-		t.Fatalf("failed to put: %s", err)
+		t.Fatalf("failed to put: %+v", err)
 	}
 
 	// Wait until the writer restarts the txn.
@@ -335,12 +348,12 @@ func TestTxnPutOutOfOrder(t *testing.T) {
 
 	h.Timestamp = cfg.Clock.Now()
 	if _, err := client.SendWrappedWith(
-		context.Background(), store.TestSender(), h, &roachpb.GetRequest{Span: requestHeader},
+		context.Background(), store.TestSender(), h, &roachpb.GetRequest{RequestHeader: requestHeader},
 	); err == nil {
 		t.Fatal("unexpected success of get")
 	}
 	if _, err := client.SendWrappedWith(context.Background(), store.TestSender(), h, putReq); err != nil {
-		t.Fatalf("failed to put: %s", err)
+		t.Fatalf("failed to put: %+v", err)
 	}
 
 	close(waitSecondGet)
@@ -357,9 +370,18 @@ func TestRangeLookupUseReverse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	storeCfg := storage.TestStoreConfig(nil)
 	storeCfg.TestingKnobs.DisableSplitQueue = true
+	storeCfg.TestingKnobs.DisableMergeQueue = true
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.TODO())
-	store := createTestStoreWithConfig(t, stopper, storeCfg)
+	store := createTestStoreWithOpts(
+		t,
+		testStoreOpts{
+			// This test was written before the test stores were able to start with
+			// more than one range and is not prepared to handle many ranges.
+			dontCreateSystemRanges: true,
+			cfg:                    &storeCfg,
+		},
+		stopper)
 
 	// Init test ranges:
 	// ["","a"), ["a","c"), ["c","e"), ["e","g") and ["g","\xff\xff").
@@ -379,7 +401,7 @@ func TestRangeLookupUseReverse(t *testing.T) {
 
 	// Resolve the intents.
 	scanArgs := roachpb.ScanRequest{
-		Span: roachpb.Span{
+		RequestHeader: roachpb.RequestHeader{
 			Key:    keys.RangeMetaKey(roachpb.RKeyMin.Next()).AsRawKey(),
 			EndKey: keys.RangeMetaKey(roachpb.RKeyMax).AsRawKey(),
 		},
@@ -454,40 +476,33 @@ func TestRangeLookupUseReverse(t *testing.T) {
 		},
 	}
 
-	testutils.RunTrueAndFalse(t, "legacy", func(t *testing.T, legacy bool) {
-		for _, test := range testCases {
-			t.Run(fmt.Sprintf("key=%s", test.key), func(t *testing.T) {
-				lookup := client.RangeLookup
-				if legacy {
-					lookup = client.LegacyRangeLookup
-				}
+	for _, test := range testCases {
+		t.Run(fmt.Sprintf("key=%s", test.key), func(t *testing.T) {
+			rs, preRs, err := client.RangeLookup(context.Background(), store.TestSender(),
+				test.key.AsRawKey(), roachpb.READ_UNCOMMITTED, test.maxResults-1, true /* prefetchReverse */)
+			if err != nil {
+				t.Fatalf("LookupRange error: %+v", err)
+			}
 
-				rs, preRs, err := lookup(context.Background(), store.TestSender(), test.key.AsRawKey(),
-					roachpb.INCONSISTENT, test.maxResults-1, true /* prefetchReverse */)
-				if err != nil {
-					t.Fatalf("LookupRange error: %s", err)
-				}
-
-				// Checks the results count.
-				if rsLen, preRsLen := len(rs), len(preRs); int64(rsLen+preRsLen) != test.maxResults {
-					t.Fatalf("returned results count, expected %d, but got %d+%d", test.maxResults, rsLen, preRsLen)
-				}
-				// Checks the range descriptors.
-				for _, rngSlice := range []struct {
-					expect, reply []roachpb.RangeDescriptor
-				}{
-					{test.expected, rs},
-					{test.expectedPre, preRs},
-				} {
-					for i, rng := range rngSlice.expect {
-						if !(rng.StartKey.Equal(rngSlice.reply[i].StartKey) && rng.EndKey.Equal(rngSlice.reply[i].EndKey)) {
-							t.Fatalf("returned range is not correct, expected %v, but got %v", rng, rngSlice.reply[i])
-						}
+			// Checks the results count.
+			if rsLen, preRsLen := len(rs), len(preRs); int64(rsLen+preRsLen) != test.maxResults {
+				t.Fatalf("returned results count, expected %d, but got %d+%d", test.maxResults, rsLen, preRsLen)
+			}
+			// Checks the range descriptors.
+			for _, rngSlice := range []struct {
+				expect, reply []roachpb.RangeDescriptor
+			}{
+				{test.expected, rs},
+				{test.expectedPre, preRs},
+			} {
+				for i, rng := range rngSlice.expect {
+					if !(rng.StartKey.Equal(rngSlice.reply[i].StartKey) && rng.EndKey.Equal(rngSlice.reply[i].EndKey)) {
+						t.Fatalf("returned range is not correct, expected %v, but got %v", rng, rngSlice.reply[i])
 					}
 				}
-			})
-		}
-	})
+			}
+		})
+	}
 }
 
 type leaseTransferTest struct {
@@ -533,6 +548,9 @@ func setupLeaseTransferTest(t *testing.T) *leaseTransferTest {
 	}
 
 	l.mtc = &multiTestContext{}
+	// This test was written before the multiTestContext started creating many
+	// system ranges at startup, and hasn't been update to take that into account.
+	l.mtc.startWithSingleRange = true
 	l.mtc.storeConfig = &cfg
 	l.mtc.Start(t, 2)
 	l.mtc.initGossipNetwork()
@@ -545,13 +563,13 @@ func setupLeaseTransferTest(t *testing.T) *leaseTransferTest {
 	}
 
 	// Get the left range's ID.
-	rangeID := l.mtc.stores[0].LookupReplica(keys.MustAddr(l.leftKey), nil).RangeID
+	rangeID := l.mtc.stores[0].LookupReplica(keys.MustAddr(l.leftKey)).RangeID
 
 	// Replicate the left range onto node 1.
 	l.mtc.replicateRange(rangeID, 1)
 
-	l.replica0 = l.mtc.stores[0].LookupReplica(roachpb.RKey("a"), nil)
-	l.replica1 = l.mtc.stores[1].LookupReplica(roachpb.RKey("a"), nil)
+	l.replica0 = l.mtc.stores[0].LookupReplica(roachpb.RKey("a"))
+	l.replica1 = l.mtc.stores[1].LookupReplica(roachpb.RKey("a"))
 	{
 		var err error
 		if l.replica0Desc, err = l.replica0.GetReplicaDescriptor(); err != nil {
@@ -570,7 +588,7 @@ func setupLeaseTransferTest(t *testing.T) *leaseTransferTest {
 }
 
 func (l *leaseTransferTest) sendRead(storeIdx int) *roachpb.Error {
-	desc := l.mtc.stores[storeIdx].LookupReplica(keys.MustAddr(l.leftKey), nil)
+	desc := l.mtc.stores[storeIdx].LookupReplica(keys.MustAddr(l.leftKey))
 	replicaDesc, err := desc.GetReplicaDescriptor()
 	if err != nil {
 		return roachpb.NewError(err)
@@ -634,15 +652,13 @@ func (l *leaseTransferTest) forceLeaseExtension(storeIdx int, lease roachpb.Leas
 	shouldRenewTS := lease.Expiration.Add(-1, 0)
 	l.mtc.manualClock.Set(shouldRenewTS.WallTime + 1)
 	err := l.sendRead(storeIdx).GoError()
-	if err != nil {
-		// We can sometimes receive an error from our renewal attempt because the
-		// lease transfer ends up causing the renewal to re-propose and second
-		// attempt fails because it's already been renewed. This used to work
-		// before we compared the proposer's lease with the actual lease because
-		// the renewed lease still encompassed the previous request.
-		if _, ok := err.(*roachpb.NotLeaseHolderError); ok {
-			err = nil
-		}
+	// We can sometimes receive an error from our renewal attempt because the
+	// lease transfer ends up causing the renewal to re-propose and second
+	// attempt fails because it's already been renewed. This used to work
+	// before we compared the proposer's lease with the actual lease because
+	// the renewed lease still encompassed the previous request.
+	if _, ok := err.(*roachpb.NotLeaseHolderError); ok {
+		err = nil
 	}
 	return err
 }
@@ -729,7 +745,7 @@ func TestRangeTransferLeaseExpirationBased(t *testing.T) {
 		if !ok {
 			t.Fatalf("expected %T, got %s", &roachpb.NotLeaseHolderError{}, pErr)
 		}
-		if *(nlhe.LeaseHolder) != l.replica1Desc {
+		if !nlhe.LeaseHolder.Equal(&l.replica1Desc) {
 			t.Fatalf("expected lease holder %+v, got %+v",
 				l.replica1Desc, nlhe.LeaseHolder)
 		}
@@ -795,10 +811,10 @@ func TestRangeTransferLeaseExpirationBased(t *testing.T) {
 		l.setFilter(false, nil)
 
 		if err := <-renewalErrCh; err != nil {
-			t.Errorf("unexpected error from lease renewal: %s", err)
+			t.Errorf("unexpected error from lease renewal: %+v", err)
 		}
 		if err := <-transferErrCh; err != nil {
-			t.Errorf("unexpected error from lease transfer: %s", err)
+			t.Errorf("unexpected error from lease transfer: %+v", err)
 		}
 	})
 
@@ -819,7 +835,7 @@ func TestRangeTransferLeaseExpirationBased(t *testing.T) {
 		if !ok {
 			t.Fatalf("expected %T, got %s", &roachpb.NotLeaseHolderError{}, pErr)
 		}
-		if nlhe.LeaseHolder == nil || *nlhe.LeaseHolder != l.replica1Desc {
+		if nlhe.LeaseHolder == nil || !nlhe.LeaseHolder.Equal(&l.replica1Desc) {
 			t.Fatalf("expected lease holder %+v, got %+v",
 				l.replica1Desc, nlhe.LeaseHolder)
 		}
@@ -869,7 +885,7 @@ func TestRangeTransferLeaseExpirationBased(t *testing.T) {
 		l.setFilter(false, nil)
 
 		if err := <-renewalErrCh; err != nil {
-			t.Errorf("unexpected error from lease renewal: %s", err)
+			t.Errorf("unexpected error from lease renewal: %+v", err)
 		}
 	})
 }
@@ -899,7 +915,7 @@ func TestRangeLimitTxnMaxTimestamp(t *testing.T) {
 	mtc.clocks = []*hlc.Clock{clock1, clock2}
 
 	// Start a transaction using node2 as a gateway.
-	txn := roachpb.MakeTransaction("test", keyA, 1, enginepb.SERIALIZABLE, clock2.Now(), 250 /* maxOffsetNs */)
+	txn := roachpb.MakeTransaction("test", keyA, 1, clock2.Now(), 250 /* maxOffsetNs */)
 	// Simulate a read to another range on node2 by setting the observed timestamp.
 	txn.UpdateObservedTimestamp(2, clock2.Now())
 
@@ -914,11 +930,11 @@ func TestRangeLimitTxnMaxTimestamp(t *testing.T) {
 	}
 
 	// Up-replicate the data in the range to node2.
-	replica1 := mtc.stores[0].LookupReplica(roachpb.RKey(keyA), nil)
+	replica1 := mtc.stores[0].LookupReplica(roachpb.RKey(keyA))
 	mtc.replicateRange(replica1.RangeID, 1)
 
 	// Transfer the lease from node1 to node2.
-	replica2 := mtc.stores[1].LookupReplica(roachpb.RKey(keyA), nil)
+	replica2 := mtc.stores[1].LookupReplica(roachpb.RKey(keyA))
 	replica2Desc, err := replica2.GetReplicaDescriptor()
 	if err != nil {
 		t.Fatal(err)
@@ -958,6 +974,7 @@ func TestLeaseMetricsOnSplitAndTransfer(t *testing.T) {
 	var injectLeaseTransferError atomic.Value
 	sc := storage.TestStoreConfig(nil)
 	sc.TestingKnobs.DisableSplitQueue = true
+	sc.TestingKnobs.DisableMergeQueue = true
 	sc.TestingKnobs.EvalKnobs.TestingEvalFilter =
 		func(filterArgs storagebase.FilterArgs) *roachpb.Error {
 			if args, ok := filterArgs.Req.(*roachpb.TransferLeaseRequest); ok {
@@ -970,12 +987,18 @@ func TestLeaseMetricsOnSplitAndTransfer(t *testing.T) {
 			}
 			return nil
 		}
-	mtc := &multiTestContext{storeConfig: &sc}
+	mtc := &multiTestContext{
+		storeConfig: &sc,
+		// This test was written before the multiTestContext started creating many
+		// system ranges at startup, and hasn't been update to take that into
+		// account.
+		startWithSingleRange: true,
+	}
 	defer mtc.Stop()
 	mtc.Start(t, 2)
 
 	// Up-replicate to two replicas.
-	keyMinReplica0 := mtc.stores[0].LookupReplica(roachpb.RKeyMin, nil)
+	keyMinReplica0 := mtc.stores[0].LookupReplica(roachpb.RKeyMin)
 	mtc.replicateRange(keyMinReplica0.RangeID, 1)
 
 	// Split the key space at key "a".
@@ -992,12 +1015,12 @@ func TestLeaseMetricsOnSplitAndTransfer(t *testing.T) {
 	if err := mtc.dbs[0].AdminTransferLease(
 		context.TODO(), keyMinReplica0.Desc().StartKey.AsRawKey(), mtc.stores[1].StoreID(),
 	); err != nil {
-		t.Fatalf("unable to transfer lease to replica 1: %s", err)
+		t.Fatalf("unable to transfer lease to replica 1: %+v", err)
 	}
 	// Wait for all replicas to process.
 	testutils.SucceedsSoon(t, func() error {
 		for i := 0; i < 2; i++ {
-			r := mtc.stores[i].LookupReplica(roachpb.RKeyMin, nil)
+			r := mtc.stores[i].LookupReplica(roachpb.RKeyMin)
 			if l, _ := r.GetLease(); l.Replica.StoreID != mtc.stores[1].StoreID() {
 				return errors.Errorf("expected lease to transfer to replica 2: got %s", l)
 			}
@@ -1007,7 +1030,7 @@ func TestLeaseMetricsOnSplitAndTransfer(t *testing.T) {
 
 	// Next a failed transfer from RHS replica 0 to replica 1.
 	injectLeaseTransferError.Store(true)
-	keyAReplica0 := mtc.stores[0].LookupReplica(splitKey, nil)
+	keyAReplica0 := mtc.stores[0].LookupReplica(splitKey)
 	if err := mtc.dbs[0].AdminTransferLease(
 		context.TODO(), keyAReplica0.Desc().StartKey.AsRawKey(), mtc.stores[1].StoreID(),
 	); err == nil {
@@ -1056,6 +1079,7 @@ func TestLeaseMetricsOnSplitAndTransfer(t *testing.T) {
 // See replica.mu.minLeaseProposedTS for the reasons why this isn't allowed.
 func TestLeaseNotUsedAfterRestart(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+
 	ctx := context.Background()
 
 	sc := storage.TestStoreConfig(nil)
@@ -1078,17 +1102,14 @@ func TestLeaseNotUsedAfterRestart(t *testing.T) {
 	defer mtc.Stop()
 	mtc.Start(t, 1)
 
+	key := []byte("a")
 	// Send a read, to acquire a lease.
-	getArgs := getArgs([]byte("a"))
+	getArgs := getArgs(key)
 	if _, err := client.SendWrapped(ctx, mtc.stores[0].TestSender(), getArgs); err != nil {
 		t.Fatal(err)
 	}
 
-	preRepl1, err := mtc.stores[0].GetReplica(1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	preRestartLease, _ := preRepl1.GetLease()
+	preRestartLease, _ := mtc.stores[0].LookupReplica(key).GetLease()
 
 	mtc.manualClock.Increment(1E9)
 
@@ -1119,11 +1140,7 @@ func TestLeaseNotUsedAfterRestart(t *testing.T) {
 		t.Fatalf("read did not acquire a new lease")
 	}
 
-	postRepl1, err := mtc.stores[0].GetReplica(1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	postRestartLease, _ := postRepl1.GetLease()
+	postRestartLease, _ := mtc.stores[0].LookupReplica(key).GetLease()
 
 	// Verify that not only is a new lease requested, it also gets a new sequence
 	// number. This makes sure that previously proposed commands actually fail at
@@ -1137,10 +1154,10 @@ func TestLeaseNotUsedAfterRestart(t *testing.T) {
 // lease holder) is not blocked by ongoing reads.
 // The test relies on two things:
 // 1) Lease extensions, unlike lease transfers, are not blocked by reads through
-// their ReplicatedEvalResult.BlockReads.
+//    their ReplicatedEvalResult.BlockReads.
 // 2) Requests such as RequestLeaseRequest don't declare to touch the whole key
-// span of the range, and thus don't conflict through the command queue with
-// other reads.
+//    span of the range, and thus don't acquire latches that conflict with other
+//    reads.
 func TestLeaseExtensionNotBlockedByRead(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	readBlocked := make(chan struct{})
@@ -1157,7 +1174,7 @@ func TestLeaseExtensionNotBlockedByRead(t *testing.T) {
 		base.TestServerArgs{
 			Knobs: base.TestingKnobs{
 				Store: &storage.StoreTestingKnobs{
-					EvalKnobs: batcheval.TestingKnobs{
+					EvalKnobs: storagebase.BatchEvalTestingKnobs{
 						TestingEvalFilter: cmdFilter,
 					},
 				},
@@ -1176,11 +1193,11 @@ func TestLeaseExtensionNotBlockedByRead(t *testing.T) {
 	errChan := make(chan error)
 	go func() {
 		getReq := roachpb.GetRequest{
-			Span: roachpb.Span{
+			RequestHeader: roachpb.RequestHeader{
 				Key: key,
 			},
 		}
-		if _, pErr := client.SendWrappedWith(context.Background(), s.DB().GetSender(),
+		if _, pErr := client.SendWrappedWith(context.Background(), s.DB().NonTransactionalSender(),
 			roachpb.Header{UserPriority: 42},
 			&getReq); pErr != nil {
 			errChan <- pErr.GoError()
@@ -1196,7 +1213,7 @@ func TestLeaseExtensionNotBlockedByRead(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		repl := store.LookupReplica(rKey, nil)
+		repl := store.LookupReplica(rKey)
 		if repl == nil {
 			t.Fatalf("replica for key %s not found", rKey)
 		}
@@ -1205,13 +1222,8 @@ func TestLeaseExtensionNotBlockedByRead(t *testing.T) {
 			t.Fatalf("replica descriptor for key %s not found", rKey)
 		}
 
-		curLease, _, err := s.GetRangeLease(context.TODO(), key)
-		if err != nil {
-			t.Fatal(err)
-		}
-
 		leaseReq := roachpb.RequestLeaseRequest{
-			Span: roachpb.Span{
+			RequestHeader: roachpb.RequestHeader{
 				Key: key,
 			},
 			Lease: roachpb.Lease{
@@ -1219,10 +1231,30 @@ func TestLeaseExtensionNotBlockedByRead(t *testing.T) {
 				Expiration: s.Clock().Now().Add(time.Second.Nanoseconds(), 0).Clone(),
 				Replica:    replDesc,
 			},
-			PrevLease: curLease,
 		}
-		if _, pErr := client.SendWrapped(context.Background(), s.DB().GetSender(), &leaseReq); pErr != nil {
-			t.Fatal(pErr)
+
+		for {
+			curLease, _, err := s.GetRangeLease(context.TODO(), key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			leaseReq.PrevLease = curLease
+
+			_, pErr := client.SendWrapped(context.Background(), s.DB().NonTransactionalSender(), &leaseReq)
+			if _, ok := pErr.GetDetail().(*roachpb.AmbiguousResultError); ok {
+				log.Infof(context.Background(), "retrying lease after %s", pErr)
+				continue
+			}
+			if _, ok := pErr.GetDetail().(*roachpb.LeaseRejectedError); ok {
+				// Lease rejected? Try again. The extension should work because
+				// extending is idempotent (assuming the PrevLease matches).
+				log.Infof(context.Background(), "retrying lease after %s", pErr)
+				continue
+			}
+			if pErr != nil {
+				t.Errorf("%T %s", pErr.GetDetail(), pErr) // NB: don't fatal or shutdown hangs
+			}
+			break
 		}
 		// Unblock the read.
 		readBlocked <- struct{}{}
@@ -1237,11 +1269,11 @@ func LeaseInfo(
 	readConsistency roachpb.ReadConsistencyType,
 ) roachpb.LeaseInfoResponse {
 	leaseInfoReq := &roachpb.LeaseInfoRequest{
-		Span: roachpb.Span{
+		RequestHeader: roachpb.RequestHeader{
 			Key: rangeDesc.StartKey.AsRawKey(),
 		},
 	}
-	reply, pErr := client.SendWrappedWith(context.Background(), db.GetSender(), roachpb.Header{
+	reply, pErr := client.SendWrappedWith(context.Background(), db.NonTransactionalSender(), roachpb.Header{
 		ReadConsistency: readConsistency,
 	}, leaseInfoReq)
 	if pErr != nil {
@@ -1252,10 +1284,7 @@ func LeaseInfo(
 
 func TestLeaseInfoRequest(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	tc := testcluster.StartTestCluster(t, 3,
-		base.TestClusterArgs{
-			ReplicationMode: base.ReplicationManual,
-		})
+	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{})
 	defer tc.Stopper().Stop(context.TODO())
 
 	kvDB0 := tc.Servers[0].DB()
@@ -1266,16 +1295,6 @@ func TestLeaseInfoRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	rangeDesc, err = tc.AddReplicas(
-		rangeDesc.StartKey.AsRawKey(), tc.Target(1), tc.Target(2),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(rangeDesc.Replicas) != 3 {
-		t.Fatalf("expected 3 replicas, got %+v", rangeDesc.Replicas)
-	}
 	replicas := make([]roachpb.ReplicaDescriptor, 3)
 	for i := 0; i < 3; i++ {
 		var ok bool
@@ -1285,11 +1304,23 @@ func TestLeaseInfoRequest(t *testing.T) {
 		}
 	}
 
-	// Lease should start on Server 0, since nobody told it to move.
-	leaseHolderReplica := LeaseInfo(t, kvDB0, rangeDesc, roachpb.INCONSISTENT).Lease.Replica
-	if leaseHolderReplica != replicas[0] {
-		t.Fatalf("lease holder should be replica %+v, but is: %+v", replicas[0], leaseHolderReplica)
+	// Transfer the lease to Servers[0] so we start in a known state. Otherwise,
+	// there might be already a lease owned by a random node.
+	err = tc.TransferRangeLease(rangeDesc, tc.Target(0))
+	if err != nil {
+		t.Fatal(err)
 	}
+
+	// Now test the LeaseInfo. We might need to loop until the node we query has
+	// applied the lease.
+	testutils.SucceedsSoon(t, func() error {
+		leaseHolderReplica := LeaseInfo(t, kvDB0, rangeDesc, roachpb.INCONSISTENT).Lease.Replica
+		if leaseHolderReplica != replicas[0] {
+			return fmt.Errorf("lease holder should be replica %+v, but is: %+v",
+				replicas[0], leaseHolderReplica)
+		}
+		return nil
+	})
 
 	// Transfer the lease to Server 1 and check that LeaseInfoRequest gets the
 	// right answer.
@@ -1300,8 +1331,8 @@ func TestLeaseInfoRequest(t *testing.T) {
 	// An inconsistent LeaseInfoReqeust on the old lease holder should give us the
 	// right answer immediately, since the old holder has definitely applied the
 	// transfer before TransferRangeLease returned.
-	leaseHolderReplica = LeaseInfo(t, kvDB0, rangeDesc, roachpb.INCONSISTENT).Lease.Replica
-	if leaseHolderReplica != replicas[1] {
+	leaseHolderReplica := LeaseInfo(t, kvDB0, rangeDesc, roachpb.INCONSISTENT).Lease.Replica
+	if !leaseHolderReplica.Equal(replicas[1]) {
 		t.Fatalf("lease holder should be replica %+v, but is: %+v",
 			replicas[1], leaseHolderReplica)
 	}
@@ -1314,7 +1345,7 @@ func TestLeaseInfoRequest(t *testing.T) {
 		// unaware of the new lease and so the request might bounce around for a
 		// while (see #8816).
 		leaseHolderReplica = LeaseInfo(t, kvDB1, rangeDesc, roachpb.INCONSISTENT).Lease.Replica
-		if leaseHolderReplica != replicas[1] {
+		if !leaseHolderReplica.Equal(replicas[1]) {
 			return errors.Errorf("lease holder should be replica %+v, but is: %+v",
 				replicas[1], leaseHolderReplica)
 		}
@@ -1327,9 +1358,34 @@ func TestLeaseInfoRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	leaseHolderReplica = LeaseInfo(t, kvDB1, rangeDesc, roachpb.INCONSISTENT).Lease.Replica
-	if leaseHolderReplica != replicas[2] {
-		t.Fatalf("lease holder should be replica %+v, but is: %+v", replicas[2], leaseHolderReplica)
+
+	// We're now going to ask servers[1] for the lease info. We don't use kvDB1;
+	// instead we go directly to the store because otherwise the DistSender might
+	// use an old, cached, version of the range descriptor that doesn't have the
+	// local replica in it (and so the request would be routed away).
+	// TODO(andrei): Add a batch option to not use the range cache.
+	s, err := tc.Servers[1].Stores().GetStore(tc.Servers[1].GetFirstStoreID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaseInfoReq := &roachpb.LeaseInfoRequest{
+		RequestHeader: roachpb.RequestHeader{
+			Key: rangeDesc.StartKey.AsRawKey(),
+		},
+	}
+	reply, pErr := client.SendWrappedWith(
+		context.Background(), s, roachpb.Header{
+			RangeID:         rangeDesc.RangeID,
+			ReadConsistency: roachpb.INCONSISTENT,
+		}, leaseInfoReq)
+	if pErr != nil {
+		t.Fatal(pErr)
+	}
+	resp := *(reply.(*roachpb.LeaseInfoResponse))
+	leaseHolderReplica = resp.Lease.Replica
+
+	if !leaseHolderReplica.Equal(replicas[2]) {
+		t.Fatalf("lease holder should be replica %s, but is: %s", replicas[2], leaseHolderReplica)
 	}
 
 	// TODO(andrei): test the side-effect of LeaseInfoRequest when there's no
@@ -1355,7 +1411,7 @@ func TestErrorHandlingForNonKVCommand(t *testing.T) {
 		base.TestServerArgs{
 			Knobs: base.TestingKnobs{
 				Store: &storage.StoreTestingKnobs{
-					EvalKnobs: batcheval.TestingKnobs{
+					EvalKnobs: storagebase.BatchEvalTestingKnobs{
 						TestingEvalFilter: cmdFilter,
 					},
 				},
@@ -1367,13 +1423,13 @@ func TestErrorHandlingForNonKVCommand(t *testing.T) {
 	// Send the lease request.
 	key := roachpb.Key("a")
 	leaseReq := roachpb.LeaseInfoRequest{
-		Span: roachpb.Span{
+		RequestHeader: roachpb.RequestHeader{
 			Key: key,
 		},
 	}
 	_, pErr := client.SendWrappedWith(
 		context.Background(),
-		s.DB().GetSender(),
+		s.DB().NonTransactionalSender(),
 		roachpb.Header{UserPriority: 42},
 		&leaseReq,
 	)
@@ -1384,12 +1440,20 @@ func TestErrorHandlingForNonKVCommand(t *testing.T) {
 
 func TestRangeInfo(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	mtc := &multiTestContext{}
+	storeCfg := storage.TestStoreConfig(nil /* clock */)
+	storeCfg.TestingKnobs.DisableMergeQueue = true
+	mtc := &multiTestContext{
+		storeConfig: &storeCfg,
+		// This test was written before the multiTestContext started creating many
+		// system ranges at startup, and hasn't been update to take that into
+		// account.
+		startWithSingleRange: true,
+	}
 	defer mtc.Stop()
 	mtc.Start(t, 2)
 
 	// Up-replicate to two replicas.
-	mtc.replicateRange(mtc.stores[0].LookupReplica(roachpb.RKeyMin, nil).RangeID, 1)
+	mtc.replicateRange(mtc.stores[0].LookupReplica(roachpb.RKeyMin).RangeID, 1)
 
 	// Split the key space at key "a".
 	splitKey := roachpb.RKey("a")
@@ -1404,10 +1468,10 @@ func TestRangeInfo(t *testing.T) {
 	// a SucceedsSoon loop to ensure the split completes.
 	var lhsReplica0, lhsReplica1, rhsReplica0, rhsReplica1 *storage.Replica
 	testutils.SucceedsSoon(t, func() error {
-		lhsReplica0 = mtc.stores[0].LookupReplica(roachpb.RKeyMin, nil)
-		lhsReplica1 = mtc.stores[1].LookupReplica(roachpb.RKeyMin, nil)
-		rhsReplica0 = mtc.stores[0].LookupReplica(splitKey, nil)
-		rhsReplica1 = mtc.stores[1].LookupReplica(splitKey, nil)
+		lhsReplica0 = mtc.stores[0].LookupReplica(roachpb.RKeyMin)
+		lhsReplica1 = mtc.stores[1].LookupReplica(roachpb.RKeyMin)
+		rhsReplica0 = mtc.stores[0].LookupReplica(splitKey)
+		rhsReplica1 = mtc.stores[1].LookupReplica(splitKey)
 		if lhsReplica0 == rhsReplica0 || lhsReplica1 == rhsReplica1 {
 			return errors.Errorf("replicas not post-split %v, %v, %v, %v",
 				lhsReplica0, rhsReplica0, rhsReplica0, rhsReplica1)
@@ -1455,14 +1519,29 @@ func TestRangeInfo(t *testing.T) {
 		t.Errorf("on put reply, expected %+v; got %+v", expRangeInfos, reply.Header().RangeInfos)
 	}
 
+	// Verify range info on an admin request.
+	adminArgs := &roachpb.AdminTransferLeaseRequest{
+		RequestHeader: roachpb.RequestHeader{
+			Key: splitKey.AsRawKey(),
+		},
+		Target: rhsLease.Replica.StoreID,
+	}
+	reply, pErr = client.SendWrappedWith(context.Background(), mtc.distSenders[0], h, adminArgs)
+	if pErr != nil {
+		t.Fatal(pErr)
+	}
+	if !reflect.DeepEqual(reply.Header().RangeInfos, expRangeInfos) {
+		t.Errorf("on admin reply, expected %+v; got %+v", expRangeInfos, reply.Header().RangeInfos)
+	}
+
 	// Verify multiple range infos on a scan request.
 	scanArgs := roachpb.ScanRequest{
-		Span: roachpb.Span{
+		RequestHeader: roachpb.RequestHeader{
 			Key:    keys.SystemMax,
 			EndKey: roachpb.KeyMax,
 		},
 	}
-	txn := roachpb.MakeTransaction("test", roachpb.KeyMin, 1, enginepb.SERIALIZABLE, mtc.clock.Now(), 0)
+	txn := roachpb.MakeTransaction("test", roachpb.KeyMin, 1, mtc.clock.Now(), 0)
 	h.Txn = &txn
 	reply, pErr = client.SendWrappedWith(context.Background(), mtc.distSenders[0], h, &scanArgs)
 	if pErr != nil {
@@ -1484,7 +1563,7 @@ func TestRangeInfo(t *testing.T) {
 
 	// Verify multiple range infos and order on a reverse scan request.
 	revScanArgs := roachpb.ReverseScanRequest{
-		Span: roachpb.Span{
+		RequestHeader: roachpb.RequestHeader{
 			Key:    keys.SystemMax,
 			EndKey: roachpb.KeyMax,
 		},
@@ -1515,15 +1594,18 @@ func TestRangeInfo(t *testing.T) {
 		}
 		if err = mtc.dbs[0].AdminTransferLease(context.TODO(),
 			r.Desc().StartKey.AsRawKey(), replDesc.StoreID); err != nil {
-			t.Fatalf("unable to transfer lease to replica %s: %s", r, err)
+			t.Fatalf("unable to transfer lease to replica %s: %+v", r, err)
 		}
 	}
 	reply, pErr = client.SendWrappedWith(context.Background(), mtc.distSenders[0], h, &scanArgs)
 	if pErr != nil {
 		t.Fatal(pErr)
 	}
-	lhsLease, _ = lhsReplica1.GetLease()
-	rhsLease, _ = rhsReplica1.GetLease()
+	// Read the expected lease from replica0 rather than replica1 as it may serve
+	// a follower read which will contain the new lease information before
+	// replica1 has applied the lease transfer.
+	lhsLease, _ = lhsReplica0.GetLease()
+	rhsLease, _ = rhsReplica0.GetLease()
 	expRangeInfos = []roachpb.RangeInfo{
 		{
 			Desc:  *lhsReplica1.Desc(),
@@ -1536,161 +1618,6 @@ func TestRangeInfo(t *testing.T) {
 	}
 	if !reflect.DeepEqual(reply.Header().RangeInfos, expRangeInfos) {
 		t.Errorf("on scan reply, expected %+v; got %+v", expRangeInfos, reply.Header().RangeInfos)
-	}
-}
-
-// TestCampaignOnLazyRaftGroupInitialization verifies expected
-// behavior for which replicas will campaign on lazy initialization.
-func TestCampaignOnLazyRaftGroupInitialization(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	t.Skip("this test is flaky on the 5m initial stress due to errant Raft messages initializing the Raft group")
-	splitKey := keys.UserTableDataMin
-	testState := struct {
-		syncutil.Mutex
-		blockingCh chan struct{}
-		campaigns  map[roachpb.ReplicaID]bool // map from ReplicaID -> whether the replica campaigned
-	}{}
-	sc := storage.TestStoreConfig(nil)
-	sc.EnableEpochRangeLeases = false // simpler to test with
-	sc.TestingKnobs.DontPreventUseOfOldLeaseOnStart = true
-	sc.TestingKnobs.OnCampaign = func(r *storage.Replica) {
-		if !r.DescLocked().StartKey.Equal(keys.UserTableDataMin) {
-			return
-		}
-		testState.Lock()
-		if testState.campaigns == nil {
-			testState.Unlock()
-			return
-		}
-		testState.campaigns[r.ReplicaIDLocked()] = true
-		blocking := testState.blockingCh
-		testState.Unlock()
-		<-blocking
-	}
-	mtc := &multiTestContext{storeConfig: &sc}
-	defer mtc.Stop()
-	mtc.Start(t, 3)
-
-	// Split so we can rely on RHS range being quiescent after a restart.
-	// We use UserTableDataMin to avoid having the range activated to
-	// gossip system table data.
-	splitArgs := adminSplitArgs(splitKey)
-	if _, err := client.SendWrapped(context.Background(), mtc.stores[0].TestSender(), splitArgs); err != nil {
-		t.Fatal(err)
-	}
-
-	// Up-replicate to three replicas.
-	repl := mtc.stores[0].LookupReplica(roachpb.RKey(splitKey), nil)
-	if repl == nil {
-		t.Fatal("replica should not be nil for RHS range")
-	}
-	mtc.replicateRange(repl.RangeID, 1, 2)
-
-	testCases := []struct {
-		desc         string
-		prepFn       func(*testing.T)
-		expCampaigns map[roachpb.ReplicaID]bool
-	}{
-		{
-			desc:         "within idle replica campaign timeout",
-			prepFn:       func(t *testing.T) {},
-			expCampaigns: map[roachpb.ReplicaID]bool{},
-		},
-		{
-			desc: "past idle replica campaign timeout",
-			prepFn: func(t *testing.T) {
-				for _, s := range mtc.stores {
-					if err := s.GossipStore(context.TODO()); err != nil {
-						t.Fatal(err)
-					}
-				}
-				mtc.manualClock.Increment(sc.RaftElectionTimeout().Nanoseconds())
-			},
-			expCampaigns: map[roachpb.ReplicaID]bool{
-				1: true,
-			},
-		},
-		{
-			desc: "lease expired all replicas should campaign",
-			prepFn: func(t *testing.T) {
-				for _, s := range mtc.stores {
-					if err := s.GossipStore(context.TODO()); err != nil {
-						t.Fatal(err)
-					}
-				}
-				mtc.manualClock.Increment(mtc.storeConfig.LeaseExpiration())
-			},
-			expCampaigns: map[roachpb.ReplicaID]bool{
-				1: true,
-				2: true,
-				3: true,
-			},
-		},
-	}
-
-	for i, test := range testCases {
-		t.Run(test.desc, func(t *testing.T) {
-			// Restart the cluster for lazy initialization of the raft group.
-			mtc.restart()
-			// Clear the campaign map.
-			testState.Lock()
-			testState.blockingCh = make(chan struct{})
-			testState.campaigns = map[roachpb.ReplicaID]bool{}
-			testState.Unlock()
-			// Run whatever preparation is necessary for this test case.
-			test.prepFn(t)
-
-			// Send an increment to all three replicas in parallel.
-			errCh := make(chan error, len(mtc.stores))
-			for _, s := range mtc.stores {
-				go func(s *storage.Store) {
-					incArgs := incrementArgs(splitKey, 1)
-					_, pErr := client.SendWrappedWith(
-						context.Background(), s, roachpb.Header{RangeID: repl.RangeID}, incArgs,
-					)
-					errCh <- pErr.GoError()
-				}(s)
-			}
-
-			// Allow parallel invocations to proceed.
-			testutils.SucceedsSoon(t, func() error {
-				testState.Lock()
-				defer testState.Unlock()
-				if c, ec := len(testState.campaigns), len(test.expCampaigns); c != ec {
-					return errors.Errorf("have seen %d campaigns out of %d expected", c, ec)
-				}
-				return nil
-			})
-			close(testState.blockingCh)
-
-			// We expect not lease holder errors on 2 out of the three replicas.
-			var errCount int
-			for range mtc.stores {
-				if err := <-errCh; err != nil {
-					errCount++
-					if _, ok := err.(*roachpb.NotLeaseHolderError); !ok {
-						t.Errorf("got unexpected error %s", err)
-					}
-				}
-			}
-			if errCount != 2 {
-				t.Errorf("expected 2 errors; got %d", errCount)
-			}
-
-			mtc.waitForValues(splitKey, []int64{int64(i + 1), int64(i + 1), int64(i + 1)})
-
-			testState.Lock()
-			if !reflect.DeepEqual(test.expCampaigns, testState.campaigns) {
-				t.Errorf("expected %+v; got %+v", test.expCampaigns, testState.campaigns)
-			}
-			testState.Unlock()
-
-			// HACK: sleep to process raft leader wakeup proposals. It is
-			// otherwise too difficult to guarantee that the next test cycle
-			// will not have a stray raft request init the raft group after
-			// restart.
-			time.Sleep(100 * time.Millisecond)
-		})
 	}
 }
 
@@ -1709,19 +1636,45 @@ func TestDrainRangeRejection(t *testing.T) {
 
 	drainingIdx := 1
 	mtc.stores[drainingIdx].SetDraining(true)
-	if err := repl.ChangeReplicas(
-		context.Background(),
-		roachpb.ADD_REPLICA,
+	chgs := roachpb.MakeReplicationChanges(roachpb.ADD_REPLICA,
 		roachpb.ReplicationTarget{
 			NodeID:  mtc.idents[drainingIdx].NodeID,
 			StoreID: mtc.idents[drainingIdx].StoreID,
-		},
-		repl.Desc(),
-		storage.ReasonRangeUnderReplicated,
-		"",
-	); !testutils.IsError(err, "store is draining") {
+		})
+	if _, err := repl.ChangeReplicas(context.Background(), repl.Desc(), storage.SnapshotRequest_REBALANCE, storagepb.ReasonRangeUnderReplicated, "", chgs); !testutils.IsError(err, "store is draining") {
+		t.Fatalf("unexpected error: %+v", err)
+	}
+}
+
+func TestChangeReplicasGeneration(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	mtc := &multiTestContext{}
+	defer mtc.Stop()
+	mtc.Start(t, 2)
+
+	repl, err := mtc.stores[0].GetReplica(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	oldGeneration := repl.Desc().GetGeneration()
+	chgs := roachpb.MakeReplicationChanges(roachpb.ADD_REPLICA, roachpb.ReplicationTarget{
+		NodeID:  mtc.idents[1].NodeID,
+		StoreID: mtc.idents[1].StoreID,
+	})
+	if _, err := repl.ChangeReplicas(context.Background(), repl.Desc(), storage.SnapshotRequest_REBALANCE, storagepb.ReasonRangeUnderReplicated, "", chgs); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	assert.EqualValues(t, repl.Desc().GetGeneration(), oldGeneration+2)
+
+	oldGeneration = repl.Desc().GetGeneration()
+	oldDesc := repl.Desc()
+	chgs[0].ChangeType = roachpb.REMOVE_REPLICA
+	newDesc, err := repl.ChangeReplicas(context.Background(), oldDesc, storage.SnapshotRequest_REBALANCE, storagepb.ReasonRangeOverReplicated, "", chgs)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assert.EqualValues(t, repl.Desc().GetGeneration(), oldGeneration+1, "\nold: %+v\nnew: %+v", oldDesc, newDesc)
 }
 
 func TestSystemZoneConfigs(t *testing.T) {
@@ -1730,51 +1683,64 @@ func TestSystemZoneConfigs(t *testing.T) {
 	// This test is relatively slow and resource intensive. When run under
 	// stressrace on a loaded machine (as in the nightly tests), sometimes the
 	// SucceedsSoon conditions below take longer than the allotted time (#25273).
-	if testing.Short() || testutils.NightlyStress() {
+	if testing.Short() || testutils.NightlyStress() || util.RaceEnabled {
 		t.Skip()
 	}
 
-	tc := testcluster.StartTestCluster(t, 5, base.TestClusterArgs{
+	ctx := context.Background()
+	tc := testcluster.StartTestCluster(t, 7, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
+			Knobs: base.TestingKnobs{
+				Store: &storage.StoreTestingKnobs{
+					// Disable LBS because when the scan is happening at the rate it's happening
+					// below, it's possible that one of the system ranges trigger a split.
+					DisableLoadBasedSplitting: true,
+				},
+			},
 			// Scan like a bat out of hell to ensure replication and replica GC
 			// happen in a timely manner.
 			ScanInterval: 50 * time.Millisecond,
 		},
 	})
-	ctx := context.TODO()
 	defer tc.Stopper().Stop(ctx)
 	log.Info(ctx, "TestSystemZoneConfig: test cluster started")
 
-	expectedRanges, err := tc.Servers[0].ExpectedInitialRangeCount()
+	expectedSystemRanges, err := tc.Servers[0].ExpectedInitialRangeCount()
 	if err != nil {
 		t.Fatal(err)
 	}
-	config.DefaultZoneConfig()
-	expectedReplicas := expectedRanges * int(config.DefaultZoneConfig().NumReplicas)
+	expectedUserRanges := 1
+	expectedSystemRanges -= expectedUserRanges
+	systemNumReplicas := int(*config.DefaultSystemZoneConfig().NumReplicas)
+	userNumReplicas := int(*config.DefaultZoneConfig().NumReplicas)
+	expectedReplicas := expectedSystemRanges*systemNumReplicas + expectedUserRanges*userNumReplicas
+	log.Infof(ctx, "TestSystemZoneConfig: expecting %d system ranges and %d user ranges",
+		expectedSystemRanges, expectedUserRanges)
+	log.Infof(ctx, "TestSystemZoneConfig: expected (%dx%d) + (%dx%d) = %d replicas total",
+		expectedSystemRanges, systemNumReplicas, expectedUserRanges, userNumReplicas, expectedReplicas)
 
 	waitForReplicas := func() error {
-		var conflictingID roachpb.RangeID
-		replicas := make(map[roachpb.RangeID]int)
+		replicas := make(map[roachpb.RangeID]roachpb.RangeDescriptor)
 		for _, s := range tc.Servers {
 			if err := storage.IterateRangeDescriptors(ctx, s.Engines()[0], func(desc roachpb.RangeDescriptor) (bool, error) {
-				if existing, ok := replicas[desc.RangeID]; ok && existing != len(desc.Replicas) {
-					conflictingID = desc.RangeID
+				if len(desc.Replicas().Learners()) > 0 {
+					return false, fmt.Errorf("descriptor contains learners: %v", desc)
 				}
-				replicas[desc.RangeID] = len(desc.Replicas)
+				if existing, ok := replicas[desc.RangeID]; ok && !existing.Equal(desc) {
+					return false, fmt.Errorf("mismatch between\n%s\n%s", &existing, &desc)
+				}
+				replicas[desc.RangeID] = desc
 				return false, nil
 			}); err != nil {
 				return err
 			}
 		}
-		if conflictingID != 0 {
-			return fmt.Errorf("not all replicas agree on the range descriptor for r%d", conflictingID)
-		}
 		var totalReplicas int
-		for _, count := range replicas {
-			totalReplicas += count
+		for _, desc := range replicas {
+			totalReplicas += len(desc.Replicas().Voters())
 		}
 		if totalReplicas != expectedReplicas {
-			return fmt.Errorf("got %d replicas, want %d; details: %+v", totalReplicas, expectedReplicas, replicas)
+			return fmt.Errorf("got %d voters, want %d; details: %+v", totalReplicas, expectedReplicas, replicas)
 		}
 		return nil
 	}
@@ -1787,34 +1753,1082 @@ func TestSystemZoneConfigs(t *testing.T) {
 	testutils.SucceedsSoon(t, waitForReplicas)
 	log.Info(ctx, "TestSystemZoneConfig: initial replication succeeded")
 
-	// Allow for inserting zone configs without having to go through (or
-	// duplicate the logic from) the CLI.
-	config.TestingSetupZoneConfigHook(tc.Stopper())
-
 	// Update the meta zone config to have more replicas and expect the number
 	// of replicas to go up accordingly after running all replicas through the
 	// replicate queue.
-	zoneConfig := config.DefaultZoneConfig()
-	zoneConfig.NumReplicas += 2
-	config.TestingSetZoneConfig(keys.MetaRangesID, zoneConfig)
+	sqlDB := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	sqlutils.SetZoneConfig(t, sqlDB, "RANGE meta", "num_replicas: 7")
 	expectedReplicas += 2
 	testutils.SucceedsSoon(t, waitForReplicas)
 	log.Info(ctx, "TestSystemZoneConfig: up-replication of meta ranges succeeded")
 
 	// Do the same thing, but down-replicating the timeseries range.
-	zoneConfig = config.DefaultZoneConfig()
-	zoneConfig.NumReplicas -= 2
-	config.TestingSetZoneConfig(keys.TimeseriesRangesID, zoneConfig)
+	sqlutils.SetZoneConfig(t, sqlDB, "RANGE timeseries", "num_replicas: 1")
 	expectedReplicas -= 2
 	testutils.SucceedsSoon(t, waitForReplicas)
 	log.Info(ctx, "TestSystemZoneConfig: down-replication of timeseries ranges succeeded")
 
+	// Up-replicate the system.jobs table to demonstrate that it is configured
+	// independently from the system database.
+	sqlutils.SetZoneConfig(t, sqlDB, "TABLE system.jobs", "num_replicas: 7")
+	expectedReplicas += 2
+	testutils.SucceedsSoon(t, waitForReplicas)
+	log.Info(ctx, "TestSystemZoneConfig: up-replication of jobs table succeeded")
+
 	// Finally, verify the system ranges. Note that in a new cluster there are
 	// two system ranges, which we have to take into account here.
-	zoneConfig = config.DefaultZoneConfig()
-	zoneConfig.NumReplicas += 2
-	config.TestingSetZoneConfig(keys.SystemRangesID, zoneConfig)
-	expectedReplicas += 6
+	sqlutils.SetZoneConfig(t, sqlDB, "RANGE system", "num_replicas: 7")
+	expectedReplicas += 4
 	testutils.SucceedsSoon(t, waitForReplicas)
 	log.Info(ctx, "TestSystemZoneConfig: up-replication of system ranges succeeded")
+}
+
+func TestClearRange(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+	store := createTestStoreWithConfig(t, stopper, storage.TestStoreConfig(nil))
+
+	clearRange := func(start, end roachpb.Key) {
+		t.Helper()
+		if _, err := client.SendWrapped(ctx, store.DB().NonTransactionalSender(), &roachpb.ClearRangeRequest{
+			RequestHeader: roachpb.RequestHeader{
+				Key:    start,
+				EndKey: end,
+			},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	verifyKeysWithPrefix := func(prefix roachpb.Key, expectedKeys []roachpb.Key) {
+		t.Helper()
+		start := prefix
+		end := prefix.PrefixEnd()
+		kvs, err := engine.Scan(store.Engine(), start, end, 0 /* maxRows */)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var actualKeys []roachpb.Key
+		for _, kv := range kvs {
+			actualKeys = append(actualKeys, kv.Key.Key)
+		}
+		if !reflect.DeepEqual(expectedKeys, actualKeys) {
+			t.Fatalf("expected %v, but got %v", expectedKeys, actualKeys)
+		}
+	}
+
+	rng, _ := randutil.NewPseudoRand()
+
+	// Write four keys with values small enough to use individual deletions
+	// (sm1-sm4) and four keys with values large enough to require a range
+	// deletion tombstone (lg1-lg4).
+	sm, sm1, sm2, sm3 := roachpb.Key("sm"), roachpb.Key("sm1"), roachpb.Key("sm2"), roachpb.Key("sm3")
+	lg, lg1, lg2, lg3 := roachpb.Key("lg"), roachpb.Key("lg1"), roachpb.Key("lg2"), roachpb.Key("lg3")
+	for _, key := range []roachpb.Key{sm1, sm2, sm3} {
+		if err := store.DB().Put(ctx, key, "sm-val"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, key := range []roachpb.Key{lg1, lg2, lg3} {
+		if err := store.DB().Put(
+			ctx, key, randutil.RandBytes(rng, batcheval.ClearRangeBytesThreshold),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	verifyKeysWithPrefix(sm, []roachpb.Key{sm1, sm2, sm3})
+	verifyKeysWithPrefix(lg, []roachpb.Key{lg1, lg2, lg3})
+
+	// Verify that a ClearRange request from [sm1, sm3) removes sm1 and sm2.
+	clearRange(sm1, sm3)
+	verifyKeysWithPrefix(sm, []roachpb.Key{sm3})
+
+	// Verify that a ClearRange request from [lg1, lg3) removes lg1 and lg2.
+	clearRange(lg1, lg3)
+	verifyKeysWithPrefix(lg, []roachpb.Key{lg3})
+
+	// Verify that only the large ClearRange request used a range deletion
+	// tombstone by checking for the presence of a suggested compaction.
+	verifyKeysWithPrefix(keys.LocalStoreSuggestedCompactionsMin,
+		[]roachpb.Key{keys.StoreSuggestedCompactionKey(lg1, lg3)})
+}
+
+// TestLeaseTransferInSnapshotUpdatesTimestampCache prevents a regression of
+// #34025. A Replica is targeted for a lease transfer target when it needs a
+// Raft snapshot to catch up. Normally we try to prevent this case, but it is
+// possible and hard to prevent entirely. The Replica will only learn that it is
+// the new leaseholder when it applies the snapshot. When doing so, it should
+// make sure to apply the lease-related side-effects to its in-memory state.
+func TestLeaseTransferInSnapshotUpdatesTimestampCache(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+	sc := storage.TestStoreConfig(nil)
+	// We'll control replication by hand.
+	sc.TestingKnobs.DisableReplicateQueue = true
+	// Avoid fighting with the merge queue while trying to reproduce this race.
+	sc.TestingKnobs.DisableMergeQueue = true
+	mtc := &multiTestContext{storeConfig: &sc}
+	defer mtc.Stop()
+	mtc.Start(t, 3)
+	store2 := mtc.Store(2)
+
+	keyA := roachpb.Key("a")
+	keyB := roachpb.Key("b")
+	keyC := roachpb.Key("c")
+
+	// First, do a couple of writes; we'll use these to determine when
+	// the dust has settled.
+	incA := incrementArgs(keyA, 1)
+	if _, pErr := client.SendWrapped(ctx, mtc.stores[0].TestSender(), incA); pErr != nil {
+		t.Fatal(pErr)
+	}
+	incC := incrementArgs(keyC, 2)
+	if _, pErr := client.SendWrapped(ctx, mtc.stores[0].TestSender(), incC); pErr != nil {
+		t.Fatal(pErr)
+	}
+
+	// Split the system range from the rest of the keyspace.
+	splitArgs := adminSplitArgs(keys.SystemMax)
+	if _, pErr := client.SendWrapped(ctx, mtc.stores[0].TestSender(), splitArgs); pErr != nil {
+		t.Fatal(pErr)
+	}
+
+	// Get the range's ID.
+	repl0 := mtc.stores[0].LookupReplica(roachpb.RKey(keyA))
+	rangeID := repl0.RangeID
+
+	// Replicate the range onto nodes 1 and 2.
+	// Wait for all replicas to be caught up.
+	mtc.replicateRange(rangeID, 1, 2)
+	mtc.waitForValues(keyA, []int64{1, 1, 1})
+	mtc.waitForValues(keyC, []int64{2, 2, 2})
+
+	// Create a transaction that will try to write "under" a served read.
+	// The read will have been served by the original leaseholder (node 0)
+	// and the write will be attempted on the new leaseholder (node 2).
+	// It should not succeed because it should run into the timestamp cache.
+	db := mtc.dbs[0]
+	txnOld := client.NewTxn(ctx, db, 0 /* gatewayNodeID */, client.RootTxn)
+
+	// Perform a write with txnOld so that its timestamp gets set.
+	if _, err := txnOld.Inc(ctx, keyB, 3); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read keyC with txnOld, which is updated below. This prevents the
+	// transaction from refreshing when it hits the serializable error.
+	if _, err := txnOld.Get(ctx, keyC); err != nil {
+		t.Fatal(err)
+	}
+
+	// Ensure that the transaction sends its first hearbeat so that it creates
+	// its transaction record and doesn't run into trouble with the low water
+	// mark of the new leaseholder's timestamp cache. Amusingly, if the bug
+	// we're regression testing against here still existed, we would not have
+	// to do this.
+	hb, hbH := heartbeatArgs(txnOld.Serialize(), mtc.clock.Now())
+	if _, pErr := client.SendWrappedWith(ctx, mtc.stores[0].TestSender(), hbH, hb); pErr != nil {
+		t.Fatal(pErr)
+	}
+
+	// Another client comes along at a higher timestamp and reads. We should
+	// never be able to write under this time or we would be rewriting history.
+	if _, err := db.Get(ctx, keyA); err != nil {
+		t.Fatal(err)
+	}
+
+	// Partition node 2 from the rest of its range. Once partitioned, perform
+	// another write and truncate the Raft log on the two connected nodes. This
+	// ensures that that when node 2 comes back up it will require a snapshot
+	// from Raft.
+	mtc.transport.Listen(store2.Ident.StoreID, &unreliableRaftHandler{
+		rangeID:            rangeID,
+		RaftMessageHandler: store2,
+	})
+
+	if _, pErr := client.SendWrapped(ctx, mtc.stores[0].TestSender(), incC); pErr != nil {
+		t.Fatal(pErr)
+	}
+	mtc.waitForValues(keyC, []int64{4, 4, 2})
+
+	// Truncate the log at index+1 (log entries < N are removed, so this
+	// includes the increment). This necessitates a snapshot when the
+	// partitioned replica rejoins the rest of the range.
+	index, err := repl0.GetLastIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	truncArgs := truncateLogArgs(index+1, rangeID)
+	truncArgs.Key = keyA
+	if _, err := client.SendWrapped(ctx, mtc.stores[0].TestSender(), truncArgs); err != nil {
+		t.Fatal(err)
+	}
+
+	// Finally, transfer the lease to node 2 while it is still unavailable and
+	// behind. We try to avoid this case when picking new leaseholders in practice,
+	// but we're never 100% successful.
+	if err := repl0.AdminTransferLease(ctx, store2.Ident.StoreID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Remove the partition. A snapshot to node 2 should follow. This snapshot
+	// will inform node 2 that it is the new leaseholder for the range. Node 2
+	// should act accordingly and update its internal state to reflect this.
+	mtc.transport.Listen(store2.Ident.StoreID, store2)
+	mtc.waitForValues(keyC, []int64{4, 4, 4})
+
+	// Perform a write on the new leaseholder underneath the previously served
+	// read. This write should hit the timestamp cache and flag the txn for a
+	// restart when we try to commit it below. With the bug in #34025, the new
+	// leaseholder who heard about the lease transfer from a snapshot had an
+	// empty timestamp cache and would simply let us write under the previous
+	// read.
+	if _, err := txnOld.Inc(ctx, keyA, 4); err != nil {
+		t.Fatal(err)
+	}
+	const exp = `TransactionRetryError: retry txn \(RETRY_SERIALIZABLE\)`
+	if err := txnOld.Commit(ctx); !testutils.IsError(err, exp) {
+		t.Fatalf("expected retry error, got: %v; did we write under a read?", err)
+	}
+}
+
+// TestConcurrentAdminChangeReplicasRequests ensures that when two attempts to
+// change replicas for a range race, only one will succeed.
+func TestConcurrentAdminChangeReplicasRequests(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	// With 5 nodes the test is set up to have 2 actors trying to change the
+	// replication concurrently. The first one attempts to change the replication
+	// from [1] to [1, 2, 3, 4] and the second one starts by assuming that the
+	// first actor succeeded on its first request and expected [1, 2] and tries
+	// to move the replication to [1, 2, 4, 5]. One of these actors should
+	// succeed.
+	const numNodes = 5
+	tc := testcluster.StartTestCluster(t, numNodes, base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual,
+	})
+	ctx := context.Background()
+	defer tc.Stopper().Stop(ctx)
+	key := roachpb.Key("a")
+	db := tc.Servers[0].DB()
+	rangeInfo, err := getRangeInfo(ctx, db, key)
+	require.Nil(t, err)
+	require.Len(t, rangeInfo.Desc.InternalReplicas, 1)
+	targets1, targets2 := makeReplicationTargets(2, 3, 4), makeReplicationTargets(4, 5)
+	expects1 := rangeInfo.Desc
+	expects2 := rangeInfo.Desc
+	expects2.InternalReplicas = append(expects2.InternalReplicas, roachpb.ReplicaDescriptor{
+		NodeID:    2,
+		StoreID:   2,
+		ReplicaID: expects2.NextReplicaID,
+	})
+	expects2.NextReplicaID++
+	var err1, err2 error
+	var res1, res2 *roachpb.RangeDescriptor
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		res1, err1 = db.AdminChangeReplicas(
+			ctx, key, expects1, roachpb.MakeReplicationChanges(roachpb.ADD_REPLICA, targets1...))
+		wg.Done()
+	}()
+	go func() {
+		res2, err2 = db.AdminChangeReplicas(
+			ctx, key, expects2, roachpb.MakeReplicationChanges(roachpb.ADD_REPLICA, targets2...))
+		wg.Done()
+	}()
+	wg.Wait()
+
+	infoAfter, err := getRangeInfo(ctx, db, key)
+	require.Nil(t, err)
+
+	assert.Falsef(t, err1 == nil && err2 == nil,
+		"expected one of racing AdminChangeReplicasRequests to fail but neither did")
+	// It is possible that an error can occur due to a rejected snapshot from the
+	// target range. We don't want to fail the test if we got one of those.
+	isSnapshotErr := func(err error) bool {
+		return testutils.IsError(err, "snapshot failed:")
+	}
+	atLeastOneIsSnapshotErr := isSnapshotErr(err1) || isSnapshotErr(err2)
+	assert.Falsef(t, err1 != nil && err2 != nil && !atLeastOneIsSnapshotErr,
+		"expected only one of racing AdminChangeReplicasRequests to fail but both "+
+			"had errors and neither were snapshot: %v %v", err1, err2)
+	replicaNodeIDs := func(desc roachpb.RangeDescriptor) (ids []int) {
+		for _, r := range desc.InternalReplicas {
+			ids = append(ids, int(r.NodeID))
+		}
+		return ids
+	}
+	if err1 == nil {
+		assert.ElementsMatch(t, replicaNodeIDs(infoAfter.Desc), []int{1, 2, 3, 4})
+		assert.EqualValues(t, infoAfter.Desc, *res1)
+	} else if err2 == nil {
+		assert.ElementsMatch(t, replicaNodeIDs(infoAfter.Desc), []int{1, 2, 4, 5})
+		assert.EqualValues(t, infoAfter.Desc, *res2)
+	}
+}
+
+// TestRandomConcurrentAdminChangeReplicasRequests ensures that when multiple
+// AdminChangeReplicasRequests are issued concurrently, so long as requests
+// provide the the value of the RangeDescriptor they will not accidentally
+// perform replication changes. In particular this test runs a number of
+// concurrent actors which all use the same expectations of the RangeDescriptor
+// and verifies that at most one actor succeeds in making all of its changes.
+func TestRandomConcurrentAdminChangeReplicasRequests(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	const numNodes = 6
+	tc := testcluster.StartTestCluster(t, numNodes, base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual,
+	})
+	ctx := context.Background()
+	defer tc.Stopper().Stop(ctx)
+	const actors = 10
+	errors := make([]error, actors)
+	var wg sync.WaitGroup
+	key := roachpb.Key("a")
+	db := tc.Servers[0].DB()
+	require.Nil(t, db.AdminRelocateRange(ctx, key, makeReplicationTargets(1, 2, 3)))
+	// Random targets consisting of a random number of nodes from the set of nodes
+	// in the cluster which currently do not have a replica.
+	pickTargets := func() []roachpb.ReplicationTarget {
+		availableIDs := make([]int, 0, numNodes-3)
+		for id := 4; id <= numNodes; id++ {
+			availableIDs = append(availableIDs, id)
+		}
+		rand.Shuffle(len(availableIDs), func(i, j int) {
+			availableIDs[i], availableIDs[j] = availableIDs[j], availableIDs[i]
+		})
+		n := rand.Intn(len(availableIDs)) + 1
+		return makeReplicationTargets(availableIDs[:n]...)
+	}
+	// TODO(ajwerner): consider doing this read inside the addReplicas function
+	// and then allowing multiple writes to overlap and validate that the state
+	// corresponds to a valid history of events.
+	rangeInfo, err := getRangeInfo(ctx, db, key)
+	require.Nil(t, err)
+	addReplicas := func() error {
+		_, err := db.AdminChangeReplicas(
+			ctx, key, rangeInfo.Desc, roachpb.MakeReplicationChanges(
+				roachpb.ADD_REPLICA, pickTargets()...))
+		return err
+	}
+	wg.Add(actors)
+	for i := 0; i < actors; i++ {
+		go func(i int) { errors[i] = addReplicas(); wg.Done() }(i)
+	}
+	wg.Wait()
+	var gotSuccess bool
+	for _, err := range errors {
+		if err != nil {
+			const exp = "change replicas of .* failed: descriptor changed" +
+				"|snapshot failed:"
+			assert.True(t, testutils.IsError(err, exp), err)
+		} else if gotSuccess {
+			t.Error("expected only one success")
+		} else {
+			gotSuccess = true
+		}
+	}
+}
+
+// TestReplicaTombstone ensures that tombstones are written when we expect
+// them to be. Tombstones are laid down when replicas are removed.
+// Replicas are removed for several reasons:
+//
+//  (1)   In response to a ChangeReplicasTrigger which removes it.
+//  (2)   In response to a ReplicaTooOldError from a sent raft message.
+//  (3)   Due to the replica GC queue detecting a replica is not in the range.
+//  (3.1) When the replica detects the range has been merged away.
+//  (4)   Due to a raft message addressed to a newer replica ID.
+//  (4.1) When the older replica is not initialized.
+//  (5)   Due to a merge.
+//  (6)   Due to snapshot which subsumes a range.
+//
+// This test creates all of these scenarios and ensures that tombstones are
+// written at sane values.
+func TestReplicaTombstone(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	t.Run("(1) ChangeReplicasTrigger", func(t *testing.T) {
+		defer leaktest.AfterTest(t)()
+		ctx := context.Background()
+		tc := testcluster.StartTestCluster(t, 2, base.TestClusterArgs{
+			ServerArgs: base.TestServerArgs{
+				Knobs: base.TestingKnobs{Store: &storage.StoreTestingKnobs{
+					DisableReplicaGCQueue: true,
+				}},
+			},
+			ReplicationMode: base.ReplicationManual,
+		})
+		defer tc.Stopper().Stop(ctx)
+
+		key := tc.ScratchRange(t)
+		require.NoError(t, tc.WaitForSplitAndInitialization(key))
+		desc, err := tc.LookupRange(key)
+		require.NoError(t, err)
+		rangeID := desc.RangeID
+		tc.AddReplicasOrFatal(t, key, tc.Target(1))
+		// Partition node 2 from receiving responses but not requests.
+		// This will lead to it applying the ChangeReplicasTrigger which removes
+		// it rather than receiving a ReplicaTooOldError.
+		store, _ := getFirstStoreReplica(t, tc.Server(1), key)
+		funcs := noopRaftHandlerFuncs()
+		funcs.dropResp = func(*storage.RaftMessageResponse) bool {
+			return true
+		}
+		tc.Servers[1].RaftTransport().Listen(store.StoreID(), &unreliableRaftHandler{
+			rangeID:                    desc.RangeID,
+			RaftMessageHandler:         store,
+			unreliableRaftHandlerFuncs: funcs,
+		})
+		tc.RemoveReplicasOrFatal(t, key, tc.Target(1))
+		tombstone := waitForTombstone(t, store.Engine(), rangeID)
+		require.Equal(t, roachpb.ReplicaID(3), tombstone.NextReplicaID)
+	})
+	t.Run("(2) ReplicaTooOldError", func(t *testing.T) {
+		defer leaktest.AfterTest(t)()
+		ctx := context.Background()
+		tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
+			ServerArgs: base.TestServerArgs{
+				RaftConfig: base.RaftConfig{
+					// Make the tick interval short so we don't need to wait too long for
+					// the partitioned node to time out but increase the lease timeout
+					// so expiration-based leases still work.
+					RaftTickInterval:                        time.Millisecond,
+					RangeLeaseRaftElectionTimeoutMultiplier: 10000,
+				},
+				Knobs: base.TestingKnobs{Store: &storage.StoreTestingKnobs{
+					DisableReplicaGCQueue: true,
+				}},
+			},
+			ReplicationMode: base.ReplicationManual,
+		})
+		defer tc.Stopper().Stop(ctx)
+
+		key := tc.ScratchRange(t)
+		require.NoError(t, tc.WaitForSplitAndInitialization(key))
+		desc, err := tc.LookupRange(key)
+		require.NoError(t, err)
+		rangeID := desc.RangeID
+		tc.AddReplicasOrFatal(t, key, tc.Target(1), tc.Target(2))
+		require.NoError(t,
+			tc.WaitForVoters(key, tc.Target(1), tc.Target(2)))
+		store, repl := getFirstStoreReplica(t, tc.Server(2), key)
+		// Partition the range such that it hears responses but does not hear
+		// requests. It should destroy the local replica due to a
+		// ReplicaTooOldError.
+		sawTooOld := make(chan struct{}, 1)
+		raftFuncs := noopRaftHandlerFuncs()
+		raftFuncs.dropResp = func(resp *storage.RaftMessageResponse) bool {
+			if pErr, ok := resp.Union.GetValue().(*roachpb.Error); ok {
+				if _, isTooOld := pErr.GetDetail().(*roachpb.ReplicaTooOldError); isTooOld {
+					select {
+					case sawTooOld <- struct{}{}:
+					default:
+					}
+				}
+			}
+			return false
+		}
+		raftFuncs.dropReq = func(req *storage.RaftMessageRequest) bool {
+			return req.ToReplica.StoreID == store.StoreID()
+		}
+		tc.Servers[2].RaftTransport().Listen(store.StoreID(), &unreliableRaftHandler{
+			rangeID:                    desc.RangeID,
+			RaftMessageHandler:         store,
+			unreliableRaftHandlerFuncs: raftFuncs,
+		})
+		tc.RemoveReplicasOrFatal(t, key, tc.Target(2))
+		testutils.SucceedsSoon(t, func() error {
+			repl.UnquiesceAndWakeLeader()
+			if len(sawTooOld) == 0 {
+				return errors.New("still haven't seen ReplicaTooOldError")
+			}
+			return nil
+		})
+		// Wait until we're sure that the replica has seen ReplicaTooOld,
+		// then go look for the tombstone.
+		<-sawTooOld
+		tombstone := waitForTombstone(t, store.Engine(), rangeID)
+		require.Equal(t, roachpb.ReplicaID(4), tombstone.NextReplicaID)
+	})
+	t.Run("(3) ReplicaGCQueue", func(t *testing.T) {
+		defer leaktest.AfterTest(t)()
+
+		ctx := context.Background()
+		tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
+			ServerArgs: base.TestServerArgs{
+				Knobs: base.TestingKnobs{Store: &storage.StoreTestingKnobs{
+					DisableReplicaGCQueue: true,
+				}},
+			},
+			ReplicationMode: base.ReplicationManual,
+		})
+		defer tc.Stopper().Stop(ctx)
+
+		key := tc.ScratchRange(t)
+		require.NoError(t, tc.WaitForSplitAndInitialization(key))
+		desc, err := tc.LookupRange(key)
+		require.NoError(t, err)
+		rangeID := desc.RangeID
+		tc.AddReplicasOrFatal(t, key, tc.Target(1), tc.Target(2))
+		// Partition node 2 from receiving any raft messages.
+		// It will never find out it has been removed. We'll remove it
+		// with a manual replica GC.
+		store, _ := getFirstStoreReplica(t, tc.Server(2), key)
+		tc.Servers[2].RaftTransport().Listen(store.StoreID(), &unreliableRaftHandler{
+			rangeID:            desc.RangeID,
+			RaftMessageHandler: store,
+		})
+		tc.RemoveReplicasOrFatal(t, key, tc.Target(2))
+		repl, err := store.GetReplica(desc.RangeID)
+		require.NoError(t, err)
+		require.NoError(t, store.ManualReplicaGC(repl))
+		tombstone := waitForTombstone(t, store.Engine(), rangeID)
+		require.Equal(t, roachpb.ReplicaID(4), tombstone.NextReplicaID)
+	})
+	// This case also detects the tombstone for nodes which processed the merge.
+	t.Run("(3.1) (5) replica GC queue and merge", func(t *testing.T) {
+		defer leaktest.AfterTest(t)()
+
+		ctx := context.Background()
+		tc := testcluster.StartTestCluster(t, 4, base.TestClusterArgs{
+			ServerArgs: base.TestServerArgs{
+				Knobs: base.TestingKnobs{Store: &storage.StoreTestingKnobs{
+					DisableReplicaGCQueue: true,
+				}},
+			},
+			ReplicationMode: base.ReplicationManual,
+		})
+		defer tc.Stopper().Stop(ctx)
+
+		key := tc.ScratchRange(t)
+		require.NoError(t, tc.WaitForSplitAndInitialization(key))
+		tc.AddReplicasOrFatal(t, key, tc.Target(1))
+		keyA := append(key[:len(key):len(key)], 'a')
+		_, desc, err := tc.SplitRange(keyA)
+		require.NoError(t, err)
+		require.NoError(t, tc.WaitForSplitAndInitialization(keyA))
+		tc.AddReplicasOrFatal(t, key, tc.Target(3))
+		tc.AddReplicasOrFatal(t, keyA, tc.Target(2))
+		rangeID := desc.RangeID
+		// Partition node 2 from all raft communication.
+		store, _ := getFirstStoreReplica(t, tc.Server(2), keyA)
+		tc.Servers[2].RaftTransport().Listen(store.StoreID(), &unreliableRaftHandler{
+			rangeID:            desc.RangeID,
+			RaftMessageHandler: store,
+		})
+
+		// We'll move the range from server 2 to 3 and merge key and keyA.
+		// Server 2 won't hear about any of that.
+		tc.RemoveReplicasOrFatal(t, keyA, tc.Target(2))
+		tc.AddReplicasOrFatal(t, keyA, tc.Target(3))
+		require.NoError(t, tc.WaitForSplitAndInitialization(keyA))
+		require.NoError(t, tc.Server(0).DB().AdminMerge(ctx, key))
+		// Run replica GC on server 2.
+		repl, err := store.GetReplica(desc.RangeID)
+		require.NoError(t, err)
+		require.NoError(t, store.ManualReplicaGC(repl))
+		// Verify the tombstone generated from replica GC of a merged range.
+		tombstone := waitForTombstone(t, store.Engine(), rangeID)
+		require.Equal(t, roachpb.ReplicaID(math.MaxInt32), tombstone.NextReplicaID)
+		// Verify the tombstone generated from processing a merge trigger.
+		store3, _ := getFirstStoreReplica(t, tc.Server(0), key)
+		tombstone = waitForTombstone(t, store3.Engine(), rangeID)
+		require.Equal(t, roachpb.ReplicaID(math.MaxInt32), tombstone.NextReplicaID)
+	})
+	t.Run("(4) (4.1) raft messages to newer replicaID ", func(t *testing.T) {
+		defer leaktest.AfterTest(t)()
+		ctx := context.Background()
+		tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
+			ServerArgs: base.TestServerArgs{
+				RaftConfig: base.RaftConfig{
+					// Make the tick interval short so we don't need to wait too long
+					// for a heartbeat to be sent. Increase the election timeout so
+					// expiration based leases still work.
+					RaftTickInterval:                        time.Millisecond,
+					RangeLeaseRaftElectionTimeoutMultiplier: 10000,
+				},
+				Knobs: base.TestingKnobs{Store: &storage.StoreTestingKnobs{
+					DisableReplicaGCQueue: true,
+				}},
+			},
+			ReplicationMode: base.ReplicationManual,
+		})
+		defer tc.Stopper().Stop(ctx)
+
+		key := tc.ScratchRange(t)
+		desc, err := tc.LookupRange(key)
+		require.NoError(t, err)
+		rangeID := desc.RangeID
+		tc.AddReplicasOrFatal(t, key, tc.Target(1), tc.Target(2))
+		require.NoError(t, tc.WaitForSplitAndInitialization(key))
+		store, repl := getFirstStoreReplica(t, tc.Server(2), key)
+		// Set up a partition for everything but heartbeats on store 2.
+		// Make ourselves a tool to block snapshots until we've heard a
+		// heartbeat above a certain replica ID.
+		var waiter struct {
+			syncutil.Mutex
+			sync.Cond
+			minHeartbeatReplicaID roachpb.ReplicaID
+			blockSnapshot         bool
+		}
+		waiter.L = &waiter.Mutex
+		waitForSnapshot := func() {
+			waiter.Lock()
+			defer waiter.Unlock()
+			for waiter.blockSnapshot {
+				waiter.Wait()
+			}
+		}
+		recordHeartbeat := func(replicaID roachpb.ReplicaID) {
+			waiter.Lock()
+			defer waiter.Unlock()
+			if waiter.blockSnapshot && replicaID >= waiter.minHeartbeatReplicaID {
+				waiter.blockSnapshot = false
+				waiter.Broadcast()
+			}
+		}
+		setMinHeartbeat := func(replicaID roachpb.ReplicaID) {
+			waiter.Lock()
+			defer waiter.Unlock()
+			waiter.minHeartbeatReplicaID = replicaID
+			waiter.blockSnapshot = true
+		}
+		setMinHeartbeat(repl.ReplicaID() + 1)
+		tc.Servers[2].RaftTransport().Listen(store.StoreID(), &unreliableRaftHandler{
+			rangeID:            desc.RangeID,
+			RaftMessageHandler: store,
+			unreliableRaftHandlerFuncs: unreliableRaftHandlerFuncs{
+				dropResp: func(*storage.RaftMessageResponse) bool {
+					return true
+				},
+				dropReq: func(*storage.RaftMessageRequest) bool {
+					return true
+				},
+				dropHB: func(hb *storage.RaftHeartbeat) bool {
+					recordHeartbeat(hb.ToReplicaID)
+					return false
+				},
+				snapErr: func(*storage.SnapshotRequest_Header) error {
+					waitForSnapshot()
+					return errors.New("boom")
+				},
+			},
+		})
+		// Remove the current replica from the node, it will not hear about this.
+		tc.RemoveReplicasOrFatal(t, key, tc.Target(2))
+		// Try to add it back as a learner. We'll wait until it's heard about
+		// this as a heartbeat. This demonstrates case (4) where a raft message
+		// to a newer replica ID (in this case a heartbeat) removes an initialized
+		// Replica.
+		_, err = tc.AddReplicas(key, tc.Target(2))
+		require.Regexp(t, "boom", err)
+		tombstone := waitForTombstone(t, store.Engine(), rangeID)
+		require.Equal(t, roachpb.ReplicaID(4), tombstone.NextReplicaID)
+		// Try adding it again and again block the snapshot until a heartbeat
+		// at a higher ID has been sent. This is case (4.1) where a raft message
+		// removes an uninitialized Replica.
+		//
+		// Note that this case represents a potential memory leak. If we hear about
+		// a Replica and then either never receive a snapshot or for whatever reason
+		// fail to receive a snapshot and then we never hear from the range again we
+		// may leak in-memory state about this replica.
+		//
+		// We could replica GC these replicas without too much extra work but they
+		// also should be rare. Note this is not new with learner replicas.
+		setMinHeartbeat(5)
+		_, err = tc.AddReplicas(key, tc.Target(2))
+		require.Regexp(t, "boom", err)
+		// We will start out reading the old tombstone so keep retrying.
+		testutils.SucceedsSoon(t, func() error {
+			tombstone = waitForTombstone(t, store.Engine(), rangeID)
+			if tombstone.NextReplicaID != 5 {
+				return errors.Errorf("read tombstone with NextReplicaID %d, want %d",
+					tombstone.NextReplicaID, 5)
+			}
+			return nil
+		})
+	})
+	t.Run("(6) subsumption via snapshot", func(t *testing.T) {
+		defer leaktest.AfterTest(t)()
+
+		ctx := context.Background()
+		var proposalFilter atomic.Value
+		noopProposalFilter := func(storagebase.ProposalFilterArgs) *roachpb.Error {
+			return nil
+		}
+		proposalFilter.Store(noopProposalFilter)
+		tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
+			ServerArgs: base.TestServerArgs{
+				Knobs: base.TestingKnobs{Store: &storage.StoreTestingKnobs{
+					DisableReplicaGCQueue: true,
+					TestingProposalFilter: storagebase.ReplicaProposalFilter(
+						func(args storagebase.ProposalFilterArgs) *roachpb.Error {
+							return proposalFilter.
+								Load().(func(storagebase.ProposalFilterArgs) *roachpb.Error)(args)
+						},
+					),
+				}},
+			},
+			ReplicationMode: base.ReplicationManual,
+		})
+		defer tc.Stopper().Stop(ctx)
+
+		key := tc.ScratchRange(t)
+		require.NoError(t, tc.WaitForSplitAndInitialization(key))
+		tc.AddReplicasOrFatal(t, key, tc.Target(1), tc.Target(2))
+		keyA := append(key[:len(key):len(key)], 'a')
+		lhsDesc, rhsDesc, err := tc.SplitRange(keyA)
+		require.NoError(t, err)
+		require.NoError(t, tc.WaitForSplitAndInitialization(key))
+		require.NoError(t, tc.WaitForSplitAndInitialization(keyA))
+		require.NoError(t, tc.WaitForVoters(key, tc.Target(1), tc.Target(2)))
+		require.NoError(t, tc.WaitForVoters(keyA, tc.Target(1), tc.Target(2)))
+
+		// We're going to block the RHS and LHS of node 2 as soon as the merge
+		// attempts to propose the command to commit the merge. This should prevent
+		// the merge from being applied on node 2. Then we'll manually force a
+		// snapshots to be sent to the LHS of store 2 after the merge commits.
+		store, repl := getFirstStoreReplica(t, tc.Server(2), key)
+		var partActive atomic.Value
+		partActive.Store(false)
+		raftFuncs := noopRaftHandlerFuncs()
+		raftFuncs.dropReq = func(req *storage.RaftMessageRequest) bool {
+			return partActive.Load().(bool) && req.Message.Type == raftpb.MsgApp
+		}
+		tc.Servers[2].RaftTransport().Listen(store.StoreID(), &unreliableRaftHandler{
+			rangeID:                    lhsDesc.RangeID,
+			unreliableRaftHandlerFuncs: raftFuncs,
+			RaftMessageHandler: &unreliableRaftHandler{
+				rangeID:                    rhsDesc.RangeID,
+				RaftMessageHandler:         store,
+				unreliableRaftHandlerFuncs: raftFuncs,
+			},
+		})
+		proposalFilter.Store(func(args storagebase.ProposalFilterArgs) *roachpb.Error {
+			merge := args.Cmd.ReplicatedEvalResult.Merge
+			if merge != nil && merge.LeftDesc.RangeID == lhsDesc.RangeID {
+				partActive.Store(true)
+			}
+			return nil
+		})
+		require.NoError(t, tc.Server(0).DB().AdminMerge(ctx, key))
+		var tombstone roachpb.RaftTombstone
+		testutils.SucceedsSoon(t, func() (err error) {
+			// One of the two other stores better be the raft leader eventually.
+			// We keep trying to send snapshots until one takes.
+			for i := range []int{0, 1} {
+				s, r := getFirstStoreReplica(t, tc.Server(i), key)
+				err = s.ManualRaftSnapshot(r, repl.ReplicaID())
+				if err == nil {
+					break
+				}
+			}
+			if err != nil {
+				return err
+			}
+			tombstoneKey := keys.RaftTombstoneKey(rhsDesc.RangeID)
+			ok, err := engine.MVCCGetProto(
+				context.TODO(), store.Engine(), tombstoneKey, hlc.Timestamp{}, &tombstone, engine.MVCCGetOptions{},
+			)
+			require.NoError(t, err)
+			if !ok {
+				return errors.New("no tombstone found")
+			}
+			return nil
+		})
+		require.Equal(t, roachpb.ReplicaID(math.MaxInt32), tombstone.NextReplicaID)
+	})
+}
+
+// TestAdminRelocateRangeSafety exercises a situation where calls to
+// AdminRelocateRange can race with calls to ChangeReplicas and verifies
+// that such races do not leave the range in an under-replicated state.
+func TestAdminRelocateRangeSafety(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	// The test is going to verify that when a replica removal due to a
+	// Replica.ChangeReplicas call coincides with the removal phase of an
+	// AdminRelocateRangeRequest that one of the removals will fail.
+	// In order to ensure that the AdminChangeReplicas command coincides with
+	// the remove phase of the AdminRelocateReplicas the test injects a response
+	// filter which, when useSeenAdd holds true, signals on seenAdd when it sees
+	// an AdminChangeReplicasRequest which added a replica.
+	const numNodes = 4
+	var useSeenAdd atomic.Value
+	useSeenAdd.Store(false)
+	seenAdd := make(chan struct{}, 1)
+	responseFilter := func(ba roachpb.BatchRequest, _ *roachpb.BatchResponse) *roachpb.Error {
+		if ba.IsSingleRequest() {
+			changeReplicas, ok := ba.Requests[0].GetInner().(*roachpb.AdminChangeReplicasRequest)
+			if ok && changeReplicas.Changes()[0].ChangeType == roachpb.ADD_REPLICA && useSeenAdd.Load().(bool) {
+				seenAdd <- struct{}{}
+			}
+		}
+		return nil
+	}
+	tc := testcluster.StartTestCluster(t, numNodes, base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual,
+		ServerArgs: base.TestServerArgs{
+			Knobs: base.TestingKnobs{
+				Store: &storage.StoreTestingKnobs{
+					TestingResponseFilter: responseFilter,
+				},
+			},
+		},
+	})
+	ctx := context.Background()
+	defer tc.Stopper().Stop(ctx)
+	db := tc.Servers[rand.Intn(numNodes)].DB()
+
+	// The test assumes from the way that the range gets set up that the lease
+	// holder is node 1 and from the above relocate call that the range in
+	// question has replicas on nodes 1-3. Make the call to AdminRelocate range
+	// to set up the replication and then verify the assumed state.
+
+	key := roachpb.Key("a")
+	assert.Nil(t, db.AdminRelocateRange(ctx, key, makeReplicationTargets(1, 2, 3)))
+	rangeInfo, err := getRangeInfo(ctx, db, key)
+	assert.Nil(t, err)
+	assert.Len(t, rangeInfo.Desc.InternalReplicas, 3)
+	assert.Equal(t, rangeInfo.Lease.Replica.NodeID, roachpb.NodeID(1))
+	for id := roachpb.StoreID(1); id <= 3; id++ {
+		_, hasReplica := rangeInfo.Desc.GetReplicaDescriptor(id)
+		assert.Truef(t, hasReplica, "missing replica descriptor for store %d", id)
+	}
+
+	// The test now proceeds to use AdminRelocateRange to move a replica from node
+	// 3 to node 4. The call should first which will first add 4 and then
+	// remove 3. Concurrently a separate goroutine will attempt to remove the
+	// replica on node 2. The ResponseFilter passed in the TestingKnobs will
+	// prevent the remove call from proceeding until after the Add of 4 has
+	// completed.
+
+	// Code above verified r1 is the leaseholder, so use it to ChangeReplicas.
+	r1, err := tc.Servers[0].Stores().GetReplicaForRangeID(rangeInfo.Desc.RangeID)
+	assert.Nil(t, err)
+	expDescAfterAdd := rangeInfo.Desc // for use with ChangeReplicas
+	expDescAfterAdd.NextReplicaID++
+	expDescAfterAdd.InternalReplicas = append(expDescAfterAdd.InternalReplicas, roachpb.ReplicaDescriptor{
+		NodeID:    4,
+		StoreID:   4,
+		ReplicaID: 4,
+	})
+	var relocateErr, changeErr error
+	var changedDesc *roachpb.RangeDescriptor // only populated if changeErr == nil
+	change := func() {
+		<-seenAdd
+		chgs := roachpb.MakeReplicationChanges(roachpb.REMOVE_REPLICA, makeReplicationTargets(2)...)
+		changedDesc, changeErr = r1.ChangeReplicas(ctx, &expDescAfterAdd, storage.SnapshotRequest_REBALANCE, "replicate", "testing", chgs)
+	}
+	relocate := func() {
+		relocateErr = db.AdminRelocateRange(ctx, key, makeReplicationTargets(1, 2, 4))
+	}
+	useSeenAdd.Store(true)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { relocate(); wg.Done() }()
+	go func() { change(); wg.Done() }()
+	wg.Wait()
+	rangeInfo, err = getRangeInfo(ctx, db, key)
+	assert.Nil(t, err)
+	assert.True(t, len(rangeInfo.Desc.InternalReplicas) >= 3)
+	assert.Falsef(t, relocateErr == nil && changeErr == nil,
+		"expected one of racing AdminRelocateReplicas and ChangeReplicas "+
+			"to fail but neither did")
+	assert.Falsef(t, relocateErr != nil && changeErr != nil,
+		"expected only one of racing AdminRelocateReplicas and ChangeReplicas "+
+			"to fail but both did")
+	if changeErr == nil {
+		assert.EqualValues(t, *changedDesc, rangeInfo.Desc)
+	}
+}
+
+// TestChangeReplicasLeaveAtomicRacesWithMerge exercises a hazardous case which
+// arises during concurrent AdminChangeReplicas requests. The code reads the
+// descriptor from range id local, checks to make sure that the read
+// descriptor matches the expectation and then uses the bytes of the read read
+// bytes in a CPut with the update. The code contains an optimization to
+// transition out of joint consensus even if the read descriptor does not match
+// the expectation. That optimization did not verify anything about the read
+// descriptor, not even if it was nil.
+//
+// This test wants to exercise this scenario. We need to get the replica in
+// a state where it has an outgoing voter and then we need to have two
+// different requests trying to make changes and only the merge succeeds. The
+// race is that the second command will notice the voter outgoing and will
+// attempt to fix it.  In order to do that it reads the range descriptor to
+// ensure that it has not changed (and to get the raw bytes of the range
+// descriptor for use in a CPut as the current API only uses the in-memory
+// value and we need the encoding is not necessarily stable.
+//
+// The test also contains a variant whereby the range is re-split at the
+// same key producing a range descriptor with a different range ID.
+//
+// See https://github.com/cockroachdb/cockroach/issues/40877.
+func TestChangeReplicasLeaveAtomicRacesWithMerge(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	testutils.RunTrueAndFalse(t, "resplit", func(t *testing.T, resplit bool) {
+		const numNodes = 4
+		var stopAfterJointConfig atomic.Value
+		stopAfterJointConfig.Store(false)
+		var rangeToBlockRangeDescriptorRead atomic.Value
+		rangeToBlockRangeDescriptorRead.Store(roachpb.RangeID(0))
+		blockRangeDescriptorReadChan := make(chan struct{}, 1)
+		blockOnChangeReplicasRead := storagebase.ReplicaRequestFilter(func(ba roachpb.BatchRequest) *roachpb.Error {
+			if req, isGet := ba.GetArg(roachpb.Get); !isGet ||
+				ba.RangeID != rangeToBlockRangeDescriptorRead.Load().(roachpb.RangeID) ||
+				!ba.IsSingleRequest() ||
+				!bytes.HasSuffix([]byte(req.(*roachpb.GetRequest).Key),
+					[]byte(keys.LocalRangeDescriptorSuffix)) {
+				return nil
+			}
+			select {
+			case <-blockRangeDescriptorReadChan:
+				<-blockRangeDescriptorReadChan
+			default:
+			}
+			return nil
+		})
+		tc := testcluster.StartTestCluster(t, numNodes, base.TestClusterArgs{
+			ServerArgs: base.TestServerArgs{
+				Knobs: base.TestingKnobs{
+					Store: &storage.StoreTestingKnobs{
+						TestingRequestFilter: blockOnChangeReplicasRead,
+						ReplicaAddStopAfterJointConfig: func() bool {
+							return stopAfterJointConfig.Load().(bool)
+						},
+					},
+				},
+			},
+			ReplicationMode: base.ReplicationManual,
+		})
+		// Make a magical context which will allow us to use atomic replica changes.
+		ctx := client.ChangeReplicasCanMixAddAndRemoveContext(context.Background())
+		defer tc.Stopper().Stop(ctx)
+
+		// We want to first get into a joint consensus scenario.
+		// Then we want to issue a ChangeReplicasRequest on a goroutine that will
+		// block trying to read the RHS's range descriptor. Then we'll merge the RHS
+		// away.
+
+		// Set up a userspace range to mess around with.
+		lhs := tc.ScratchRange(t)
+		_, err := tc.AddReplicas(lhs, tc.Targets(1, 2)...)
+		require.NoError(t, err)
+
+		// Split it and then we're going to try to up-replicate.
+		// We're going to have one goroutine trying to ADD the 4th node.
+		// and another goroutine trying to move out of a joint config on both
+		// sides and then merge the range. We ensure that the first goroutine
+		// blocks and the second one succeeds. This will test that the first
+		// goroutine detects reading the nil descriptor.
+		rhs := append(lhs[:len(lhs):len(lhs)], 'a')
+		lhsDesc, rhsDesc := &roachpb.RangeDescriptor{}, &roachpb.RangeDescriptor{}
+		*lhsDesc, *rhsDesc, err = tc.SplitRange(rhs)
+		require.NoError(t, err)
+
+		err = tc.WaitForSplitAndInitialization(rhs)
+		require.NoError(t, err)
+
+		// Manually construct the batch because the (*DB).AdminChangeReplicas does
+		// not yet support atomic replication changes.
+		db := tc.Servers[0].DB()
+		swapReplicas := func(key roachpb.Key, desc roachpb.RangeDescriptor, add, remove int) (*roachpb.RangeDescriptor, error) {
+			return db.AdminChangeReplicas(ctx, key, desc, []roachpb.ReplicationChange{
+				{ChangeType: roachpb.ADD_REPLICA, Target: tc.Target(add)},
+				{ChangeType: roachpb.REMOVE_REPLICA, Target: tc.Target(remove)},
+			})
+		}
+
+		// Move the RHS and LHS to 3 from 2.
+		_, err = swapReplicas(lhs, *lhsDesc, 3, 2)
+		require.NoError(t, err)
+		stopAfterJointConfig.Store(true) // keep the RHS in a joint config.
+		rhsDesc, err = swapReplicas(rhs, *rhsDesc, 3, 2)
+		require.NoError(t, err)
+		stopAfterJointConfig.Store(false)
+
+		// Run a goroutine which sends an AdminChangeReplicasRequest which will try to
+		// move the range out of joint config but will end up blocking on
+		// blockRangeDescriptorReadChan until we close it later.
+		rangeToBlockRangeDescriptorRead.Store(rhsDesc.RangeID)
+		blockRangeDescriptorReadChan <- struct{}{}
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := db.AdminChangeReplicas(
+				ctx, rhs, *rhsDesc, roachpb.MakeReplicationChanges(roachpb.ADD_REPLICA, tc.Target(2)),
+			)
+			// We'll ultimately fail because we're going to race with the work below.
+			msg := "descriptor changed"
+			if resplit {
+				// We don't convert ConditionFailedError to the "descriptor changed"
+				// error if the range ID changed.
+				msg = "unexpected value"
+			}
+			require.True(t, testutils.IsError(err, msg), err)
+		}()
+		// Wait until our goroutine is blocked.
+		testutils.SucceedsSoon(t, func() error {
+			if len(blockRangeDescriptorReadChan) != 0 {
+				return errors.New("not blocked yet")
+			}
+			return nil
+		})
+		// Add and remove a replica to exit the joint config.
+		_, err = tc.AddReplicas(rhs, tc.Target(2))
+		require.NoError(t, err)
+		_, err = tc.RemoveReplicas(rhs, tc.Target(2))
+		require.NoError(t, err)
+		// Merge the RHS away.
+		err = db.AdminMerge(ctx, lhs)
+		require.NoError(t, err)
+		if resplit {
+			require.NoError(t, db.AdminSplit(ctx, lhs, rhs, hlc.Timestamp{WallTime: math.MaxInt64}))
+			err = tc.WaitForSplitAndInitialization(rhs)
+			require.NoError(t, err)
+		}
+
+		// Unblock the original add on the separate goroutine to ensure that it
+		// properly handles reading a nil range descriptor.
+		close(blockRangeDescriptorReadChan)
+		wg.Wait()
+	})
+}
+
+// getRangeInfo retreives range info by performing a get against the provided
+// key and setting the ReturnRangeInfo flag to true.
+func getRangeInfo(
+	ctx context.Context, db *client.DB, key roachpb.Key,
+) (ri *roachpb.RangeInfo, err error) {
+	err = db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+		b := txn.NewBatch()
+		b.Header.ReturnRangeInfo = true
+		b.AddRawRequest(roachpb.NewGet(key))
+		if err = db.Run(ctx, b); err != nil {
+			return err
+		}
+		resp := b.RawResponse()
+		ri = &resp.Responses[0].GetInner().Header().RangeInfos[0]
+		return nil
+	})
+	return ri, err
+}
+
+// makeReplicationTargets creates a slice of replication targets where each
+// target has a NodeID and StoreID with a value corresponding to an id in ids.
+func makeReplicationTargets(ids ...int) (targets []roachpb.ReplicationTarget) {
+	for _, id := range ids {
+		targets = append(targets, roachpb.ReplicationTarget{
+			NodeID:  roachpb.NodeID(id),
+			StoreID: roachpb.StoreID(id),
+		})
+	}
+	return targets
 }

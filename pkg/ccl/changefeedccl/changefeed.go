@@ -9,448 +9,331 @@
 package changefeedccl
 
 import (
-	"bytes"
 	"context"
-	"net/url"
 	"time"
 
-	"github.com/Shopify/sarama"
-	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/jobs"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/pkg/errors"
 )
 
-var changefeedPollInterval = settings.RegisterDurationSetting(
-	"changefeed.experimental_poll_interval",
-	"polling interval for the prototype changefeed implementation",
-	1*time.Second,
-)
-
-func init() {
-	changefeedPollInterval.Hide()
-	sql.AddPlanHook(changefeedPlanHook)
-	jobs.AddResumeHook(changefeedResumeHook)
-}
-
-type envelopeType string
+var changefeedPollInterval = func() *settings.DurationSetting {
+	s := settings.RegisterNonNegativeDurationSetting(
+		"changefeed.experimental_poll_interval",
+		"polling interval for the prototype changefeed implementation",
+		1*time.Second,
+	)
+	s.SetSensitive()
+	return s
+}()
 
 const (
-	optEnvelope = `envelope`
-
-	optEnvelopeKeyOnly envelopeType = `key_only`
-	optEnvelopeRow     envelopeType = `row`
-
-	sinkSchemeKafka      = `kafka`
-	sinkParamTopicPrefix = `topic_prefix`
+	jsonMetaSentinel = `__crdb__`
 )
 
-var changefeedOptionExpectValues = map[string]bool{
-	optEnvelope: true,
+type emitEntry struct {
+	// row, if not the zero value, represents a changed row to be emitted.
+	row encodeRow
+
+	// resolved, if non-nil, is a guarantee for the associated
+	// span that no previously unseen entries with a lower or equal updated
+	// timestamp will be emitted.
+	resolved *jobspb.ResolvedSpan
+
+	// bufferGetTimestamp is the time this entry came out of the buffer.
+	bufferGetTimestamp time.Time
 }
 
-// changefeedPlanHook implements sql.PlanHookFn.
-func changefeedPlanHook(
-	_ context.Context, stmt tree.Statement, p sql.PlanHookState,
-) (sql.PlanHookRowFn, sqlbase.ResultColumns, []sql.PlanNode, error) {
-	changefeedStmt, ok := stmt.(*tree.CreateChangefeed)
-	if !ok {
-		return nil, nil, nil, nil
-	}
+// kvsToRows gets changed kvs from a closure and converts them into sql rows. It
+// returns a closure that may be repeatedly called to advance the changefeed.
+// The returned closure is not threadsafe.
+func kvsToRows(
+	leaseMgr *sql.LeaseManager,
+	details jobspb.ChangefeedDetails,
+	inputFn func(context.Context) (bufferEntry, error),
+) func(context.Context) ([]emitEntry, error) {
+	rfCache := newRowFetcherCache(leaseMgr)
 
-	sinkURIFn, err := p.TypeAsString(changefeedStmt.SinkURI, `CREATE CHANGEFEED`)
-	if err != nil {
-		return nil, nil, nil, err
-	}
+	var kvs row.SpanKVFetcher
+	appendEmitEntryForKV := func(
+		ctx context.Context, output []emitEntry, kv roachpb.KeyValue, schemaTimestamp hlc.Timestamp,
+		bufferGetTimestamp time.Time,
+	) ([]emitEntry, error) {
+		// Reuse kvs to save allocations.
+		kvs.KVs = kvs.KVs[:0]
 
-	optsFn, err := p.TypeAsStringOpts(changefeedStmt.Options, changefeedOptionExpectValues)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-
-	header := sqlbase.ResultColumns{
-		{Name: "job_id", Typ: types.Int},
-	}
-	fn := func(ctx context.Context, _ []sql.PlanNode, resultsCh chan<- tree.Datums) error {
-		ctx, span := tracing.ChildSpan(ctx, stmt.StatementTag())
-		defer tracing.FinishSpan(span)
-
-		sinkURI, err := sinkURIFn()
-		if err != nil {
-			return err
-		}
-
-		opts, err := optsFn()
-		if err != nil {
-			return err
-		}
-
-		now := p.ExecCfg().Clock.Now()
-		var highwater hlc.Timestamp
-		if changefeedStmt.AsOf.Expr != nil {
-			var err error
-			if highwater, err = sql.EvalAsOfTimestamp(nil, changefeedStmt.AsOf, now); err != nil {
-				return err
-			}
-		}
-
-		// TODO(dan): This grabs table descriptors once, but uses them to
-		// interpret kvs written later. This both doesn't handle any schema
-		// changes and breaks the table leasing.
-		descriptorTime := now
-		if highwater != (hlc.Timestamp{}) {
-			descriptorTime = highwater
-		}
-		targetDescs, _, err := backupccl.ResolveTargetsToDescriptors(
-			ctx, p, descriptorTime, changefeedStmt.Targets)
-		if err != nil {
-			return err
-		}
-		var tableDescs []sqlbase.TableDescriptor
-		for _, desc := range targetDescs {
-			if tableDesc := desc.GetTable(); tableDesc != nil {
-				tableDescs = append(tableDescs, *tableDesc)
-			}
-		}
-
-		// This makes a new changefeed so we get an error if any of the options
-		// are wrong, otherwise it would only show up as a failed job.
-		// TODO(dan): Do this validation without actually constructing a
-		// changefeed.
-		cf, err := newChangefeed(-1 /* jobID */, p.ExecCfg().DB, sinkURI, opts, tableDescs)
-		if err != nil {
-			return err
-		}
-		if err := cf.Close(); err != nil {
-			return err
-		}
-
-		job, _, err := p.ExecCfg().JobRegistry.StartJob(ctx, resultsCh, jobs.Record{
-			Description: changefeedJobDescription(changefeedStmt),
-			Username:    p.User(),
-			DescriptorIDs: func() (sqlDescIDs []sqlbase.ID) {
-				for _, desc := range targetDescs {
-					sqlDescIDs = append(sqlDescIDs, desc.GetID())
-				}
-				return sqlDescIDs
-			}(),
-			Details: jobs.ChangefeedDetails{
-				Highwater:  highwater,
-				TableDescs: tableDescs,
-				Opts:       opts,
-				SinkURI:    sinkURI,
-			},
-		})
-		if err != nil {
-			return err
-		}
-		resultsCh <- tree.Datums{
-			tree.NewDInt(tree.DInt(*job.ID())),
-		}
-		return nil
-	}
-	return fn, header, nil, nil
-}
-
-func changefeedJobDescription(changefeed *tree.CreateChangefeed) string {
-	return tree.AsStringWithFlags(changefeed, tree.FmtAlwaysQualifyTableNames)
-}
-
-type changefeed struct {
-	jobID   int64
-	sinkURI string
-	spans   []roachpb.Span
-	rf      sqlbase.RowFetcher
-
-	db               *client.DB
-	kafka            sarama.SyncProducer
-	envelope         envelopeType
-	kafkaTopicPrefix string
-
-	a sqlbase.DatumAlloc
-}
-
-func newChangefeed(
-	jobID int64,
-	db *client.DB,
-	sinkURI string,
-	opts map[string]string,
-	tableDescs []sqlbase.TableDescriptor,
-) (*changefeed, error) {
-	cf := &changefeed{
-		jobID:   jobID,
-		db:      db,
-		sinkURI: sinkURI,
-	}
-
-	switch envelopeType(opts[optEnvelope]) {
-	case ``, optEnvelopeRow:
-		cf.envelope = optEnvelopeRow
-	case optEnvelopeKeyOnly:
-		cf.envelope = optEnvelopeKeyOnly
-	default:
-		return nil, errors.Errorf(`unknown %s: %s`, optEnvelope, opts[optEnvelope])
-	}
-
-	var rfTables []sqlbase.RowFetcherTableArgs
-	for _, tableDesc := range tableDescs {
-		tableDesc := tableDesc
-		if len(tableDesc.Families) != 1 {
-			return nil, errors.Errorf(
-				`only tables with 1 column family are currently supported: %s has %d`,
-				tableDesc.Name, len(tableDesc.Families))
-		}
-		span := tableDesc.PrimaryIndexSpan()
-		cf.spans = append(cf.spans, span)
-
-		var colIDs []sqlbase.ColumnID
-		if cf.envelope == optEnvelopeKeyOnly {
-			colIDs = tableDesc.PrimaryIndex.ColumnIDs
-		} else {
-			for _, col := range tableDesc.Columns {
-				colIDs = append(colIDs, col.ID)
-			}
-		}
-		colIdxMap := make(map[sqlbase.ColumnID]int)
-		var valNeededForCol util.FastIntSet
-		for colIdx, colID := range colIDs {
-			colIdxMap[colID] = colIdx
-			valNeededForCol.Add(colIdx)
-		}
-
-		rfTables = append(rfTables, sqlbase.RowFetcherTableArgs{
-			Spans:            roachpb.Spans{span},
-			Desc:             &tableDesc,
-			Index:            &tableDesc.PrimaryIndex,
-			ColIdxMap:        colIdxMap,
-			IsSecondaryIndex: false,
-			Cols:             tableDesc.Columns,
-			ValNeededForCol:  valNeededForCol,
-		})
-	}
-	if err := cf.rf.Init(
-		false /* reverse */, false /* returnRangeInfo */, false /* isCheck */, &cf.a, rfTables...,
-	); err != nil {
-		return nil, err
-	}
-
-	// TODO(dan): Collapse any overlapping cf.spans (which only happens for
-	// interleaved tables).
-
-	uri, err := url.Parse(sinkURI)
-	if err != nil {
-		return nil, err
-	}
-	switch uri.Scheme {
-	case sinkSchemeKafka:
-		cf.kafkaTopicPrefix = uri.Query().Get(sinkParamTopicPrefix)
-		cf.kafka, err = getKafkaProducer(uri.Host)
+		desc, err := rfCache.TableDescForKey(ctx, kv.Key, schemaTimestamp)
 		if err != nil {
 			return nil, err
 		}
-	default:
-		return nil, errors.Errorf(`unsupported sink: %s`, uri.Scheme)
+		if _, ok := details.Targets[desc.ID]; !ok {
+			// This kv is for an interleaved table that we're not watching.
+			if log.V(3) {
+				log.Infof(ctx, `skipping key from unwatched table %s: %s`, desc.Name, kv.Key)
+			}
+			return nil, nil
+		}
+
+		rf, err := rfCache.RowFetcherForTableDesc(desc)
+		if err != nil {
+			return nil, err
+		}
+		// TODO(dan): Handle tables with multiple column families.
+		kvs.KVs = append(kvs.KVs, kv)
+		if err := rf.StartScanFrom(ctx, &kvs); err != nil {
+			return nil, err
+		}
+
+		for {
+			var r emitEntry
+			r.bufferGetTimestamp = bufferGetTimestamp
+			r.row.datums, r.row.tableDesc, _, err = rf.NextRow(ctx)
+			if err != nil {
+				return nil, err
+			}
+			if r.row.datums == nil {
+				break
+			}
+			r.row.datums = append(sqlbase.EncDatumRow(nil), r.row.datums...)
+			r.row.deleted = rf.RowIsDeleted()
+			r.row.updated = schemaTimestamp
+			output = append(output, r)
+		}
+		return output, nil
 	}
 
-	return cf, nil
-}
-
-func (cf *changefeed) Close() error {
-	return cf.kafka.Close()
-}
-
-func (cf *changefeed) poll(ctx context.Context, startTime, endTime hlc.Timestamp) error {
-	log.VEventf(ctx, 1, `changefeed poll job %d [%s,%s)`, cf.jobID, startTime, endTime)
-
-	// TODO(dan): Write a KVFetcher implementation backed by a sequence of
-	// sstables.
-	var kvs sqlbase.SpanKVFetcher
-	emitFunc := func(kv engine.MVCCKeyValue) (bool, error) {
-		if log.V(3) {
-			v := roachpb.Value{RawBytes: kv.Value}
-			log.Infof(ctx, `kv %s [%s] -> %s`, kv.Key.Key, kv.Key.Timestamp, v.PrettyPrint())
-		}
-		// TODO(dan): Plumb this timestamp down to record written to kafka.
-		kvs.KVs = append(kvs.KVs, roachpb.KeyValue{
-			Key: kv.Key.Key,
-			Value: roachpb.Value{
-				Timestamp: kv.Key.Timestamp,
-				RawBytes:  kv.Value,
-			},
-		})
-		return false, nil
-	}
-
-	// TODO(dan): Send these out in parallel.
-	for _, span := range cf.spans {
-		header := roachpb.Header{Timestamp: endTime}
-		req := &roachpb.ExportRequest{
-			Span:       roachpb.Span{Key: span.Key, EndKey: span.EndKey},
-			StartTime:  startTime,
-			MVCCFilter: roachpb.MVCCFilter_Latest,
-			ReturnSST:  true,
-		}
-		res, pErr := client.SendWrappedWith(ctx, cf.db.GetSender(), header, req)
-		if pErr != nil {
-			return errors.Wrapf(
-				pErr.GoError(), `fetching changes for [%s,%s)`, span.Key, span.EndKey)
-		}
-		for _, file := range res.(*roachpb.ExportResponse).Files {
-			err := func() error {
-				sst := engine.MakeRocksDBSstFileReader()
-				defer sst.Close()
-				if err := sst.IngestExternalFile(file.SST); err != nil {
-					return err
+	var output []emitEntry
+	return func(ctx context.Context) ([]emitEntry, error) {
+		// Reuse output to save allocations.
+		output = output[:0]
+		for {
+			input, err := inputFn(ctx)
+			if err != nil {
+				return nil, err
+			}
+			if input.kv.Key != nil {
+				if log.V(3) {
+					log.Infof(ctx, "changed key %s %s", input.kv.Key, input.kv.Value.Timestamp)
 				}
-				start, end := engine.MVCCKey{Key: keys.MinKey}, engine.MVCCKey{Key: keys.MaxKey}
-				return sst.Iterate(start, end, emitFunc)
-			}()
-			if err != nil {
-				return err
+				schemaTimestamp := input.kv.Value.Timestamp
+				if input.schemaTimestamp != (hlc.Timestamp{}) {
+					schemaTimestamp = input.schemaTimestamp
+				}
+				output, err = appendEmitEntryForKV(
+					ctx, output, input.kv, schemaTimestamp, input.bufferGetTimestamp)
+				if err != nil {
+					return nil, err
+				}
+			}
+			if input.resolved != nil {
+				output = append(output, emitEntry{
+					resolved:           input.resolved,
+					bufferGetTimestamp: input.bufferGetTimestamp,
+				})
+			}
+			if output != nil {
+				return output, nil
 			}
 		}
 	}
+}
 
-	if err := cf.rf.StartScanFrom(ctx, &kvs); err != nil {
-		return err
-	}
-
-	for {
-		row, tableDesc, _, err := cf.rf.NextRowDecoded(ctx)
+// emitEntries connects to a sink, receives rows from a closure, and repeatedly
+// emits them to the sink. It returns a closure that may be repeatedly called to
+// advance the changefeed and which returns span-level resolved timestamp
+// updates. The returned closure is not threadsafe. Note that rows read from
+// `inputFn` which precede or equal the Frontier of `sf` will not be emitted
+// because they're provably duplicates.
+func emitEntries(
+	settings *cluster.Settings,
+	details jobspb.ChangefeedDetails,
+	sf *spanFrontier,
+	encoder Encoder,
+	sink Sink,
+	inputFn func(context.Context) ([]emitEntry, error),
+	knobs TestingKnobs,
+	metrics *Metrics,
+) func(context.Context) ([]jobspb.ResolvedSpan, error) {
+	var scratch bufalloc.ByteAllocator
+	emitRowFn := func(ctx context.Context, row encodeRow) error {
+		// Ensure that row updates are strictly newer than the least resolved timestamp
+		// being tracked by the local span frontier. The poller should not be forwarding
+		// row updates that have timestamps less than or equal to any resolved timestamp
+		// it's forwarded before.
+		// TODO(aayush): This should be an assertion once we're confident this can never
+		// happen under any circumstance.
+		if !sf.Frontier().Less(row.updated) {
+			log.Errorf(ctx, "cdc ux violation: detected timestamp %s that is less than "+
+				"or equal to the local frontier %s.", cloudStorageFormatTime(row.updated),
+				cloudStorageFormatTime(sf.Frontier()))
+			return nil
+		}
+		var keyCopy, valueCopy []byte
+		encodedKey, err := encoder.EncodeKey(row)
 		if err != nil {
 			return err
 		}
-		if row == nil {
-			break
-		}
-		rowIsDeleted := cf.rf.RowIsDeleted()
-
-		keyColumns := tableDesc.PrimaryIndex.ColumnNames
-		jsonKeyRaw := make([]interface{}, len(keyColumns))
-		jsonValueRaw := make(map[string]interface{}, len(row))
-		for i := range row {
-			jsonValueRaw[tableDesc.Columns[i].Name], err = builtins.AsJSON(row[i])
-			if err != nil {
-				return err
-			}
-		}
-		for i, columnName := range keyColumns {
-			jsonKeyRaw[i] = jsonValueRaw[columnName]
-		}
-
-		jsonKey, err := json.MakeJSON(jsonKeyRaw)
+		scratch, keyCopy = scratch.Copy(encodedKey, 0 /* extraCap */)
+		encodedValue, err := encoder.EncodeValue(row)
 		if err != nil {
 			return err
 		}
-		var key bytes.Buffer
-		jsonKey.Format(&key)
-		var value bytes.Buffer
-		if !rowIsDeleted && cf.envelope == optEnvelopeRow {
-			jsonValue, err := json.MakeJSON(jsonValueRaw)
-			if err != nil {
+		scratch, valueCopy = scratch.Copy(encodedValue, 0 /* extraCap */)
+
+		if knobs.BeforeEmitRow != nil {
+			if err := knobs.BeforeEmitRow(ctx); err != nil {
 				return err
 			}
-			jsonValue.Format(&value)
+		}
+		if err := sink.EmitRow(
+			ctx, row.tableDesc, keyCopy, valueCopy, row.updated,
+		); err != nil {
+			return err
 		}
 		if log.V(3) {
-			log.Infof(ctx, `row %s -> %s`, key.String(), value.String())
+			log.Infof(ctx, `row %s: %s -> %s`, row.tableDesc.Name, keyCopy, valueCopy)
 		}
-
-		message := &sarama.ProducerMessage{
-			Topic: cf.kafkaTopicPrefix + tableDesc.Name,
-			Key:   sarama.ByteEncoder(key.Bytes()),
-			Value: sarama.ByteEncoder(value.Bytes()),
-		}
-		if _, _, err := cf.kafka.SendMessage(message); err != nil {
-			return errors.Wrapf(err, `sending message to kafka topic %s`, message.Topic)
-		}
+		return nil
 	}
 
+	var lastFlush time.Time
+	// TODO(dan): We could keep these in `sf` to eliminate dups.
+	var resolvedSpans []jobspb.ResolvedSpan
+
+	return func(ctx context.Context) ([]jobspb.ResolvedSpan, error) {
+		inputs, err := inputFn(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, input := range inputs {
+			if input.bufferGetTimestamp == (time.Time{}) {
+				// We could gracefully handle this instead of panic'ing, but
+				// we'd really like to be able to reason about this data, so
+				// instead we're defensive. If this is ever seen in prod without
+				// breaking a unit test, then we have a pretty severe test
+				// coverage issue.
+				panic(`unreachable: bufferGetTimestamp is set by all codepaths`)
+			}
+			processingNanos := timeutil.Since(input.bufferGetTimestamp).Nanoseconds()
+			metrics.ProcessingNanos.Inc(processingNanos)
+
+			if input.row.datums != nil {
+				if err := emitRowFn(ctx, input.row); err != nil {
+					return nil, err
+				}
+			}
+			if input.resolved != nil {
+				_ = sf.Forward(input.resolved.Span, input.resolved.Timestamp)
+				resolvedSpans = append(resolvedSpans, *input.resolved)
+			}
+		}
+
+		// If the resolved timestamp frequency is specified, use it as a rough
+		// approximation of how latency-sensitive the changefeed user is. If
+		// it's not, fall back to the poll interval.
+		//
+		// The current poller implementation means we emit a changefeed-level
+		// resolved timestamps to the user once per changefeedPollInterval. This
+		// buffering adds on average timeBetweenFlushes/2 to that latency. With
+		// timeBetweenFlushes and changefeedPollInterval both set to 1s, TPCC
+		// was seeing about 100x more time spent emitting than flushing.
+		// Dividing by 5 tries to balance these a bit, but ultimately is fairly
+		// unprincipled.
+		//
+		// NB: As long as we periodically get new span-level resolved timestamps
+		// from the poller (which should always happen, even if the watched data
+		// is not changing), then this is sufficient and we don't have to do
+		// anything fancy with timers.
+		var timeBetweenFlushes time.Duration
+		if r, ok := details.Opts[optResolvedTimestamps]; ok && r != `` {
+			var err error
+			if timeBetweenFlushes, err = time.ParseDuration(r); err != nil {
+				return nil, err
+			}
+		} else {
+			timeBetweenFlushes = changefeedPollInterval.Get(&settings.SV) / 5
+		}
+		if len(resolvedSpans) == 0 || timeutil.Since(lastFlush) < timeBetweenFlushes {
+			return nil, nil
+		}
+
+		// Make sure to flush the sink before forwarding resolved spans,
+		// otherwise, we could lose buffered messages and violate the
+		// at-least-once guarantee. This is also true for checkpointing the
+		// resolved spans in the job progress.
+		if err := sink.Flush(ctx); err != nil {
+			return nil, err
+		}
+		lastFlush = timeutil.Now()
+		if knobs.AfterSinkFlush != nil {
+			if err := knobs.AfterSinkFlush(); err != nil {
+				return nil, err
+			}
+		}
+		ret := append([]jobspb.ResolvedSpan(nil), resolvedSpans...)
+		resolvedSpans = resolvedSpans[:0]
+		return ret, nil
+	}
+}
+
+// checkpointResolvedTimestamp checkpoints a changefeed-level resolved timestamp
+// to the jobs record.
+func checkpointResolvedTimestamp(
+	ctx context.Context,
+	jobProgressedFn func(context.Context, jobs.HighWaterProgressedFn) error,
+	sf *spanFrontier,
+) error {
+	resolved := sf.Frontier()
+	var resolvedSpans []jobspb.ResolvedSpan
+	sf.Entries(func(span roachpb.Span, ts hlc.Timestamp) {
+		resolvedSpans = append(resolvedSpans, jobspb.ResolvedSpan{
+			Span: span, Timestamp: ts,
+		})
+	})
+
+	// Some benchmarks want to skip the job progress update for a bit more
+	// isolation.
+	//
+	// NB: To minimize the chance that a user sees duplicates from below
+	// this resolved timestamp, keep this update of the high-water mark
+	// before emitting the resolved timestamp to the sink.
+	if jobProgressedFn != nil {
+		progressedClosure := func(ctx context.Context, d jobspb.ProgressDetails) hlc.Timestamp {
+			// TODO(dan): This was making enormous jobs rows, especially in
+			// combination with how many mvcc versions there are. Cut down on
+			// the amount of data used here dramatically and re-enable.
+			//
+			// d.(*jobspb.Progress_Changefeed).Changefeed.ResolvedSpans = resolvedSpans
+			return resolved
+		}
+		if err := jobProgressedFn(ctx, progressedClosure); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-type changefeedResumer struct {
-	settings *cluster.Settings
-}
-
-func (b *changefeedResumer) Resume(
-	ctx context.Context, job *jobs.Job, planHookState interface{}, _ chan<- tree.Datums,
+// emitResolvedTimestamp emits a changefeed-level resolved timestamp to the
+// sink.
+func emitResolvedTimestamp(
+	ctx context.Context, encoder Encoder, sink Sink, resolved hlc.Timestamp,
 ) error {
-	details := job.Record.Details.(jobs.ChangefeedDetails)
-	p := planHookState.(sql.PlanHookState)
-
-	cf, err := newChangefeed(
-		*job.ID(), p.ExecCfg().DB, details.SinkURI, details.Opts, details.TableDescs)
-	if err != nil {
+	// TODO(dan): Emit more fine-grained (table level) resolved
+	// timestamps.
+	if err := sink.EmitResolvedTimestamp(ctx, encoder, resolved); err != nil {
 		return err
 	}
-	defer func() { _ = cf.Close() }()
-
-	highwater := details.Highwater
-	for {
-		nextHighwater := p.ExecCfg().Clock.Now()
-		// TODO(dan): nextHighwater should probably be some amount of time in
-		// the past, so we don't update a bunch of timestamp caches and cause
-		// transactions to be restarted.
-		if err := cf.poll(ctx, highwater, nextHighwater); err != nil {
-			return err
-		}
-		highwater = nextHighwater
-		log.VEventf(ctx, 1, `new highwater: %s`, highwater)
-
-		// TODO(dan): HACK for testing. We call SendMessages with nil to
-		// indicate to the test that a full poll finished. Figure out something
-		// better.
-		if err := cf.kafka.SendMessages(nil); err != nil {
-			return err
-		}
-
-		progressedFn := func(ctx context.Context, details jobs.Details) float32 {
-			cfDetails := details.(*jobs.Payload_Changefeed).Changefeed
-			cfDetails.Highwater = nextHighwater
-			// TODO(dan): Having this stuck at 0% forever is bad UX. Revisit.
-			return 0.0
-		}
-		if err := job.Progressed(ctx, progressedFn); err != nil {
-			return err
-		}
-
-		pollDuration := changefeedPollInterval.Get(&p.ExecCfg().Settings.SV)
-		pollDuration = pollDuration - timeutil.Since(timeutil.Unix(0, highwater.WallTime))
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(pollDuration): // NB: time.After handles durations < 0
-		}
+	if log.V(2) {
+		log.Infof(ctx, `resolved %s`, resolved)
 	}
-}
-
-func (b *changefeedResumer) OnFailOrCancel(context.Context, *client.Txn, *jobs.Job) error { return nil }
-func (b *changefeedResumer) OnSuccess(context.Context, *client.Txn, *jobs.Job) error      { return nil }
-func (b *changefeedResumer) OnTerminal(
-	context.Context, *jobs.Job, jobs.Status, chan<- tree.Datums,
-) {
-}
-
-func changefeedResumeHook(typ jobs.Type, settings *cluster.Settings) jobs.Resumer {
-	if typ != jobs.TypeChangefeed {
-		return nil
-	}
-	return &changefeedResumer{settings: settings}
+	return nil
 }

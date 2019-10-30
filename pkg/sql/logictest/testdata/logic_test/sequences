@@ -1,5 +1,3 @@
-# LogicTest: default distsql distsql-metadata parallel-stmts
-
 # see also files `drop_sequence`, `alter_sequence`, `rename_sequence`
 
 # USING THE `lastval` FUNCTION
@@ -84,10 +82,10 @@ statement ok
 CREATE SEQUENCE high_minvalue_test MINVALUE 5
 
 # Test unimplemented syntax.
-statement error pq: unimplemented at or near "EOF"
+statement error at or near "EOF": syntax error: unimplemented
 CREATE SEQUENCE err_test AS INT2
 
-statement error pq: unimplemented at or near "EOF"
+statement error at or near "EOF": syntax error: unimplemented
 CREATE SEQUENCE err_test OWNED BY someuser
 
 # Verify validation of START vs MINVALUE/MAXVALUE.
@@ -118,20 +116,17 @@ CREATE SEQUENCE ignored_options_test CACHE 1 NO CYCLE
 statement ok
 CREATE SEQUENCE show_create_test
 
-query ITTITTTTTTT colnames
+query ITTITTTTTTTT colnames
 SELECT * FROM crdb_internal.create_statements WHERE descriptor_name = 'show_create_test'
 ----
-database_id  database_name  schema_name  descriptor_id  descriptor_type  descriptor_name   create_statement                                                                              state   create_nofks                                                                                  alter_statements  validate_statements
-52           test           public       66             sequence         show_create_test  CREATE SEQUENCE show_create_test MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1  PUBLIC  CREATE SEQUENCE show_create_test MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1  {}                {}
+database_id  database_name  schema_name  descriptor_id  descriptor_type  descriptor_name   create_statement                                                                              state   create_nofks                                                                                  alter_statements  validate_statements zone_configuration_statements
+52           test           public       66             sequence         show_create_test  CREATE SEQUENCE show_create_test MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1  PUBLIC  CREATE SEQUENCE show_create_test MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1  {}                {}                  {}
 
 query TT colnames
 SHOW CREATE SEQUENCE show_create_test
 ----
-Sequence         CreateSequence
-show_create_test CREATE SEQUENCE show_create_test MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1
-
-statement error pq: show_create_test is not a table
-SHOW CREATE TABLE show_create_test
+table_name        create_statement
+show_create_test  CREATE SEQUENCE show_create_test MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1
 
 # DML ERRORS
 
@@ -150,6 +145,26 @@ TRUNCATE foo
 # Drop table on sequences doesn't work; you have to use DROP SEQUENCE.
 statement error pgcode 42809 "foo" is not a table
 DROP TABLE foo
+
+# List sequences with SHOW
+
+query T
+SHOW SEQUENCES
+----
+foo
+high_minvalue_test
+ignored_options_test
+lastval_test
+lastval_test_2
+show_create_test
+
+statement ok
+CREATE DATABASE seqdb; USE seqdb; CREATE SEQUENCE otherseq; USE test
+
+query T
+SHOW SEQUENCES FROM seqdb
+----
+otherseq
 
 # You can select from a sequence to get its value.
 
@@ -177,14 +192,8 @@ SELECT last_value FROM select_test
 1
 
 # Since this is a custom plan node, verify that column validation works.
-statement error pq: column name "foo" not found
+statement error pq: column "foo" does not exist
 SELECT foo from select_test
-
-query TTTTT colnames
-EXPLAIN (VERBOSE) SELECT * FROM select_test
-----
-Tree             Field  Description  Columns                           Ordering
-sequence select  ·      ·            (last_value, log_cnt, is_called)  ·
 
 # USING THE `nextval` AND `currval` FUNCTIONS
 
@@ -291,7 +300,7 @@ statement error pgcode 42809 "kv" is not a sequence
 SELECT nextval('kv')
 
 # Parse errors in the argument to nextval are handled.
-statement error pq: nextval\(\): syntax error at or near "@"
+statement error pq: nextval\(\): at or near "@": syntax error
 SELECT nextval('@#%@!324234')
 
 # You can create and find sequences from other databases.
@@ -552,7 +561,7 @@ SELECT id FROM blog_posts ORDER BY id
 1
 2
 
-# USE WITH PARALLEL STATEMENTS
+# USE WITH (DEPRECATED) PARALLEL STATEMENTS
 
 # Both accesses to the sequence value in the KV layer and the sequenceState struct in
 # the Session are serialized, so after the last parallel statement you'll get the last value.
@@ -838,3 +847,57 @@ SELECT last_value FROM priv_test
 5
 
 user root
+
+subtest virtual_sequences
+
+statement ok
+CREATE SEQUENCE sv VIRTUAL
+
+query T
+SELECT create_statement FROM [SHOW CREATE SEQUENCE sv]
+----
+CREATE SEQUENCE sv MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1 VIRTUAL
+
+statement ok
+CREATE TABLE svals(x INT)
+
+statement ok
+BEGIN;
+  INSERT INTO svals VALUES(nextval('sv'));
+  INSERT INTO svals VALUES(lastval());
+  INSERT INTO svals VALUES(currval('sv'));
+END
+
+# Check that lastval returns the last auto-generated virtual value.
+query I
+SELECT count(DISTINCT x) FROM svals
+----
+1
+
+# Check that the KV trace is empty.
+statement ok
+BEGIN;
+  SELECT nextval('sv'); -- acquire the lease, so that doesn't go to the KV trace
+  SET tracing = on; SELECT nextval('sv'); SET tracing = off;
+  COMMIT
+
+query T
+SELECT message FROM [SHOW KV TRACE FOR SESSION]
+----
+rows affected: 1
+
+statement ok
+DROP SEQUENCE sv
+
+# Check that generators can be interrupted by statement timeouts.
+subtest generator_timeout
+
+statement ok
+SET statement_timeout = 1
+
+statement error pq: query execution canceled due to statement timeout
+select * from generate_series(1,10000000) where generate_series = 0;
+
+# Clean up
+statement ok
+SET statement_timeout = 0

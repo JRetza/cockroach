@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cli
 
@@ -23,12 +19,11 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/pkg/errors"
-	"github.com/spf13/cobra"
-
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/pkg/errors"
+	"github.com/spf13/cobra"
 )
 
 const (
@@ -51,7 +46,7 @@ To retrieve the IDs for inactive members, see 'node status --decommission'.
 }
 
 func runLsNodes(cmd *cobra.Command, args []string) error {
-	conn, err := getPasswordAndMakeSQLClient("cockroach node ls")
+	conn, err := makeSQLClient("cockroach node ls", useSystemDb)
 	if err != nil {
 		return err
 	}
@@ -79,9 +74,12 @@ func runLsNodes(cmd *cobra.Command, args []string) error {
 var baseNodeColumnHeaders = []string{
 	"id",
 	"address",
+	"sql_address",
 	"build",
-	"updated_at",
 	"started_at",
+	"updated_at",
+	"locality",
+	"is_available",
 	"is_live",
 }
 
@@ -111,8 +109,8 @@ var statusNodeCmd = &cobra.Command{
 	Use:   "status [<node id>]",
 	Short: "shows the status of a node or all nodes",
 	Long: `
-	If a node ID is specified, this will show the status for the corresponding node. If no node ID
-	is specified, this will display the status for all nodes in the cluster.
+If a node ID is specified, this will show the status for the corresponding node. If no node ID
+is specified, this will display the status for all nodes in the cluster.
 	`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: MaybeDecorateGRPCError(runStatusNode),
@@ -129,70 +127,68 @@ func runStatusNode(cmd *cobra.Command, args []string) error {
 }
 
 func runStatusNodeInner(showDecommissioned bool, args []string) ([]string, [][]string, error) {
-
 	joinUsingID := func(queries []string) (query string) {
 		for i, q := range queries {
 			if i == 0 {
 				query = q
 				continue
 			}
-			query = "(" + query + ") JOIN (" + q + ") USING (id)"
+			query = "(" + query + ") LEFT JOIN (" + q + ") USING (id)"
 		}
 		return
 	}
 
 	maybeAddActiveNodesFilter := func(query string) string {
-		activeNodesFilter := "decommissioning = false OR split_part(expiration,',',1)::decimal > now()::decimal"
 		if !showDecommissioned {
-			query += " WHERE " + activeNodesFilter
+			query += " WHERE decommissioning = false OR split_part(expiration,',',1)::decimal > now()::decimal"
 		}
 		return query
 	}
 
-	baseQuery := joinUsingID(
-		[]string{
-			"SELECT node_id AS id, address, tag AS build, started_at, updated_at from crdb_internal.kv_node_status",
-			maybeAddActiveNodesFilter(
-				`SELECT node_id AS id,
-                CASE WHEN split_part(expiration,',',1)::decimal > now()::decimal
-                     THEN true
-                     ELSE false
-                     END AS is_live
-         FROM crdb_internal.gossip_liveness`,
-			),
-		},
+	baseQuery := maybeAddActiveNodesFilter(
+		`SELECT node_id AS id,
+            address,
+            sql_address,
+            build_tag AS build,
+            started_at,
+			updated_at,
+			locality,
+            CASE WHEN split_part(expiration,',',1)::decimal > now()::decimal
+                 THEN true
+                 ELSE false
+                 END AS is_available,
+			ifnull(is_live, false)
+     FROM crdb_internal.gossip_liveness LEFT JOIN crdb_internal.gossip_nodes USING (node_id)`,
 	)
 
-	rangesQuery := `
+	const rangesQuery = `
 SELECT node_id AS id,
-       SUM((metrics->>'replicas.leaders')::DECIMAL)::INT AS replicas_leaders,
-       SUM((metrics->>'replicas.leaseholders')::DECIMAL)::INT AS replicas_leaseholders,
-       SUM((metrics->>'replicas')::DECIMAL)::INT AS ranges,
-       SUM((metrics->>'ranges.underreplicated')::DECIMAL)::INT AS ranges_underreplicated,
-       SUM((metrics->>'ranges.unavailable')::DECIMAL)::INT AS ranges_unavailable
+       sum((metrics->>'replicas.leaders')::DECIMAL)::INT AS replicas_leaders,
+       sum((metrics->>'replicas.leaseholders')::DECIMAL)::INT AS replicas_leaseholders,
+       sum((metrics->>'replicas')::DECIMAL)::INT AS ranges,
+       sum((metrics->>'ranges.unavailable')::DECIMAL)::INT AS ranges_unavailable,
+       sum((metrics->>'ranges.underreplicated')::DECIMAL)::INT AS ranges_underreplicated
 FROM crdb_internal.kv_store_status
 GROUP BY node_id`
 
-	statsQuery := `
+	const statsQuery = `
 SELECT node_id AS id,
-       SUM((metrics->>'livebytes')::DECIMAL)::INT AS live_bytes,
-       SUM((metrics->>'keybytes')::DECIMAL)::INT AS key_bytes,
-       SUM((metrics->>'valbytes')::DECIMAL)::INT AS value_bytes,
-       SUM((metrics->>'intentbytes')::DECIMAL)::INT AS intent_bytes,
-       SUM((metrics->>'sysbytes')::DECIMAL)::INT AS system_bytes
+       sum((metrics->>'livebytes')::DECIMAL)::INT AS live_bytes,
+       sum((metrics->>'keybytes')::DECIMAL)::INT AS key_bytes,
+       sum((metrics->>'valbytes')::DECIMAL)::INT AS value_bytes,
+       sum((metrics->>'intentbytes')::DECIMAL)::INT AS intent_bytes,
+       sum((metrics->>'sysbytes')::DECIMAL)::INT AS system_bytes
 FROM crdb_internal.kv_store_status
 GROUP BY node_id`
 
-	decommissionQuery := joinUsingID(
-		[]string{
-			`SELECT node_id AS id, SUM((metrics->>'replicas')::DECIMAL)::INT AS gossiped_replicas
-       FROM crdb_internal.kv_store_status GROUP BY node_id`,
-			`SELECT node_id AS id, decommissioning AS is_decommissioning, draining AS is_draining
-       FROM crdb_internal.gossip_liveness`,
-		},
-	)
+	const decommissionQuery = `
+SELECT node_id AS id,
+       ranges AS gossiped_replicas,
+       decommissioning AS is_decommissioning,
+       draining AS is_draining
+FROM crdb_internal.gossip_liveness LEFT JOIN crdb_internal.gossip_nodes USING (node_id)`
 
-	conn, err := getPasswordAndMakeSQLClient("cockroach node status")
+	conn, err := makeSQLClient("cockroach node status", useSystemDb)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -216,7 +212,7 @@ GROUP BY node_id`
 		}
 	}
 
-	queryString := "SELECT * FROM " + joinUsingID(queriesToJoin)
+	queryString := "SELECT * FROM (" + joinUsingID(queriesToJoin) + ")"
 
 	switch len(args) {
 	case 0:
@@ -257,7 +253,7 @@ func getStatusNodeHeaders() []string {
 }
 
 func getStatusNodeAlignment() string {
-	align := "rllll"
+	align := "rlllll"
 	if nodeCtx.statusShowAll || nodeCtx.statusShowRanges {
 		align += "rrrrrr"
 	}
@@ -273,7 +269,7 @@ func getStatusNodeAlignment() string {
 var decommissionNodesColumnHeaders = []string{
 	"id",
 	"is_live",
-	"gossiped_replicas",
+	"replicas",
 	"is_decommissioning",
 	"is_draining",
 }
@@ -316,6 +312,9 @@ func runDecommissionNode(cmd *cobra.Command, args []string) error {
 func runDecommissionNodeImpl(
 	ctx context.Context, c serverpb.AdminClient, wait nodeDecommissionWaitType, args []string,
 ) error {
+	if wait == nodeDecommissionWaitLive {
+		fmt.Fprintln(stderr, "\n--wait=live is deprecated and is treated as --wait=all")
+	}
 	nodeIDs, err := parseNodeIDs(args)
 	if err != nil {
 		return err
@@ -351,19 +350,12 @@ func runDecommissionNodeImpl(
 		var replicaCount int64
 		allDecommissioning := true
 		for _, status := range resp.Status {
-			if wait != nodeDecommissionWaitLive || status.IsLive {
-				replicaCount += status.ReplicaCount
-			}
+			replicaCount += status.ReplicaCount
 			allDecommissioning = allDecommissioning && status.Decommissioning
 		}
 		if replicaCount == 0 && allDecommissioning {
-			if wait == nodeDecommissionWaitAll {
-				fmt.Fprintln(os.Stdout, "\nAll target nodes report that they hold no more data. "+
-					"Please verify cluster health before removing the nodes.")
-			} else {
-				fmt.Fprintln(os.Stdout, "\nDecommissioning finished. Please verify cluster health "+
-					"before removing the nodes.")
-			}
+			fmt.Fprintln(os.Stdout, "\nNo more data reported on target nodes. "+
+				"Please verify cluster health before removing the nodes.")
 			return nil
 		}
 		if wait == nodeDecommissionWaitNone {
@@ -404,9 +396,8 @@ var recommissionNodeCmd = &cobra.Command{
 	Use:   "recommission <node id 1> [<node id 2> ...]",
 	Short: "recommissions the node(s)",
 	Long: `
-For the nodes with the supplied IDs, resets the decommissioning states.
-The target nodes must be restarted, at which point the change will take
-effect and the nodes will participate in the cluster as regular nodes.
+For the nodes with the supplied IDs, resets the decommissioning states,
+signaling the affected nodes to participate in the cluster again.
 	`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: MaybeDecorateGRPCError(runRecommissionNode),
@@ -440,11 +431,7 @@ func runRecommissionNode(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := printDecommissionStatus(*resp); err != nil {
-		return err
-	}
-	fmt.Fprintln(os.Stdout, "The affected nodes must be restarted for the change to take effect.")
-	return nil
+	return printDecommissionStatus(*resp)
 }
 
 // Sub-commands for node command.
@@ -459,9 +446,7 @@ var nodeCmd = &cobra.Command{
 	Use:   "node [command]",
 	Short: "list, inspect or remove nodes",
 	Long:  "List, inspect or remove nodes.",
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return cmd.Usage()
-	},
+	RunE:  usageAndErr,
 }
 
 func init() {

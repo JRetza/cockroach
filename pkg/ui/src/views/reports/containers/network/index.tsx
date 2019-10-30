@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import classNames from "classnames";
 import { deviation as d3Deviation, mean as d3Mean } from "d3";
 import _ from "lodash";
@@ -6,9 +16,16 @@ import React from "react";
 import { Helmet } from "react-helmet";
 import { connect } from "react-redux";
 import { RouterState } from "react-router";
+import { createSelector } from "reselect";
 
 import { refreshLiveness, refreshNodes } from "src/redux/apiReducers";
-import { LivenessStatus, NodesSummary, nodesSummarySelector } from "src/redux/nodes";
+import {
+  LivenessStatus,
+  NodesSummary,
+  nodesSummarySelector,
+  selectLivenessRequestStatus,
+  selectNodeRequestStatus,
+} from "src/redux/nodes";
 import { AdminUIState } from "src/redux/state";
 import { LongToMoment, NanoToMilli } from "src/util/convert";
 import { FixLong } from "src/util/fixLong";
@@ -20,10 +37,9 @@ import {
 } from "src/views/reports/components/nodeFilterList";
 import Loading from "src/views/shared/components/loading";
 
-import spinner from "assets/spinner.gif";
-
 interface NetworkOwnProps {
   nodesSummary: NodesSummary;
+  nodeSummaryErrors: Error[];
   refreshNodes: typeof refreshNodes;
   refreshLiveness: typeof refreshLiveness;
 }
@@ -444,22 +460,30 @@ class Network extends React.Component<NetworkProps, {}> {
         <h1>Network Diagnostics</h1>
         <Loading
           loading={!contentAvailable(nodesSummary)}
+          error={this.props.nodeSummaryErrors}
           className="loading-image loading-image__spinner-left loading-image__spinner-left__padded"
-          image={spinner}
-        >
-          <div>
-            <NodeFilterList nodeIDs={filters.nodeIDs} localityRegex={filters.localityRegex} />
-            {this.renderContent(nodesSummary, filters)}
-          </div>
-        </Loading>
+          render={() => (
+            <div>
+              <NodeFilterList nodeIDs={filters.nodeIDs} localityRegex={filters.localityRegex} />
+              {this.renderContent(nodesSummary, filters)}
+            </div>
+          )}
+        />
       </div>
     );
   }
 }
 
+const nodeSummaryErrors = createSelector(
+  selectNodeRequestStatus,
+  selectLivenessRequestStatus,
+  (nodes, liveness) => [nodes.lastError, liveness.lastError],
+);
+
 function mapStateToProps(state: AdminUIState) {
   return {
     nodesSummary: nodesSummarySelector(state),
+    nodeSummaryErrors: nodeSummaryErrors(state),
   };
 }
 

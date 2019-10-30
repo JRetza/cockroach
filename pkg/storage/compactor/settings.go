@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package compactor
 
@@ -20,16 +16,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/pkg/errors"
 )
-
-func init() {
-	// Hide the advanced knobs (defined below), leaving only `enabled`
-	// user-visible.
-	minInterval.Hide()
-	thresholdBytes.Hide()
-	thresholdBytesUsedFraction.Hide()
-	thresholdBytesAvailableFraction.Hide()
-	maxSuggestedCompactionRecordAge.Hide()
-}
 
 func validateFraction(v float64) error {
 	if v >= 0 && v <= 1 { // handles +-Inf, Nan
@@ -50,11 +36,15 @@ var enabled = settings.RegisterBoolSetting(
 // all ranges to be cleared when a big table is dropped, so the
 // compactor can determine contiguous stretches and efficient delete
 // sstable files.
-var minInterval = settings.RegisterDurationSetting(
-	"compactor.min_interval",
-	"minimum time interval to wait before compacting",
-	2*time.Minute,
-)
+var minInterval = func() *settings.DurationSetting {
+	s := settings.RegisterDurationSetting(
+		"compactor.min_interval",
+		"minimum time interval to wait before compacting",
+		15*time.Second,
+	)
+	s.SetSensitive()
+	return s
+}()
 
 // thresholdBytes is the threshold in bytes of suggested
 // reclamation, after which the compactor will begin processing
@@ -63,25 +53,33 @@ var minInterval = settings.RegisterDurationSetting(
 // these are logical bytes (as in, from MVCCStats) which can't be
 // translated into SSTable-bytes. As a result, we conservatively set
 // a higher threshold.
-var thresholdBytes = settings.RegisterByteSizeSetting(
-	"compactor.threshold_bytes",
-	"minimum expected logical space reclamation required before considering an aggregated suggestion",
-	256<<20, // more than 256MiB will trigger
-)
+var thresholdBytes = func() *settings.ByteSizeSetting {
+	s := settings.RegisterByteSizeSetting(
+		"compactor.threshold_bytes",
+		"minimum expected logical space reclamation required before considering an aggregated suggestion",
+		256<<20, // more than 256MiB will trigger
+	)
+	s.SetSensitive()
+	return s
+}()
 
-// ThresholdBytesUsedFraction is the fraction of total logical
+// thresholdBytesUsedFraction is the fraction of total logical
 // bytes used which are up for suggested reclamation, after which
 // the compactor will begin processing (taking compactor min
 // interval into account). Note that this threshold handles the case
 // where a table is dropped which is a significant fraction of the
 // total space in the database, but does not exceed the absolute
 // defaultThresholdBytes threshold.
-var thresholdBytesUsedFraction = settings.RegisterValidatedFloatSetting(
-	"compactor.threshold_used_fraction",
-	"Consider suggestions for at least the given percentage of the used logical space (zero to disable)",
-	0.10, // more than 10% of space will trigger
-	validateFraction,
-)
+var thresholdBytesUsedFraction = func() *settings.FloatSetting {
+	s := settings.RegisterValidatedFloatSetting(
+		"compactor.threshold_used_fraction",
+		"consider suggestions for at least the given percentage of the used logical space (zero to disable)",
+		0.10, // more than 10% of space will trigger
+		validateFraction,
+	)
+	s.SetSensitive()
+	return s
+}()
 
 // thresholdBytesAvailableFraction is the fraction of remaining
 // available space on a disk, which, if exceeded by the size of a suggested
@@ -89,18 +87,26 @@ var thresholdBytesUsedFraction = settings.RegisterValidatedFloatSetting(
 // threshold is meant to make compaction more aggressive when a store is
 // nearly full, since reclaiming space is much more important in such
 // scenarios.	ThresholdBytesAvailableFraction() float64
-var thresholdBytesAvailableFraction = settings.RegisterValidatedFloatSetting(
-	"compactor.threshold_available_fraction",
-	"Consider suggestions for at least the given percentage of the available logical space (zero to disable)",
-	0.10, // more than 10% of space will trigger
-	validateFraction,
-)
+var thresholdBytesAvailableFraction = func() *settings.FloatSetting {
+	s := settings.RegisterValidatedFloatSetting(
+		"compactor.threshold_available_fraction",
+		"consider suggestions for at least the given percentage of the available logical space (zero to disable)",
+		0.10, // more than 10% of space will trigger
+		validateFraction,
+	)
+	s.SetSensitive()
+	return s
+}()
 
 // maxSuggestedCompactionRecordAge is the maximum age of a
 // suggested compaction record. If not processed within this time
 // interval since the compaction was suggested, it will be deleted.
-var maxSuggestedCompactionRecordAge = settings.RegisterNonNegativeDurationSetting(
-	"compactor.max_record_age",
-	"discard suggestions not processed within this duration",
-	24*time.Hour,
-)
+var maxSuggestedCompactionRecordAge = func() *settings.DurationSetting {
+	s := settings.RegisterNonNegativeDurationSetting(
+		"compactor.max_record_age",
+		"discard suggestions not processed within this duration",
+		24*time.Hour,
+	)
+	s.SetSensitive()
+	return s
+}()

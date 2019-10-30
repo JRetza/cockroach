@@ -1,5 +1,3 @@
-# LogicTest: default opt distsql distsql-opt distsql-metadata
-
 # Test querying deeply interleaved tables.
 
 statement ok

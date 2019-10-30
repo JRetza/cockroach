@@ -1,18 +1,15 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 #include "snapshot.h"
+#include "encoding.h"
 #include "getter.h"
 #include "iterator.h"
 #include "status.h"
@@ -34,6 +31,8 @@ DBStatus DBSnapshot::Get(DBKey key, DBString* value) {
 
 DBStatus DBSnapshot::Delete(DBKey key) { return FmtStatus("unsupported"); }
 
+DBStatus DBSnapshot::SingleDelete(DBKey key) { return FmtStatus("unsupported"); }
+
 DBStatus DBSnapshot::DeleteRange(DBKey start, DBKey end) { return FmtStatus("unsupported"); }
 
 DBStatus DBSnapshot::CommitBatch(bool sync) { return FmtStatus("unsupported"); }
@@ -42,18 +41,26 @@ DBStatus DBSnapshot::ApplyBatchRepr(DBSlice repr, bool sync) { return FmtStatus(
 
 DBSlice DBSnapshot::BatchRepr() { return ToDBSlice("unsupported"); }
 
-DBIterator* DBSnapshot::NewIter(rocksdb::ReadOptions* read_opts) {
-  read_opts->snapshot = snapshot;
-  DBIterator* iter = new DBIterator(iters);
-  iter->rep.reset(rep->NewIterator(*read_opts));
+DBIterator* DBSnapshot::NewIter(DBIterOptions iter_options) {
+  DBIterator* iter = new DBIterator(iters, iter_options);
+  iter->read_opts.snapshot = snapshot;
+  iter->rep.reset(rep->NewIterator(iter->read_opts));
   return iter;
 }
 
 DBStatus DBSnapshot::GetStats(DBStatsResult* stats) { return FmtStatus("unsupported"); }
 
+DBStatus DBSnapshot::GetTickersAndHistograms(DBTickersAndHistogramsResult* stats) {
+  return FmtStatus("unsupported");
+}
+
 DBString DBSnapshot::GetCompactionStats() { return ToDBString("unsupported"); }
 
 DBStatus DBSnapshot::GetEnvStats(DBEnvStatsResult* stats) { return FmtStatus("unsupported"); }
+
+DBStatus DBSnapshot::GetEncryptionRegistries(DBEncryptionRegistries* result) {
+  return FmtStatus("unsupported");
+}
 
 DBStatus DBSnapshot::EnvWriteFile(DBSlice path, DBSlice contents) {
   return FmtStatus("unsupported");
@@ -75,7 +82,11 @@ DBStatus DBSnapshot::EnvAppendFile(rocksdb::WritableFile* file, DBSlice contents
   return FmtStatus("unsupported");
 }
 
-DBStatus DBSnapshot::EnvDeleteFile(DBSlice path) {
+DBStatus DBSnapshot::EnvDeleteFile(DBSlice path) { return FmtStatus("unsupported"); }
+
+DBStatus DBSnapshot::EnvDeleteDirAndFiles(DBSlice dir) { return FmtStatus("unsupported"); }
+
+DBStatus DBSnapshot::EnvLinkFile(DBSlice oldname, DBSlice newname) {
   return FmtStatus("unsupported");
 }
 

@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import _ from "lodash";
 import React from "react";
 import ReactPaginate from "react-paginate";
@@ -136,9 +146,9 @@ class RangesMain extends React.Component<RangesMainProps, RangesMainState> {
       errors = errors.concat(statuses.errors.map(err => err.message));
 
       // Build list of all nodes for static ordering.
-      const nodeIDs = _(statuses.ranges).flatMap((range: protos.cockroach.server.serverpb.RaftRangeStatus$Properties) => {
+      const nodeIDs = _(statuses.ranges).flatMap((range: protos.cockroach.server.serverpb.IRaftRangeStatus) => {
         return range.nodes;
-      }).map((node: protos.cockroach.server.serverpb.RaftRangeNode$Properties) => {
+      }).map((node: protos.cockroach.server.serverpb.IRaftRangeNode) => {
         return node.node_id;
       }).uniq().sort().value();
 
@@ -190,7 +200,7 @@ class RangesMain extends React.Component<RangesMainProps, RangesMainState> {
         // Render each replica into a cell
         range.nodes.forEach((node) => {
           const nodeRange = node.range;
-          const replicaLocations = nodeRange.state.state.desc.replicas.map(
+          const replicaLocations = nodeRange.state.state.desc.internal_replicas.map(
             (replica) => "(Node " + replica.node_id.toString() +
               " Store " + replica.store_id.toString() +
               " ReplicaID " + replica.replica_id.toString() + ")",

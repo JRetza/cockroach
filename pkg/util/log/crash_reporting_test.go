@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package log
 
@@ -19,19 +15,29 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"reflect"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/kr/pretty"
 	"github.com/pkg/errors"
 )
+
+// Renumber lines so they're stable no matter what changes above. (We
+// could make the regexes accept any string of digits, but we also
+// want to make sure that the correct line numbers get captured).
+//
+//line crash_reporting_test.go:1000
 
 type safeErrorTestCase struct {
 	format string
 	rs     []interface{}
 	expErr string
+	expStr string
 }
 
 // Exposed globally so it can be injected with platform-specific tests.
@@ -43,7 +49,7 @@ var safeErrorTestCases = func() []safeErrorTestCase {
 	var errWrapped3 = errors.Wrap(errWrapped2, "not recoverable :(")
 	var errWrappedSentinel = errors.Wrap(errors.Wrapf(errSentinel, "unseen"), "unsung")
 
-	runtimeErr := &runtime.TypeAssertionError{}
+	runtimeErr := makeTypeAssertionErr()
 
 	return []safeErrorTestCase{
 		{
@@ -51,62 +57,73 @@ var safeErrorTestCases = func() []safeErrorTestCase {
 			// error but a safeError is returned.
 			format: "", rs: []interface{}{context.DeadlineExceeded},
 			expErr: "?:0: context.deadlineExceededError: context deadline exceeded",
+			expStr: "%!(EXTRA context.deadlineExceededError=context deadline exceeded)",
 		},
 		{
 			// Intended result of panic(runtimeErr) which exhibits special case of known safe error.
 			format: "", rs: []interface{}{runtimeErr},
-			expErr: "?:0: *runtime.TypeAssertionError: interface conversion: interface is nil, not ",
+			expErr: "?:0: *runtime.TypeAssertionError: interface conversion: interface {} is nil, not int",
+			expStr: "",
 		},
 		{
 			// Same as last, but skipping through to the cause: panic(errors.Wrap(safeErr, "gibberish")).
 			format: "", rs: []interface{}{errors.Wrap(runtimeErr, "unseen")},
-			expErr: "?:0: crash_reporting_test.go:62: caused by *errors.withMessage: caused by *runtime.TypeAssertionError: interface conversion: interface is nil, not ",
+			expErr: "?:0: crash_reporting_test.go:1035: caused by *errors.withMessage: caused by *runtime.TypeAssertionError: interface conversion: interface {} is nil, not int",
+			expStr: "",
 		},
 		{
 			// Special-casing switched off when format string present.
 			format: "%s", rs: []interface{}{runtimeErr},
-			expErr: "?:0: %s | *runtime.TypeAssertionError: interface conversion: interface is nil, not ",
+			expErr: "?:0: %s | *runtime.TypeAssertionError: interface conversion: interface {} is nil, not int",
+			expStr: "interface conversion: interface {} is nil, not int",
 		},
 		{
 			// Special-casing switched off when more than one reportable present.
 			format: "", rs: []interface{}{runtimeErr, "foo"},
-			expErr: "?:0: *runtime.TypeAssertionError: interface conversion: interface is nil, not ; string",
+			expErr: "?:0: *runtime.TypeAssertionError: interface conversion: interface {} is nil, not int; string",
+			expStr: "",
 		},
 		{
-			format: "I like %s and %q and my pin code is %d", rs: []interface{}{Safe("A"), &SafeType{V: "B"}, 1234},
-			expErr: "?:0: I like %s and %q and my pin code is %d | A; B; int",
+			format: "I like %s and %q and my pin code is %d or %d", rs: []interface{}{Safe("A"), &SafeType{V: "B"}, 1234, Safe(9999)},
+			expErr: "?:0: I like %s and %q and my pin code is %d or %d | A; B; int; 9999",
+			expStr: "I like A and \"B\" and my pin code is 1234 or 9999",
 		},
 		{
 			format: "outer %+v", rs: []interface{}{
 				errors.Wrapf(context.Canceled, "this will unfortunately be lost: %d", Safe(6)),
 			},
-			expErr: "?:0: outer %+v | crash_reporting_test.go:81: caused by *errors.withMessage: caused by *errors.errorString: context canceled",
+			expErr: "?:0: outer %+v | crash_reporting_test.go:1058: caused by *errors.withMessage: caused by *errors.errorString: context canceled",
+			expStr: "",
 		},
 		{
 			// Verify that the special case still scrubs inside of the error.
 			format: "", rs: []interface{}{&os.LinkError{Op: "moo", Old: "sec", New: "cret", Err: errors.New("assumed safe")}},
 			expErr: "?:0: *os.LinkError: moo <redacted> <redacted>: assumed safe",
+			expStr: "",
 		},
 		{
 			// Verify that unknown sentinel errors print at least their type (regression test).
 			// Also, that its Error() is never called (since it would panic).
 			format: "%s", rs: []interface{}{errWrappedSentinel},
-			expErr: "?:0: %s | crash_reporting_test.go:44: caused by *errors.withMessage: caused by crash_reporting_test.go:44: caused by *errors.withMessage: caused by struct { error }",
+			expErr: "?:0: %s | crash_reporting_test.go:1015: caused by *errors.withMessage: caused by crash_reporting_test.go:1015: caused by *errors.withMessage: caused by struct { error }",
+			expStr: "",
 		},
 		{
 			format: "", rs: []interface{}{errWrapped3},
-			expErr: "?:0: crash_reporting_test.go:43: caused by *errors.withMessage: caused by crash_reporting_test.go:42: caused by *errors.withMessage: caused by crash_reporting_test.go:41: caused by *errors.withMessage: caused by crash_reporting_test.go:40",
+			expErr: "?:0: crash_reporting_test.go:1014: caused by *errors.withMessage: caused by crash_reporting_test.go:1013: caused by *errors.withMessage: caused by crash_reporting_test.go:1012: caused by *errors.withMessage: caused by crash_reporting_test.go:1011",
+			expStr: "",
 		},
 		{
 			format: "", rs: []interface{}{&net.OpError{Op: "write", Net: "tcp", Source: &util.UnresolvedAddr{AddressField: "sensitive-source"}, Addr: &util.UnresolvedAddr{AddressField: "sensitive-addr"}, Err: errors.New("not safe")}},
-			expErr: "?:0: *net.OpError: write tcp redacted->redacted: crash_reporting_test.go:101",
+			expErr: "?:0: *net.OpError: write tcp redacted->redacted: crash_reporting_test.go:1082",
+			expStr: "",
 		},
 	}
 }()
 
 func TestCrashReportingSafeError(t *testing.T) {
 	for _, test := range safeErrorTestCases {
-		t.Run("", func(t *testing.T) {
+		t.Run("safeErr", func(t *testing.T) {
 			err := ReportablesToSafeError(0, test.format, test.rs)
 			if err == nil {
 				t.Fatal(err)
@@ -119,6 +136,14 @@ func TestCrashReportingSafeError(t *testing.T) {
 				t.Errorf("expected:\n%q\ngot:\n%q", test.expErr, errStr)
 			}
 		})
+		if test.expStr != "" {
+			t.Run("fmt", func(t *testing.T) {
+				msg := fmt.Sprintf(test.format, test.rs...)
+				if msg != test.expStr {
+					t.Errorf("expected:\n%q\ngot:\n%q", test.expStr, msg)
+				}
+			})
+		}
 	}
 }
 
@@ -181,5 +206,47 @@ func TestWithCause(t *testing.T) {
 
 	if act != exp {
 		t.Fatalf("wanted %s, got %s", exp, act)
+	}
+}
+
+// makeTypeAssertionErr returns a runtime.Error with the message:
+//     interface conversion: interface {} is nil, not int
+func makeTypeAssertionErr() (result runtime.Error) {
+	defer func() {
+		e := recover()
+		result = e.(runtime.Error)
+	}()
+	var x interface{}
+	_ = x.(int)
+	return nil
+}
+
+func genStack2() *StackTrace {
+	return NewStackTrace(0)
+}
+
+func genStack1() *StackTrace {
+	return genStack2()
+}
+
+func TestStackTrace(t *testing.T) {
+	st := genStack1()
+
+	t.Logf("Stack trace:\n%s", PrintStackTrace(st))
+
+	encoded := EncodeStackTrace(st)
+	t.Logf("encoded:\n%s", encoded)
+	if !strings.Contains(encoded, `"function":"genStack1"`) ||
+		!strings.Contains(encoded, `"function":"genStack2"`) {
+		t.Fatalf("function genStack not in call stack:\n%s", encoded)
+	}
+
+	st2, b := DecodeStackTrace(encoded)
+	if !b {
+		t.Fatalf("decode failed")
+	}
+
+	if !reflect.DeepEqual(st, st2) {
+		t.Fatalf("stack traces not identical: %v", pretty.Diff(st, st2))
 	}
 }

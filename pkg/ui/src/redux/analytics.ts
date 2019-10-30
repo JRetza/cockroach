@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import Analytics from "analytics-node";
 import { Location } from "history";
 import _ from "lodash";
@@ -6,8 +16,9 @@ import { Store } from "redux";
 import * as protos from "src/js/protos";
 import { versionsSelector } from "src/redux/alerts";
 import { store, history, AdminUIState } from "src/redux/state";
+import { COCKROACHLABS_ADDR } from "src/util/cockroachlabsAPI";
 
-type ClusterResponse = protos.cockroach.server.serverpb.ClusterResponse$Properties;
+type ClusterResponse = protos.cockroach.server.serverpb.IClusterResponse;
 
 /**
  * List of current redactions needed for pages tracked by the Admin UI.
@@ -38,6 +49,11 @@ export const defaultRedactions = [
             }
             return original.replace(localities, redactedLocalities);
         },
+    },
+    // The statement details page, with a full SQL statement in the URL.
+    {
+        match: new RegExp("/statement/.*"),
+        replace: "/statement/[statement]",
     },
 ];
 
@@ -238,7 +254,10 @@ export class AnalyticsSync {
 // Create a global instance of AnalyticsSync which can be used from various
 // packages. If enabled, this instance will push to segment using the following
 // analytics key.
-const analyticsInstance = new Analytics("5Vbp8WMYDmZTfCwE0uiUqEdAcTiZWFDb");
+const analyticsOpts = {
+  host: COCKROACHLABS_ADDR + "/api/segment",
+};
+const analyticsInstance = new Analytics("5Vbp8WMYDmZTfCwE0uiUqEdAcTiZWFDb", analyticsOpts);
 export const analytics = new AnalyticsSync(analyticsInstance, store, defaultRedactions);
 
 // Attach a listener to the history object which will track a 'page' event
@@ -255,6 +274,8 @@ history.listen((location) => {
   }
   lastPageLocation = location;
   analytics.page(location);
+  // Identify the cluster.
+  analytics.identify();
 });
 
 // Record the initial page that was accessed; listen won't fire for the first

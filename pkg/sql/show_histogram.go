@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -19,11 +15,11 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // Ideally, we would want upper_bound to have the type of the column the
@@ -31,8 +27,9 @@ import (
 // the schema depends on its parameters.
 var showHistogramColumns = sqlbase.ResultColumns{
 	{Name: "upper_bound", Typ: types.String},
-	{Name: "num_range", Typ: types.Int},
-	{Name: "num_eq", Typ: types.Int},
+	{Name: "range_rows", Typ: types.Int},
+	{Name: "distinct_range_rows", Typ: types.Float},
+	{Name: "equal_rows", Typ: types.Int},
 }
 
 // ShowHistogram returns a SHOW HISTOGRAM statement.
@@ -59,7 +56,7 @@ func (p *planner) ShowHistogram(ctx context.Context, n *tree.ShowHistogram) (pla
 				return nil, fmt.Errorf("histogram %d not found", n.HistogramID)
 			}
 			if len(row) != 1 {
-				return nil, errors.Errorf("programming error: expected 1 column from internal query")
+				return nil, errors.AssertionFailedf("expected 1 column from internal query")
 			}
 			if row[0] == tree.DNull {
 				// We found a statistic, but it has no histogram.
@@ -84,6 +81,7 @@ func (p *planner) ShowHistogram(ctx context.Context, n *tree.ShowHistogram) (pla
 				row := tree.Datums{
 					tree.NewDString(ed.String(&histogram.ColumnType)),
 					tree.NewDInt(tree.DInt(b.NumRange)),
+					tree.NewDFloat(tree.DFloat(b.DistinctRange)),
 					tree.NewDInt(tree.DInt(b.NumEq)),
 				}
 				if _, err := v.rows.AddRow(ctx, row); err != nil {

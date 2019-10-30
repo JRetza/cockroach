@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package json
 
@@ -274,8 +270,8 @@ func TestJSONErrors(t *testing.T) {
 			if !strings.Contains(err.Error(), tc.msg) {
 				t.Fatalf("expected error message to be '%s', but was '%s'", tc.msg, err.Error())
 			}
-			if _, ok := err.(*pgerror.Error); !ok {
-				t.Fatalf("expected parsing '%s' to be a pgerror", tc.input)
+			if !pgerror.HasCandidateCode(err) {
+				t.Fatalf("expected parsing '%s' to provide a pg error code", tc.input)
 			}
 		})
 	}
@@ -614,9 +610,9 @@ func TestJSONFetchIdx(t *testing.T) {
 		idx      int
 		expected JSON
 	}{
-		`{}`: {{1, nil}, {2, nil}},
+		`{}`:                     {{1, nil}, {2, nil}},
 		`{"foo": 1, "1": "baz"}`: {{0, nil}, {1, nil}, {2, nil}},
-		`[]`: {{-1, nil}, {0, nil}, {1, nil}},
+		`[]`:                     {{-1, nil}, {0, nil}, {1, nil}},
 		`["a", "b", "c"]`: {
 			// Negative indices count from the back.
 			{-4, nil},
@@ -695,7 +691,7 @@ func TestJSONExists(t *testing.T) {
 			{`baz`, false},
 		},
 		`["a"]`: {{``, false}, {`0`, false}, {`a`, true}},
-		`"a"`:   {{``, false}, {`0`, false}, {`a`, false}},
+		`"a"`:   {{``, false}, {`0`, false}, {`a`, true}},
 		`1`:     {{``, false}, {`0`, false}, {`a`, false}},
 		`true`:  {{``, false}, {`0`, false}, {`a`, false}},
 	}
@@ -1283,6 +1279,42 @@ func TestEncodeJSONInvertedIndex(t *testing.T) {
 				t.Errorf("unexpected encoding mismatch for %v. expected [%#v], got [%#v]",
 					c.value, c.expEnc[j], path)
 			}
+		}
+	}
+}
+
+func TestNumInvertedIndexEntries(t *testing.T) {
+	testCases := []struct {
+		value    string
+		expCount int
+	}{
+		{`1`, 1},
+		{`"a"`, 1},
+		{`null`, 1},
+		{`false`, 1},
+		{`true`, 1},
+		{`[]`, 1},
+		{`{}`, 1},
+		{`[[[]]]`, 1},
+		{`[[{}]]`, 1},
+		{`[{}, []]`, 2},
+		{`[1]`, 1},
+		{`[1, 2]`, 2},
+		{`[1, [1]]`, 2},
+		{`[1, 2, 1, 2]`, 2},
+		{`[[1, 2], [2, 3]]`, 3},
+		{`[{"a": 1, "b": 2}]`, 2},
+		{`[{"a": 1, "b": 2}, {"a": 1, "b": 3}]`, 3},
+		{`[{"a": [1, 2], "b": 2}, {"a": [1, 3], "b": 3}]`, 5},
+	}
+	for _, c := range testCases {
+		n, err := NumInvertedIndexEntries(jsonTestShorthand(c.value))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n != c.expCount {
+			t.Errorf("unexpected count of index entries for %v. expected %d, got %d",
+				c.value, c.expCount, n)
 		}
 	}
 }
@@ -1885,6 +1917,14 @@ func BenchmarkFetchKey(b *testing.B) {
 				}
 			})
 		})
+	}
+}
+
+func BenchmarkJSONNumInvertedIndexEntries(b *testing.B) {
+	j := jsonTestShorthand(sampleJSON)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = NumInvertedIndexEntries(j)
 	}
 }
 

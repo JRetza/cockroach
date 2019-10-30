@@ -1,24 +1,19 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package kv
 
 import (
-	"github.com/pkg/errors"
-
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/pkg/errors"
 )
 
 var emptySpan = roachpb.Span{}
@@ -35,7 +30,7 @@ var emptySpan = roachpb.Span{}
 // then truncate(ba,rs) returns a batch (Put[a], Put[b]) and positions [0,2].
 func truncate(ba roachpb.BatchRequest, rs roachpb.RSpan) (roachpb.BatchRequest, []int, error) {
 	truncateOne := func(args roachpb.Request) (bool, roachpb.Span, error) {
-		header := args.Header()
+		header := args.Header().Span()
 		if !roachpb.IsRange(args) {
 			// This is a point request.
 			if len(header.EndKey) > 0 {
@@ -103,17 +98,19 @@ func truncate(ba roachpb.BatchRequest, rs roachpb.RSpan) (roachpb.BatchRequest, 
 	truncBA := ba
 	truncBA.Requests = nil
 	for pos, arg := range ba.Requests {
-		hasRequest, newHeader, err := truncateOne(arg.GetInner())
+		hasRequest, newSpan, err := truncateOne(arg.GetInner())
 		if hasRequest {
 			// Keep the old one. If we must adjust the header, must copy.
-			if inner := ba.Requests[pos].GetInner(); newHeader.EqualValue(inner.Header()) {
+			inner := ba.Requests[pos].GetInner()
+			oldHeader := inner.Header()
+			if newSpan.EqualValue(oldHeader.Span()) {
 				truncBA.Requests = append(truncBA.Requests, ba.Requests[pos])
 			} else {
-				var union roachpb.RequestUnion
+				oldHeader.SetSpan(newSpan)
 				shallowCopy := inner.ShallowCopy()
-				shallowCopy.SetHeader(newHeader)
-				union.MustSetInner(shallowCopy)
-				truncBA.Requests = append(truncBA.Requests, union)
+				shallowCopy.SetHeader(oldHeader)
+				truncBA.Requests = append(truncBA.Requests, roachpb.RequestUnion{})
+				truncBA.Requests[len(truncBA.Requests)-1].MustSetInner(shallowCopy)
 			}
 			positions = append(positions, pos)
 		}
@@ -139,9 +136,6 @@ func prev(ba roachpb.BatchRequest, k roachpb.RKey) (roachpb.RKey, error) {
 	candidate := roachpb.RKeyMin
 	for _, union := range ba.Requests {
 		inner := union.GetInner()
-		if _, ok := inner.(*roachpb.NoopRequest); ok {
-			continue
-		}
 		h := inner.Header()
 		addr, err := keys.Addr(h.Key)
 		if err != nil {
@@ -210,9 +204,6 @@ func next(ba roachpb.BatchRequest, k roachpb.RKey) (roachpb.RKey, error) {
 	candidate := roachpb.RKeyMax
 	for _, union := range ba.Requests {
 		inner := union.GetInner()
-		if _, ok := inner.(*roachpb.NoopRequest); ok {
-			continue
-		}
 		h := inner.Header()
 		addr, err := keys.Addr(h.Key)
 		if err != nil {

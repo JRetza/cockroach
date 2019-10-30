@@ -1,5 +1,3 @@
-# LogicTest: default opt parallel-stmts distsql distsql-opt distsql-metadata distsql-disk
-
 ##
 # Test a primary key with a collated string in second position (cannot get a key range).
 #

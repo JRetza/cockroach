@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package builtins
 
@@ -19,23 +15,29 @@ import (
 	"fmt"
 	"math/rand"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestCategory(t *testing.T) {
-	if expected, actual := categoryString, Builtins["lower"][0].Category; expected != actual {
+	defer leaktest.AfterTest(t)()
+	if expected, actual := categoryString, builtins["lower"].props.Category; expected != actual {
 		t.Fatalf("bad category: expected %q got %q", expected, actual)
 	}
-	if expected, actual := categoryString, Builtins["length"][0].Category; expected != actual {
+	if expected, actual := categoryString, builtins["length"].props.Category; expected != actual {
 		t.Fatalf("bad category: expected %q got %q", expected, actual)
 	}
-	if expected, actual := categoryDateAndTime, Builtins["now"][0].Category; expected != actual {
+	if expected, actual := categoryDateAndTime, builtins["now"].props.Category; expected != actual {
 		t.Fatalf("bad category: expected %q got %q", expected, actual)
 	}
-	if expected, actual := categorySystemInfo, Builtins["version"][0].Category; expected != actual {
+	if expected, actual := categorySystemInfo, builtins["version"].props.Category; expected != actual {
 		t.Fatalf("bad category: expected %q got %q", expected, actual)
 	}
 }
@@ -43,6 +45,7 @@ func TestCategory(t *testing.T) {
 // TestGenerateUniqueIDOrder verifies the expected ordering of
 // GenerateUniqueID.
 func TestGenerateUniqueIDOrder(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	tests := []tree.DInt{
 		GenerateUniqueID(0, 0),
 		GenerateUniqueID(1, 0),
@@ -60,8 +63,15 @@ func TestGenerateUniqueIDOrder(t *testing.T) {
 }
 
 func TestStringToArrayAndBack(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	// s allows us to have a string pointer literal.
 	s := func(x string) *string { return &x }
+	fs := func(x *string) string {
+		if x != nil {
+			return *x
+		}
+		return "<nil>"
+	}
 	cases := []struct {
 		input    string
 		sep      *string
@@ -89,7 +99,7 @@ func TestStringToArrayAndBack(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		t.Run(fmt.Sprintf("string_to_array(%q, %q)", tc.input, tc.sep), func(t *testing.T) {
+		t.Run(fmt.Sprintf("string_to_array(%q, %q)", tc.input, fs(tc.sep)), func(t *testing.T) {
 			result, err := stringToArray(tc.input, tc.sep, tc.nullStr)
 			if err != nil {
 				t.Fatal(err)
@@ -111,18 +121,21 @@ func TestStringToArrayAndBack(t *testing.T) {
 				t.Errorf("expected %v, got %v", tc.expected, result)
 			}
 
-			s, err := arrayToString(result.(*tree.DArray), tc.sep, tc.nullStr)
+			if tc.sep == nil {
+				return
+			}
+
+			s, err := arrayToString(result.(*tree.DArray), *tc.sep, tc.nullStr)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if tc.sep == nil {
-				if s != tree.DNull {
-					t.Errorf("expected null, found %s", s)
-				}
-				return
+			if s == tree.DNull {
+				t.Errorf("expected not null, found null")
 			}
-			fmt.Println(s)
-			if string(*s.(*tree.DString)) != tc.input {
+
+			ds := s.(*tree.DString)
+			fmt.Println(ds)
+			if string(*ds) != tc.input {
 				t.Errorf("original %s, roundtripped %s", tc.input, s)
 			}
 		})
@@ -130,6 +143,7 @@ func TestStringToArrayAndBack(t *testing.T) {
 }
 
 func TestEscapeFormat(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	testCases := []struct {
 		bytes []byte
 		str   string
@@ -165,6 +179,7 @@ func TestEscapeFormat(t *testing.T) {
 }
 
 func TestEscapeFormatRandom(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	for i := 0; i < 1000; i++ {
 		b := make([]byte, rand.Intn(100))
 		for j := 0; j < len(b); j++ {
@@ -182,8 +197,9 @@ func TestEscapeFormatRandom(t *testing.T) {
 }
 
 func TestLPadRPad(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	testCases := []struct {
-		padFn    func(*tree.EvalContext, string, int, string) (string, error)
+		padFn    func(string, int, string) (string, error)
 		str      string
 		length   int
 		fill     string
@@ -219,9 +235,8 @@ func TestLPadRPad(t *testing.T) {
 		{rpad, "Hello", 8, "世界", "Hello世界世"},
 		{rpad, "foo", -1, "世界", ""},
 	}
-	evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 	for _, tc := range testCases {
-		out, err := tc.padFn(evalCtx, tc.str, tc.length, tc.fill)
+		out, err := tc.padFn(tc.str, tc.length, tc.fill)
 		if err != nil {
 			t.Errorf("Found err %v, expected nil", err)
 		}
@@ -231,12 +246,65 @@ func TestLPadRPad(t *testing.T) {
 	}
 }
 
-func TestAllTypesAsJSON(t *testing.T) {
-	for _, typ := range types.AnyNonArray {
-		d := tree.SampleDatum(typ)
-		_, err := AsJSON(d)
-		if err != nil {
-			t.Errorf("couldn't convert %s to JSON: %s", d, err)
+func TestTruncateTimestamp(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	loc, err := timeutil.LoadLocation("Australia/Sydney")
+	require.NoError(t, err)
+
+	testCases := []struct {
+		fromTime time.Time
+		timeSpan string
+		expected *tree.DTimestampTZ
+	}{
+		{time.Date(2118, time.March, 11, 5, 6, 7, 80009001, loc), "millennium", tree.MakeDTimestampTZ(time.Date(2001, time.January, 1, 0, 0, 0, 0, loc), time.Microsecond)},
+		{time.Date(2118, time.March, 11, 5, 6, 7, 80009001, loc), "century", tree.MakeDTimestampTZ(time.Date(2101, time.January, 1, 0, 0, 0, 0, loc), time.Microsecond)},
+		{time.Date(2118, time.March, 11, 5, 6, 7, 80009001, loc), "decade", tree.MakeDTimestampTZ(time.Date(2110, time.January, 1, 0, 0, 0, 0, loc), time.Microsecond)},
+		{time.Date(2118, time.March, 11, 5, 6, 7, 80009001, loc), "year", tree.MakeDTimestampTZ(time.Date(2118, time.January, 1, 0, 0, 0, 0, loc), time.Microsecond)},
+		{time.Date(2118, time.March, 11, 5, 6, 7, 80009001, loc), "quarter", tree.MakeDTimestampTZ(time.Date(2118, time.January, 1, 0, 0, 0, 0, loc), time.Microsecond)},
+		{time.Date(2118, time.March, 11, 5, 6, 7, 80009001, loc), "month", tree.MakeDTimestampTZ(time.Date(2118, time.March, 1, 0, 0, 0, 0, loc), time.Microsecond)},
+		{time.Date(2118, time.March, 11, 5, 6, 7, 80009001, loc), "day", tree.MakeDTimestampTZ(time.Date(2118, time.March, 11, 0, 0, 0, 0, loc), time.Microsecond)},
+		{time.Date(2118, time.March, 11, 5, 6, 7, 80009001, loc), "week", tree.MakeDTimestampTZ(time.Date(2118, time.March, 6, 0, 0, 0, 0, loc), time.Microsecond)},
+		{time.Date(2118, time.March, 11, 5, 6, 7, 80009001, loc), "hour", tree.MakeDTimestampTZ(time.Date(2118, time.March, 11, 5, 0, 0, 0, loc), time.Microsecond)},
+		{time.Date(2118, time.March, 11, 5, 6, 7, 80009001, loc), "second", tree.MakeDTimestampTZ(time.Date(2118, time.March, 11, 5, 6, 7, 0, loc), time.Microsecond)},
+		{time.Date(2118, time.March, 11, 5, 6, 7, 80009001, loc), "millisecond", tree.MakeDTimestampTZ(time.Date(2118, time.March, 11, 5, 6, 7, 80000000, loc), time.Microsecond)},
+		{time.Date(2118, time.March, 11, 5, 6, 7, 80009001, loc), "microsecond", tree.MakeDTimestampTZ(time.Date(2118, time.March, 11, 5, 6, 7, 80009000, loc), time.Microsecond)},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.timeSpan, func(t *testing.T) {
+			result, err := truncateTimestamp(nil, tc.fromTime, tc.timeSpan)
+			require.NoError(t, err)
+			assert.Equal(t, tc.expected, result)
+		})
+	}
+}
+
+func TestFloatWidthBucket(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	testCases := []struct {
+		operand  float64
+		b1       float64
+		b2       float64
+		count    int
+		expected int
+	}{
+		{0.5, 2, 3, 5, 0},
+		{8, 2, 3, 5, 6},
+		{1.5, 1, 3, 2, 1},
+		{5.35, 0.024, 10.06, 5, 3},
+		{-3.0, -5, 5, 10, 3},
+		{1, 1, 10, 2, 1},  // minimum should be inclusive
+		{10, 1, 10, 2, 3}, // maximum should be exclusive
+		{4, 10, 1, 4, 3},
+		{11, 10, 1, 4, 0},
+		{0, 10, 1, 4, 5},
+	}
+
+	for _, tc := range testCases {
+		got := widthBucket(tc.operand, tc.b1, tc.b2, tc.count)
+		if got != tc.expected {
+			t.Errorf("expected %d, found %d", tc.expected, got)
 		}
 	}
 }

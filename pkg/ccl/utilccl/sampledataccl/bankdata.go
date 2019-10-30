@@ -18,8 +18,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/pkg/errors"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/importccl"
@@ -31,8 +29,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
+	"github.com/cockroachdb/cockroach/pkg/workload/workloadsql"
+	"github.com/pkg/errors"
 )
 
 // ToBackup creates an enterprise backup in `dir`.
@@ -55,8 +54,8 @@ func toBackup(t testing.TB, data workload.Table, dir string, chunkBytes int64) (
 	var stmts bytes.Buffer
 	fmt.Fprintf(&stmts, "CREATE TABLE %s %s;\n", data.Name, data.Schema)
 	for rowIdx := 0; rowIdx < data.InitialRows.NumBatches; rowIdx++ {
-		for _, row := range data.InitialRows.Batch(rowIdx) {
-			rowBatch := strings.Join(workload.StringTuple(row), `,`)
+		for _, row := range data.InitialRows.BatchRows(rowIdx) {
+			rowBatch := strings.Join(workloadsql.StringTuple(row), `,`)
 			fmt.Fprintf(&stmts, "INSERT INTO %s VALUES (%s);\n", data.Name, rowBatch)
 		}
 	}
@@ -97,7 +96,7 @@ func (b *Backup) NextKeyValues(
 ) ([]engine.MVCCKeyValue, roachpb.Span, error) {
 	var userTables []*sqlbase.TableDescriptor
 	for _, d := range b.Desc.Descriptors {
-		if t := d.GetTable(); t != nil && t.ParentID != keys.SystemDatabaseID {
+		if t := d.Table(hlc.Timestamp{}); t != nil && t.ParentID != keys.SystemDatabaseID {
 			userTables = append(userTables, t)
 		}
 	}
@@ -109,13 +108,7 @@ func (b *Backup) NextKeyValues(
 
 	newDesc := *tableDesc
 	newDesc.ID = newTableID
-	newDescBytes, err := protoutil.Marshal(sqlbase.WrapDescriptor(&newDesc))
-	if err != nil {
-		return nil, roachpb.Span{}, err
-	}
-	kr, err := storageccl.MakeKeyRewriter([]roachpb.ImportRequest_TableRekey{{
-		OldID: uint32(tableDesc.ID), NewDesc: newDescBytes,
-	}})
+	kr, err := storageccl.MakeKeyRewriter(sqlbase.TablesByID{tableDesc.ID: &newDesc})
 	if err != nil {
 		return nil, roachpb.Span{}, err
 	}
@@ -135,7 +128,7 @@ func (b *Backup) NextKeyValues(
 			return nil, roachpb.Span{}, err
 		}
 
-		it := sst.NewIterator(engine.IterOptions{})
+		it := sst.NewIterator(engine.IterOptions{UpperBound: roachpb.KeyMax})
 		defer it.Close()
 		it.Seek(engine.MVCCKey{Key: file.Span.Key})
 
@@ -163,7 +156,7 @@ func (b *Backup) NextKeyValues(
 			b.iterIdx = iterIdx
 
 			key := it.Key()
-			key.Key, ok, err = kr.RewriteKey(key.Key)
+			key.Key, ok, err = kr.RewriteKey(key.Key, false /* isFromSpan */)
 			if err != nil {
 				return nil, roachpb.Span{}, err
 			}

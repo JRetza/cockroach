@@ -1,7 +1,17 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import _ from "lodash";
 
 import { LocalityTier, LocalityTree } from "src/redux/localities";
-import { Location, LocationTree } from "src/redux/locations";
+import { ILocation, LocationTree } from "src/redux/locations";
 import * as vector from "src/util/vector";
 
 /*
@@ -71,7 +81,7 @@ export function findOrCalculateLocation(locations: LocationTree, locality: Local
   }
 
   // Find (or calculate) the location of each child locality.
-  const childLocations: Location[] = [];
+  const childLocations: ILocation[] = [];
   _.values(locality.localities).forEach((tier) => {
     _.values(tier).forEach((child) => {
       childLocations.push(findOrCalculateLocation(locations, child));

@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage_test
 
@@ -41,17 +37,26 @@ func TestGossipFirstRange(t *testing.T) {
 		})
 	defer tc.Stopper().Stop(context.TODO())
 
-	errors := make(chan error)
+	errors := make(chan error, 1)
 	descs := make(chan *roachpb.RangeDescriptor)
 	unregister := tc.Servers[0].Gossip().RegisterCallback(gossip.KeyFirstRangeDescriptor,
 		func(_ string, content roachpb.Value) {
 			var desc roachpb.RangeDescriptor
 			if err := content.GetProto(&desc); err != nil {
-				errors <- err
+				select {
+				case errors <- err:
+				default:
+				}
 			} else {
-				descs <- &desc
+				select {
+				case descs <- &desc:
+				case <-time.After(45 * time.Second):
+					t.Logf("had to drop descriptor %+v", desc)
+				}
 			}
 		},
+		// Redundant callbacks are required by this test.
+		gossip.Redundant,
 	)
 	// Unregister the callback before attempting to stop the stopper to prevent
 	// deadlock. This is still flaky in theory since a callback can fire between
@@ -133,6 +138,10 @@ func TestGossipFirstRange(t *testing.T) {
 // restarted after losing its data) without the cluster breaking.
 func TestGossipHandlesReplacedNode(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	if testing.Short() {
+		// As of Nov 2018 it takes 3.6s.
+		t.Skip("short")
+	}
 	ctx := context.Background()
 
 	// Shorten the raft tick interval and election timeout to make range leases
@@ -152,33 +161,22 @@ func TestGossipHandlesReplacedNode(t *testing.T) {
 
 	tc := testcluster.StartTestCluster(t, 3,
 		base.TestClusterArgs{
-			// Use manual replication so that we can ensure the range is properly
-			// replicated to all three nodes before stopping one of them.
-			ReplicationMode: base.ReplicationManual,
-			ServerArgs:      serverArgs,
+			ServerArgs: serverArgs,
 		})
 	defer tc.Stopper().Stop(context.TODO())
 
-	// Ensure that the first range is fully replicated before moving on.
-	firstRangeKey := keys.MinKey
-	if _, err := tc.AddReplicas(firstRangeKey, tc.Target(1), tc.Target(2)); err != nil {
-		t.Fatal(err)
-	}
-
-	// Take down a node other than the first node and replace it with a new one.
-	// Replacing the first node would be better from an adversarial testing
-	// perspective because it typically has the most leases on it, but that also
-	// causes the test to take significantly longer as a result.
+	// Take down the first node and replace it with a new one.
 	oldNodeIdx := 0
 	newServerArgs := serverArgs
-	newServerArgs.Addr = tc.Servers[oldNodeIdx].ServingAddr()
+	newServerArgs.Addr = tc.Servers[oldNodeIdx].ServingRPCAddr()
+	newServerArgs.SQLAddr = tc.Servers[oldNodeIdx].ServingSQLAddr()
 	newServerArgs.PartOfCluster = true
-	newServerArgs.JoinAddr = tc.Servers[1].ServingAddr()
+	newServerArgs.JoinAddr = tc.Servers[1].ServingRPCAddr()
 	log.Infof(ctx, "stopping server %d", oldNodeIdx)
 	tc.StopServer(oldNodeIdx)
 	tc.AddServer(t, newServerArgs)
 
-	tc.WaitForStores(t, tc.Server(1).Gossip())
+	tc.WaitForStores(t, tc.Server(1).GossipI().(*gossip.Gossip))
 
 	// Ensure that all servers still running are responsive. If the two remaining
 	// original nodes don't refresh their connection to the address of the first
@@ -189,7 +187,7 @@ func TestGossipHandlesReplacedNode(t *testing.T) {
 		}
 		kvClient := server.DB()
 		if err := kvClient.Put(ctx, fmt.Sprintf("%d", i), i); err != nil {
-			t.Errorf("failed Put to node %d: %s", i, err)
+			t.Errorf("failed Put to node %d: %+v", i, err)
 		}
 	}
 }

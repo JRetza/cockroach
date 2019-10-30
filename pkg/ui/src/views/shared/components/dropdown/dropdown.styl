@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 @require nib
 @require "~styl/base/palette.styl"
 
@@ -15,6 +25,7 @@ $dropdown-hover-color = darken($background-color, 2.5%)
   white-space nowrap
   padding-right 10px
   color $body-color
+  cursor pointer
 
   &:hover
     background-color $dropdown-hover-color
@@ -22,10 +33,19 @@ $dropdown-hover-color = darken($background-color, 2.5%)
   &__title
     vertical-align middle
     display inline-block
+    -webkit-user-select none
+    -moz-user-select none
+    -ms-user-select: none;
+    user-select: none;
+
 
   &__select
     display inline-block
     vertical-align middle
+    -webkit-user-select none
+    -moz-user-select none
+    -ms-user-select: none;
+    user-select: none;
 
     &:hover
       background-color $dropdown-hover-color
@@ -35,6 +55,10 @@ $dropdown-hover-color = darken($background-color, 2.5%)
     display none
     color $link-color
     cursor pointer
+    -webkit-user-select none
+    -moz-user-select none
+    -ms-user-select: none;
+    user-select: none;
 
     &:first-child
       border-right 1px solid $button-border-color

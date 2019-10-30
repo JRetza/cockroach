@@ -1,25 +1,19 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
 	"context"
 	"math"
-	"strconv"
 	"sync"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -34,7 +28,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/logtags"
 )
 
 var _ sqlutil.InternalExecutor = &InternalExecutor{}
@@ -53,7 +48,7 @@ type InternalExecutor struct {
 
 // SessionBoundInternalExecutor is like InternalExecutor, except that it is
 // initialized with values for session variables. Conversely, it doesn't offer
-// the *WithSessionArgs methods of the InternalExecutor.
+// the *WithUser methods of the InternalExecutor.
 type SessionBoundInternalExecutor struct {
 	impl internalExecutorImpl
 }
@@ -73,15 +68,18 @@ type internalExecutorImpl struct {
 
 	// sessionData, if not nil, represents the session variables used by
 	// statements executed on this internalExecutor. This field supports the
-	// implementation of SessionBoundInternalExecutor. Note that different
-	// executors never share sessionData; instead they make copies. Updating the
-	// sessionData through an internalExecutor doesn't affect the real client
-	// session from whence it came (and thus updating this data is probably not
-	// what you want).
-	// NOTE: We could consider allowing an internalExecutor to share/update the
-	// parent session state if need be, but then we'd need to share a
-	// sessionDataMutator.
+	// implementation of SessionBoundInternalExecutor. Note that a session bound
+	// internal executor cannot modify session data.
 	sessionData *sessiondata.SessionData
+
+	// The internal executor uses its own TableCollection. A TableCollection
+	// is a schema cache for each transaction and contains data like the schema
+	// modified by a transaction. Occasionally an internal executor is called
+	// within the context of a transaction that has modified the schema, the
+	// internal executor should see the modified schema. This interface allows
+	// the internal executor to modify its TableCollection to match the
+	// TableCollection of the parent executor.
+	tcModifier tableCollectionModifier
 }
 
 // MakeInternalExecutor creates an InternalExecutor.
@@ -106,14 +104,14 @@ func MakeInternalExecutor(
 	}
 }
 
-// MakeSessionBoundInternalExecutor creates a SessionBoundInternalExecutor.
-func MakeSessionBoundInternalExecutor(
+// NewSessionBoundInternalExecutor creates a SessionBoundInternalExecutor.
+func NewSessionBoundInternalExecutor(
 	ctx context.Context,
 	sessionData *sessiondata.SessionData,
 	s *Server,
 	memMetrics MemoryMetrics,
 	settings *cluster.Settings,
-) SessionBoundInternalExecutor {
+) *SessionBoundInternalExecutor {
 	monitor := mon.MakeUnlimitedMonitor(
 		ctx,
 		"internal SQL executor",
@@ -123,15 +121,12 @@ func MakeSessionBoundInternalExecutor(
 		math.MaxInt64, /* noteworthy */
 		settings,
 	)
-	dataCopy := sessionData.Copy()
-	return SessionBoundInternalExecutor{
+	return &SessionBoundInternalExecutor{
 		impl: internalExecutorImpl{
-			s:          s,
-			mon:        &monitor,
-			memMetrics: memMetrics,
-			// The internal executor gets a copy of the session data, so it can't
-			// update the parent session.
-			sessionData: &dataCopy,
+			s:           s,
+			mon:         &monitor,
+			memMetrics:  memMetrics,
+			sessionData: sessionData,
 		},
 	}
 }
@@ -148,72 +143,74 @@ func MakeSessionBoundInternalExecutor(
 func (ie *internalExecutorImpl) initConnEx(
 	ctx context.Context,
 	txn *client.Txn,
-	sargs *SessionArgs,
+	sargs SessionArgs,
 	syncCallback func([]resWithPos),
 	errCallback func(error),
-) (*StmtBuf, *sync.WaitGroup) {
+) (*StmtBuf, *sync.WaitGroup, error) {
 	clientComm := &internalClientComm{
 		sync: syncCallback,
 		// init lastDelivered below the position of the first result (0).
 		lastDelivered: -1,
 	}
 
-	var sp sessionParams
-	if sargs != nil {
+	var sd *sessiondata.SessionData
+	var sdMut *sessionDataMutator
+	if sargs.isDefined() {
 		if ie.sessionData != nil {
 			log.Fatal(ctx, "sargs used on a session bound executor")
 		}
-		sp.args = sargs
+		sd, sdMut = ie.s.newSessionDataAndMutator(sargs)
 	} else {
 		if ie.sessionData == nil {
 			log.Fatal(ctx, "initConnEx called with no sargs, and the executor is also not session bound")
 		}
-		sp.data = ie.sessionData
+		sd = ie.sessionData
+		// sdMut stays nil for session bound executors.
 	}
 
 	stmtBuf := NewStmtBuf()
 	var ex *connExecutor
+	var err error
 	if txn == nil {
-		ex = ie.s.newConnExecutor(
+		ex, err = ie.s.newConnExecutor(
 			ctx,
-			sp,
+			sd, sdMut,
 			stmtBuf,
 			clientComm,
-			ie.mon,
-			mon.BoundAccount{}, /* reserved */
-			ie.memMetrics)
-	} else {
-		ex = ie.s.newConnExecutorWithTxn(
-			ctx,
-			sp,
-			stmtBuf,
-			clientComm,
-			ie.mon,
-			mon.BoundAccount{}, /* reserved */
 			ie.memMetrics,
-			txn)
+			&ie.s.InternalMetrics)
+	} else {
+		ex, err = ie.s.newConnExecutorWithTxn(
+			ctx,
+			sd, sdMut,
+			stmtBuf,
+			clientComm,
+			ie.mon,
+			ie.memMetrics,
+			&ie.s.InternalMetrics,
+			txn,
+			ie.tcModifier)
 	}
-	ex.stmtCounterDisabled = true
+	if err != nil {
+		return nil, nil, err
+	}
+	ex.executorType = executorTypeInternal
 
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
-		// Once ex.run() returns, we call ex.resetExtraTxnState() to release the
-		// leases that might have been acquired by the connEx. If there is no
-		// higher-level txn, then the leases were already released when the implicit
-		// txn committed. But if there is a higher-level txn, they don't get
-		// released.
-		defer func() {
-			if err := ex.resetExtraTxnState(ctx, txnAborted, ex.server.dbCache); err != nil {
-				log.Warningf(ctx, "error while cleaning up connExecutor: %s", err)
-			}
-		}()
-		if err := ex.run(ctx, nil /* cancel */); err != nil {
+		if err := ex.run(ctx, ie.mon, mon.BoundAccount{} /*reserved*/, nil /* cancel */); err != nil {
+			ex.recordError(ctx, err)
 			errCallback(err)
 		}
+		closeMode := normalClose
+		if txn != nil {
+			closeMode = externalTxnClose
+		}
+		ex.close(ctx, closeMode)
 		wg.Done()
 	}()
-	return stmtBuf, &wg
+	return stmtBuf, &wg, nil
 }
 
 // Query executes the supplied SQL statement and returns the resulting rows.
@@ -222,10 +219,24 @@ func (ie *internalExecutorImpl) initConnEx(
 // If txn is not nil, the statement will be executed in the respective txn.
 func (ie *InternalExecutor) Query(
 	ctx context.Context, opName string, txn *client.Txn, stmt string, qargs ...interface{},
+) ([]tree.Datums, error) {
+	datums, _, err := ie.queryInternal(
+		ctx, opName, txn,
+		internalExecRootSession,
+		SessionArgs{},
+		stmt, qargs...)
+	return datums, err
+}
+
+// QueryWithCols is like Query, but it also returns the computed ResultColumns
+// of the input query.
+func (ie *InternalExecutor) QueryWithCols(
+	ctx context.Context, opName string, txn *client.Txn, stmt string, qargs ...interface{},
 ) ([]tree.Datums, sqlbase.ResultColumns, error) {
 	return ie.queryInternal(
 		ctx, opName, txn,
-		&SessionArgs{User: security.RootUser, Database: "system"},
+		internalExecRootSession,
+		SessionArgs{},
 		stmt, qargs...)
 }
 
@@ -233,28 +244,30 @@ func (ie *internalExecutorImpl) queryInternal(
 	ctx context.Context,
 	opName string,
 	txn *client.Txn,
-	sargs *SessionArgs,
+	sessionMode internalExecSessionMode,
+	sargs SessionArgs,
 	stmt string,
 	qargs ...interface{},
 ) ([]tree.Datums, sqlbase.ResultColumns, error) {
-	res, err := ie.execInternal(ctx, opName, txn, sargs, stmt, qargs...)
+	res, err := ie.execInternal(ctx, opName, txn, sessionMode, sargs, stmt, qargs...)
 	if err != nil {
 		return nil, nil, err
 	}
 	return res.rows, res.cols, res.err
 }
 
-// QueryWithSessionArgs is like Query, except it takes the session arguments.
-// Nothing is filled in by default, not even the user or database.
-func (ie *InternalExecutor) QueryWithSessionArgs(
+// QueryWithUser is like Query, except it changes the username to that
+// specified.
+func (ie *InternalExecutor) QueryWithUser(
 	ctx context.Context,
 	opName string,
 	txn *client.Txn,
-	sargs SessionArgs,
+	userName string,
 	stmt string,
 	qargs ...interface{},
 ) ([]tree.Datums, sqlbase.ResultColumns, error) {
-	return ie.queryInternal(ctx, opName, txn, &sargs, stmt, qargs...)
+	return ie.queryInternal(ctx,
+		opName, txn, internalExecFixedUserSession, SessionArgs{User: userName}, stmt, qargs...)
 }
 
 // QueryRow is like Query, except it returns a single row, or nil if not row is
@@ -262,7 +275,7 @@ func (ie *InternalExecutor) QueryWithSessionArgs(
 func (ie *InternalExecutor) QueryRow(
 	ctx context.Context, opName string, txn *client.Txn, stmt string, qargs ...interface{},
 ) (tree.Datums, error) {
-	rows, _, err := ie.Query(ctx, opName, txn, stmt, qargs...)
+	rows, err := ie.Query(ctx, opName, txn, stmt, qargs...)
 	if err != nil {
 		return nil, err
 	}
@@ -286,7 +299,7 @@ func (ie *InternalExecutor) Exec(
 	ctx context.Context, opName string, txn *client.Txn, stmt string, qargs ...interface{},
 ) (int, error) {
 	res, err := ie.execInternal(
-		ctx, opName, txn, &SessionArgs{User: security.RootUser, Database: "system"}, stmt, qargs...,
+		ctx, opName, txn, internalExecRootSession, SessionArgs{}, stmt, qargs...,
 	)
 	if err != nil {
 		return 0, err
@@ -294,17 +307,18 @@ func (ie *InternalExecutor) Exec(
 	return res.rowsAffected, res.err
 }
 
-// ExecWithSessionArgs is like Exec, except it takes the session arguments.
-// Nothing is filled in by default, not even the user or database.
-func (ie *InternalExecutor) ExecWithSessionArgs(
+// ExecWithUser is like Exec, except it changes the username to that
+// specified.
+func (ie *InternalExecutor) ExecWithUser(
 	ctx context.Context,
 	opName string,
 	txn *client.Txn,
-	sargs SessionArgs,
+	userName string,
 	stmt string,
 	qargs ...interface{},
 ) (int, error) {
-	res, err := ie.execInternal(ctx, opName, txn, &sargs, stmt, qargs...)
+	res, err := ie.execInternal(ctx,
+		opName, txn, internalExecFixedUserSession, SessionArgs{User: userName}, stmt, qargs...)
 	if err != nil {
 		return 0, err
 	}
@@ -317,10 +331,24 @@ func (ie *InternalExecutor) ExecWithSessionArgs(
 // If txn is not nil, the statement will be executed in the respective txn.
 func (ie *SessionBoundInternalExecutor) Query(
 	ctx context.Context, opName string, txn *client.Txn, stmt string, qargs ...interface{},
+) ([]tree.Datums, error) {
+	rows, _, err := ie.impl.queryInternal(
+		ctx, opName, txn,
+		internalExecInheritSession,
+		SessionArgs{},
+		stmt, qargs...)
+	return rows, err
+}
+
+// QueryWithCols is like Query, but it also returns the computed ResultColumns
+// of the input query.
+func (ie *SessionBoundInternalExecutor) QueryWithCols(
+	ctx context.Context, opName string, txn *client.Txn, stmt string, qargs ...interface{},
 ) ([]tree.Datums, sqlbase.ResultColumns, error) {
 	return ie.impl.queryInternal(
 		ctx, opName, txn,
-		nil, // sargs - the executor will use the bound session
+		internalExecInheritSession,
+		SessionArgs{},
 		stmt, qargs...)
 }
 
@@ -331,7 +359,8 @@ func (ie *SessionBoundInternalExecutor) QueryRow(
 ) (tree.Datums, error) {
 	rows, _ /* cols */, err := ie.impl.queryInternal(
 		ctx, opName, txn,
-		nil, // sargs - the executor will use the bound session
+		internalExecInheritSession,
+		SessionArgs{},
 		stmt, qargs...)
 	if err != nil {
 		return nil, err
@@ -356,7 +385,8 @@ func (ie *SessionBoundInternalExecutor) Exec(
 ) (int, error) {
 	res, err := ie.impl.execInternal(
 		ctx, opName, txn,
-		nil, // sargs - the executor will use the bound session
+		internalExecInheritSession,
+		SessionArgs{},
 		stmt, qargs...,
 	)
 	if err != nil {
@@ -372,6 +402,24 @@ type result struct {
 	err          error
 }
 
+type internalExecSessionMode int
+
+const (
+	// internalExecInheritSession will pick up the internalExecutor's
+	// existing sessionData.
+	internalExecInheritSession internalExecSessionMode = iota
+	// internalExecRootSession will create a new session from scratch
+	// with the root user, the system database as current database, an
+	// auto-generated internal application_name and all session defaults
+	// otherwise.
+	// This is equivalent to passing internalExecUseFixedUserSession with
+	// the result of newInternalSessionUserArgs(security.RootUser).
+	internalExecRootSession
+	// internalExecFixedUser will use the provided username in
+	// SessionArgs and reset everything else as per internalExecRootSession.
+	internalExecFixedUserSession
+)
+
 // execInternal executes a statement.
 //
 // sargs, if not nil, is used to initialize the executor's session data. If nil,
@@ -381,30 +429,56 @@ func (ie *internalExecutorImpl) execInternal(
 	ctx context.Context,
 	opName string,
 	txn *client.Txn,
-	sargs *SessionArgs,
+	sessionMode internalExecSessionMode,
+	sargs SessionArgs,
 	stmt string,
 	qargs ...interface{},
 ) (retRes result, retErr error) {
+	ctx = logtags.AddTag(ctx, "intExec", opName)
+
+	switch sessionMode {
+	case internalExecInheritSession, internalExecRootSession:
+		if sargs.isDefined() {
+			log.Fatalf(ctx, "programming error: session args provided with mode %d", sessionMode)
+		}
+		if sessionMode == internalExecRootSession {
+			sargs = SessionArgs{User: security.RootUser}
+		}
+	}
+
+	switch sessionMode {
+	case internalExecFixedUserSession:
+		if !sargs.isDefined() {
+			log.Fatal(ctx, "programming error: mode fixed user with undefined sargs")
+		}
+		// Clear all fields except user.
+		sargs = SessionArgs{User: sargs.User}
+		fallthrough
+	case internalExecRootSession:
+		sargs.SessionDefaults = map[string]string{
+			"database":         "system",
+			"application_name": sqlbase.InternalAppNamePrefix + "-" + opName,
+		}
+	}
 
 	defer func() {
 		// We wrap errors with the opName, but not if they're retriable - in that
 		// case we need to leave the error intact so that it can be retried at a
 		// higher level.
 		if retErr != nil && !errIsRetriable(retErr) {
-			retErr = errors.Wrap(retErr, opName)
+			retErr = errors.Wrapf(retErr, opName)
 		}
 		if retRes.err != nil && !errIsRetriable(retRes.err) {
-			retRes.err = errors.Wrap(retRes.err, opName)
+			retRes.err = errors.Wrapf(retRes.err, opName)
 		}
 	}()
 
-	ctx, finishSp := tracing.EnsureChildSpan(ctx, ie.s.cfg.AmbientCtx.Tracer, opName)
-	defer finishSp()
-	ctx = log.WithLogTag(ctx, "intExec", opName)
+	ctx, sp := tracing.EnsureChildSpan(ctx, ie.s.cfg.AmbientCtx.Tracer, opName)
+	defer sp.Finish()
 
 	timeReceived := timeutil.Now()
 	parseStart := timeReceived
-	s, err := parser.ParseOne(stmt)
+	parsed, err := parser.ParseOne(stmt)
 	if err != nil {
 		return result{}, err
 	}
@@ -430,8 +504,7 @@ func (ie *internalExecutorImpl) execInternal(
 				return
 			}
 		}
-		resCh <- result{err: errors.Errorf(
-			"programming error: missing result for pos: %d and no previous error", resPos)}
+		resCh <- result{err: errors.AssertionFailedf("missing result for pos: %d and no previous error", resPos)}
 	}
 	errCallback := func(err error) {
 		if resultsReceived {
@@ -439,22 +512,25 @@ func (ie *internalExecutorImpl) execInternal(
 		}
 		resCh <- result{err: err}
 	}
-	stmtBuf, wg := ie.initConnEx(ctx, txn, sargs, syncCallback, errCallback)
+	stmtBuf, wg, err := ie.initConnEx(ctx, txn, sargs, syncCallback, errCallback)
+	if err != nil {
+		return result{}, err
+	}
 
 	// Transforms the args to datums. The datum types will be passed as type hints
 	// to the PrepareStmt command.
 	datums := golangFillQueryArguments(qargs...)
-	types := make(tree.PlaceholderTypes, len(datums))
+	typeHints := make(tree.PlaceholderTypes, len(datums))
 	for i, d := range datums {
 		// Arg numbers start from 1.
-		types[strconv.Itoa(i+1)] = d.ResolvedType()
+		typeHints[tree.PlaceholderIdx(i)] = d.ResolvedType()
 	}
 	if len(qargs) == 0 {
 		resPos = 0
 		if err := stmtBuf.Push(
 			ctx,
 			ExecStmt{
-				Stmt:         s,
+				Statement:    parsed,
 				TimeReceived: timeReceived,
 				ParseStart:   parseStart,
 				ParseEnd:     parseEnd,
@@ -466,10 +542,10 @@ func (ie *internalExecutorImpl) execInternal(
 		if err := stmtBuf.Push(
 			ctx,
 			PrepareStmt{
-				Stmt:       s,
+				Statement:  parsed,
 				ParseStart: parseStart,
 				ParseEnd:   parseEnd,
-				TypeHints:  types,
+				TypeHints:  typeHints,
 			},
 		); err != nil {
 			return result{}, err
@@ -514,7 +590,14 @@ type resWithPos struct {
 
 // CreateStatementResult is part of the ClientComm interface.
 func (icc *internalClientComm) CreateStatementResult(
-	_ tree.Statement, _ RowDescOpt, pos CmdPos, _ []pgwirebase.FormatCode, _ *time.Location,
+	_ tree.Statement,
+	_ RowDescOpt,
+	pos CmdPos,
+	_ []pgwirebase.FormatCode,
+	_ sessiondata.DataConversionConfig,
+	_ int,
+	_ string,
+	_ bool,
 ) CommandResult {
 	return icc.createRes(pos, nil /* onClose */)
 }
@@ -573,7 +656,7 @@ func (icc *internalClientComm) Flush(pos CmdPos) error {
 
 // CreateDescribeResult is part of the ClientComm interface.
 func (icc *internalClientComm) CreateDescribeResult(pos CmdPos) DescribeResult {
-	panic("unimplemented")
+	return icc.createRes(pos, nil /* onClose */)
 }
 
 // CreateDeleteResult is part of the ClientComm interface.

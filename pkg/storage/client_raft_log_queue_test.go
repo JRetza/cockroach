@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage_test
 
@@ -21,10 +17,10 @@ import (
 	"math"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/gogo/protobuf/proto"
 )
 
 // TestRaftLogQueue verifies that the raft log queue correctly truncates the
@@ -37,13 +33,11 @@ func TestRaftLogQueue(t *testing.T) {
 	// Set maxBytes to something small so we can trigger the raft log truncation
 	// without adding 64MB of logs.
 	const maxBytes = 1 << 16
-	defer config.TestingSetDefaultZoneConfig(config.ZoneConfig{
-		RangeMaxBytes: maxBytes,
-	})()
 
 	// Turn off raft elections so the raft leader won't change out from under
 	// us in this test.
 	sc := storage.TestStoreConfig(nil)
+	sc.DefaultZoneConfig.RangeMaxBytes = proto.Int64(maxBytes)
 	sc.RaftTickInterval = math.MaxInt32
 	sc.RaftElectionTimeoutTicks = 1000000
 	mtc.storeConfig = &sc
@@ -58,7 +52,7 @@ func TestRaftLogQueue(t *testing.T) {
 	}
 
 	// Get the raft leader (and ensure one exists).
-	rangeID := mtc.stores[0].LookupReplica([]byte("a"), nil).RangeID
+	rangeID := mtc.stores[0].LookupReplica([]byte("a")).RangeID
 	raftLeaderRepl := mtc.getRaftLeader(rangeID)
 	if raftLeaderRepl == nil {
 		t.Fatalf("could not find raft leader replica for range %d", rangeID)
@@ -84,7 +78,7 @@ func TestRaftLogQueue(t *testing.T) {
 
 	// Force a truncation check.
 	for _, store := range mtc.stores {
-		store.ForceRaftLogScanAndProcess()
+		store.MustForceRaftLogScanAndProcess()
 	}
 
 	// Ensure that firstIndex has increased indicating that the log
@@ -106,7 +100,7 @@ func TestRaftLogQueue(t *testing.T) {
 	// instrumentation of the queues, which was deemed to require too much work
 	// at the time of this writing.
 	for _, store := range mtc.stores {
-		store.ForceRaftLogScanAndProcess()
+		store.MustForceRaftLogScanAndProcess()
 	}
 
 	after2ndTruncationIndex, err := raftLeaderRepl.GetFirstIndex()

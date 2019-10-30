@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package timeofday
 
@@ -82,7 +78,7 @@ func TestAdd(t *testing.T) {
 		{Min, -1, Max},
 	}
 	for _, td := range testData {
-		d := duration.Duration{Nanos: td.micros * nanosPerMicro}
+		d := duration.MakeDuration(td.micros*nanosPerMicro, 0, 0)
 		t.Run(fmt.Sprintf("%s,%s", td.t, d), func(t *testing.T) {
 			actual := td.t.Add(d)
 			if actual != td.exp {
@@ -106,7 +102,7 @@ func TestDifference(t *testing.T) {
 	}
 	for _, td := range testData {
 		t.Run(fmt.Sprintf("%s,%s", td.t1, td.t2), func(t *testing.T) {
-			actual := Difference(td.t1, td.t2).Nanos / nanosPerMicro
+			actual := Difference(td.t1, td.t2).Nanos() / nanosPerMicro
 			if actual != td.expMicros {
 				t.Errorf("expected %d, got %d", td.expMicros, actual)
 			}

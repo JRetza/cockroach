@@ -1,20 +1,17 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package ts
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -37,7 +34,7 @@ func TestGetMaxTimespan(t *testing.T) {
 		{
 			Resolution10s,
 			QueryMemoryOptions{
-				BudgetBytes:             2 * (sizeOfTimeSeriesData + sizeOfTimeSeriesData*360),
+				BudgetBytes:             2 * (sizeOfTimeSeriesData + sizeOfSample*360),
 				EstimatedSources:        1,
 				InterpolationLimitNanos: 0,
 			},
@@ -48,7 +45,7 @@ func TestGetMaxTimespan(t *testing.T) {
 		{
 			Resolution10s,
 			QueryMemoryOptions{
-				BudgetBytes:             sizeOfTimeSeriesData + sizeOfTimeSeriesData*360,
+				BudgetBytes:             sizeOfTimeSeriesData + sizeOfSample*360,
 				EstimatedSources:        1,
 				InterpolationLimitNanos: 0,
 			},
@@ -59,7 +56,7 @@ func TestGetMaxTimespan(t *testing.T) {
 		{
 			Resolution10s,
 			QueryMemoryOptions{
-				BudgetBytes:             2 * (sizeOfTimeSeriesData + sizeOfTimeSeriesData*360),
+				BudgetBytes:             2 * (sizeOfTimeSeriesData + sizeOfSample*360),
 				EstimatedSources:        2,
 				InterpolationLimitNanos: 0,
 			},
@@ -70,7 +67,7 @@ func TestGetMaxTimespan(t *testing.T) {
 		{
 			Resolution10s,
 			QueryMemoryOptions{
-				BudgetBytes:             12 * (sizeOfTimeSeriesData + sizeOfTimeSeriesData*360),
+				BudgetBytes:             12 * (sizeOfTimeSeriesData + sizeOfSample*360),
 				EstimatedSources:        6,
 				InterpolationLimitNanos: 0,
 			},
@@ -81,7 +78,7 @@ func TestGetMaxTimespan(t *testing.T) {
 		{
 			Resolution10s,
 			QueryMemoryOptions{
-				BudgetBytes:             18 * (sizeOfTimeSeriesData + sizeOfTimeSeriesData*360),
+				BudgetBytes:             18 * (sizeOfTimeSeriesData + sizeOfSample*360),
 				EstimatedSources:        6,
 				InterpolationLimitNanos: 0,
 			},
@@ -92,7 +89,7 @@ func TestGetMaxTimespan(t *testing.T) {
 		{
 			Resolution10s,
 			QueryMemoryOptions{
-				BudgetBytes:             12 * (sizeOfTimeSeriesData + sizeOfTimeSeriesData*360),
+				BudgetBytes:             12 * (sizeOfTimeSeriesData + sizeOfSample*360),
 				EstimatedSources:        6,
 				InterpolationLimitNanos: 1,
 			},
@@ -103,7 +100,7 @@ func TestGetMaxTimespan(t *testing.T) {
 		{
 			Resolution10s,
 			QueryMemoryOptions{
-				BudgetBytes:             18 * (sizeOfTimeSeriesData + sizeOfTimeSeriesData*360),
+				BudgetBytes:             18 * (sizeOfTimeSeriesData + sizeOfSample*360),
 				EstimatedSources:        6,
 				InterpolationLimitNanos: 1,
 			},
@@ -114,7 +111,7 @@ func TestGetMaxTimespan(t *testing.T) {
 		{
 			Resolution10s,
 			QueryMemoryOptions{
-				BudgetBytes:             18 * (sizeOfTimeSeriesData + sizeOfTimeSeriesData*360),
+				BudgetBytes:             18 * (sizeOfTimeSeriesData + sizeOfSample*360),
 				EstimatedSources:        6,
 				InterpolationLimitNanos: int64(float64(Resolution10s.SlabDuration()) * 0.75),
 			},
@@ -125,7 +122,7 @@ func TestGetMaxTimespan(t *testing.T) {
 		{
 			Resolution10s,
 			QueryMemoryOptions{
-				BudgetBytes:             24 * (sizeOfTimeSeriesData + sizeOfTimeSeriesData*360),
+				BudgetBytes:             24 * (sizeOfTimeSeriesData + sizeOfSample*360),
 				EstimatedSources:        6,
 				InterpolationLimitNanos: int64(float64(Resolution10s.SlabDuration()) * 0.75),
 			},
@@ -136,11 +133,22 @@ func TestGetMaxTimespan(t *testing.T) {
 		{
 			resolution1ns,
 			QueryMemoryOptions{
-				BudgetBytes:             3 * (sizeOfTimeSeriesData + sizeOfTimeSeriesData*10),
+				BudgetBytes:             3 * (sizeOfTimeSeriesData + sizeOfSample*10),
 				EstimatedSources:        1,
 				InterpolationLimitNanos: 1,
 			},
 			10,
+			"",
+		},
+		// Overflow.
+		{
+			Resolution10s,
+			QueryMemoryOptions{
+				BudgetBytes:             math.MaxInt64,
+				EstimatedSources:        1,
+				InterpolationLimitNanos: math.MaxInt64,
+			},
+			math.MaxInt64,
 			"",
 		},
 	} {

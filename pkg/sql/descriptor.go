@@ -1,31 +1,27 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
 	"context"
-	"fmt"
-
-	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 //
@@ -37,20 +33,11 @@ import (
 //
 
 var (
-	errEmptyDatabaseName = pgerror.NewError(pgerror.CodeSyntaxError, "empty database name")
-	errNoDatabase        = pgerror.NewError(pgerror.CodeInvalidNameError, "no database specified")
-	errNoTable           = pgerror.NewError(pgerror.CodeInvalidNameError, "no table specified")
-	errNoMatch           = pgerror.NewError(pgerror.CodeUndefinedObjectError, "no object matched")
+	errEmptyDatabaseName = pgerror.New(pgcode.Syntax, "empty database name")
+	errNoDatabase        = pgerror.New(pgcode.InvalidName, "no database specified")
+	errNoTable           = pgerror.New(pgcode.InvalidName, "no table specified")
+	errNoMatch           = pgerror.New(pgcode.UndefinedObject, "no object matched")
 )
-
-type descriptorAlreadyExistsErr struct {
-	desc sqlbase.DescriptorProto
-	name string
-}
-
-func (d descriptorAlreadyExistsErr) Error() string {
-	return fmt.Sprintf("%s %q already exists", d.desc.TypeName(), d.name)
-}
 
 // GenerateUniqueDescID returns the next available Descriptor ID and increments
 // the counter. The incrementing is non-transactional, and the counter could be
@@ -59,22 +46,21 @@ func GenerateUniqueDescID(ctx context.Context, db *client.DB) (sqlbase.ID, error
 	// Increment unique descriptor counter.
 	newVal, err := client.IncrementValRetryable(ctx, db, keys.DescIDGenerator, 1)
 	if err != nil {
-		return 0, err
+		return sqlbase.InvalidID, err
 	}
 	return sqlbase.ID(newVal - 1), nil
 }
 
-// createDescriptor takes a Table or Database descriptor and creates it if
-// needed, incrementing the descriptor counter. Returns true if the descriptor
+// createdatabase takes Database descriptor and creates it if needed,
+// incrementing the descriptor counter. Returns true if the descriptor
 // is actually created, false if it already existed, or an error if one was
 // encountered. The ifNotExists flag is used to declare if the "already existed"
 // state should be an error (false) or a no-op (true).
-func (p *planner) createDescriptor(
-	ctx context.Context,
-	plainKey sqlbase.DescriptorKey,
-	descriptor sqlbase.DescriptorProto,
-	ifNotExists bool,
+// createDatabase implements the DatabaseDescEditor interface.
+func (p *planner) createDatabase(
+	ctx context.Context, desc *sqlbase.DatabaseDescriptor, ifNotExists bool,
 ) (bool, error) {
+	plainKey := sqlbase.NewDatabaseKey(desc.Name)
 	idKey := plainKey.Key()
 
 	if exists, err := descExists(ctx, p.txn, idKey); err == nil && exists {
@@ -82,15 +68,7 @@ func (p *planner) createDescriptor(
 			// Noop.
 			return false, nil
 		}
-		// Key exists, but we don't want it to: error out.
-		switch descriptor.TypeName() {
-		case "database":
-			return false, sqlbase.NewDatabaseAlreadyExistsError(plainKey.Name())
-		case "table", "view":
-			return false, sqlbase.NewRelationAlreadyExistsError(plainKey.Name())
-		default:
-			return false, descriptorAlreadyExistsErr{descriptor, plainKey.Name()}
-		}
+		return false, sqlbase.NewDatabaseAlreadyExistsError(plainKey.Name())
 	} else if err != nil {
 		return false, err
 	}
@@ -100,7 +78,7 @@ func (p *planner) createDescriptor(
 		return false, err
 	}
 
-	return true, p.createDescriptorWithID(ctx, idKey, id, descriptor)
+	return true, p.createDescriptorWithID(ctx, idKey, id, desc, nil)
 }
 
 func descExists(ctx context.Context, txn *client.Txn, idKey roachpb.Key) (bool, error) {
@@ -113,7 +91,11 @@ func descExists(ctx context.Context, txn *client.Txn, idKey roachpb.Key) (bool, 
 }
 
 func (p *planner) createDescriptorWithID(
-	ctx context.Context, idKey roachpb.Key, id sqlbase.ID, descriptor sqlbase.DescriptorProto,
+	ctx context.Context,
+	idKey roachpb.Key,
+	id sqlbase.ID,
+	descriptor sqlbase.DescriptorProto,
+	st *cluster.Settings,
 ) error {
 	descriptor.SetID(id)
 	// TODO(pmattis): The error currently returned below is likely going to be
@@ -125,49 +107,51 @@ func (p *planner) createDescriptorWithID(
 	// but not going through the normal INSERT logic and not performing a precise
 	// mimicry. In particular, we're only writing a single key per table, while
 	// perfect mimicry would involve writing a sentinel key for each row as well.
-	descKey := sqlbase.MakeDescMetadataKey(descriptor.GetID())
 
 	b := &client.Batch{}
 	descID := descriptor.GetID()
-	descDesc := sqlbase.WrapDescriptor(descriptor)
 	if p.ExtendedEvalContext().Tracing.KVTracingEnabled() {
 		log.VEventf(ctx, 2, "CPut %s -> %d", idKey, descID)
-		log.VEventf(ctx, 2, "CPut %s -> %s", descKey, descDesc)
 	}
 	b.CPut(idKey, descID, nil)
-	b.CPut(descKey, descDesc, nil)
-
-	if desc, ok := descriptor.(*sqlbase.TableDescriptor); ok {
-		p.Tables().addUncommittedTable(*desc)
+	if err := WriteNewDescToBatch(ctx, p.ExtendedEvalContext().Tracing.KVTracingEnabled(), st, b, descID, descriptor); err != nil {
+		return err
 	}
 
-	return p.txn.Run(ctx, b)
+	mutDesc, isTable := descriptor.(*sqlbase.MutableTableDescriptor)
+	if isTable {
+		if err := mutDesc.ValidateTable(); err != nil {
+			return err
+		}
+		if err := p.Tables().addUncommittedTable(*mutDesc); err != nil {
+			return err
+		}
+	}
+
+	if err := p.txn.Run(ctx, b); err != nil {
+		return err
+	}
+	if isTable && mutDesc.Adding() {
+		p.queueSchemaChange(mutDesc.TableDesc(), sqlbase.InvalidMutationID)
+	}
+	return nil
 }
 
-// getDescriptor looks up the descriptor for `plainKey`, validates it,
-// and unmarshals it into `descriptor`.
-//
-// If `plainKey` doesn't exist, returns false and nil error.
-// In most cases you'll want to use wrappers: `getDatabaseDesc` or
-// `getTableDesc`.
-func getDescriptor(
-	ctx context.Context,
-	txn *client.Txn,
-	plainKey sqlbase.DescriptorKey,
-	descriptor sqlbase.DescriptorProto,
-) (bool, error) {
-	gr, err := txn.Get(ctx, plainKey.Key())
+// getDescriptorID looks up the ID for plainKey.
+// InvalidID is returned if the name cannot be resolved.
+func getDescriptorID(
+	ctx context.Context, txn *client.Txn, plainKey sqlbase.DescriptorKey,
+) (sqlbase.ID, error) {
+	key := plainKey.Key()
+	log.Eventf(ctx, "looking up descriptor ID for name key %q", key)
+	gr, err := txn.Get(ctx, key)
 	if err != nil {
-		return false, err
+		return sqlbase.InvalidID, err
 	}
 	if !gr.Exists() {
-		return false, nil
+		return sqlbase.InvalidID, nil
 	}
-
-	if err := getDescriptorByID(ctx, txn, sqlbase.ID(gr.ValueInt()), descriptor); err != nil {
-		return false, err
-	}
-	return true, nil
+	return sqlbase.ID(gr.ValueInt()), nil
 }
 
 // getDescriptorByID looks up the descriptor for `id`, validates it,
@@ -178,28 +162,33 @@ func getDescriptor(
 func getDescriptorByID(
 	ctx context.Context, txn *client.Txn, id sqlbase.ID, descriptor sqlbase.DescriptorProto,
 ) error {
+	log.Eventf(ctx, "fetching descriptor with ID %d", id)
 	descKey := sqlbase.MakeDescMetadataKey(id)
 	desc := &sqlbase.Descriptor{}
-	if err := txn.GetProto(ctx, descKey, desc); err != nil {
+	ts, err := txn.GetProtoTs(ctx, descKey, desc)
+	if err != nil {
 		return err
 	}
-
 	switch t := descriptor.(type) {
 	case *sqlbase.TableDescriptor:
-		table := desc.GetTable()
+		table := desc.Table(ts)
 		if table == nil {
-			return errors.Errorf("%q is not a table", desc.String())
+			return pgerror.Newf(pgcode.WrongObjectType,
+				"%q is not a table", desc.String())
 		}
-		table.MaybeFillInDescriptor()
+		if err := table.MaybeFillInDescriptor(ctx, txn); err != nil {
+			return nil
+		}
 
-		if err := table.Validate(ctx, txn, nil /* clusterVersion */); err != nil {
+		if err := table.Validate(ctx, txn); err != nil {
 			return err
 		}
 		*t = *table
 	case *sqlbase.DatabaseDescriptor:
 		database := desc.GetDatabase()
 		if database == nil {
-			return errors.Errorf("%q is not a database", desc.String())
+			return pgerror.Newf(pgcode.WrongObjectType,
+				"%q is not a database", desc.String())
 		}
 
 		if err := database.Validate(); err != nil {
@@ -212,26 +201,127 @@ func getDescriptorByID(
 
 // GetAllDescriptors looks up and returns all available descriptors.
 func GetAllDescriptors(ctx context.Context, txn *client.Txn) ([]sqlbase.DescriptorProto, error) {
+	log.Eventf(ctx, "fetching all descriptors")
 	descsKey := sqlbase.MakeAllDescsMetadataKey()
 	kvs, err := txn.Scan(ctx, descsKey, descsKey.PrefixEnd(), 0)
 	if err != nil {
 		return nil, err
 	}
 
-	descs := make([]sqlbase.DescriptorProto, len(kvs))
-	for i, kv := range kvs {
+	descs := make([]sqlbase.DescriptorProto, 0, len(kvs))
+	for _, kv := range kvs {
 		desc := &sqlbase.Descriptor{}
 		if err := kv.ValueProto(desc); err != nil {
 			return nil, err
 		}
 		switch t := desc.Union.(type) {
 		case *sqlbase.Descriptor_Table:
-			descs[i] = desc.GetTable()
+			table := desc.Table(kv.Value.Timestamp)
+			if err := table.MaybeFillInDescriptor(ctx, txn); err != nil {
+				return nil, err
+			}
+			descs = append(descs, table)
 		case *sqlbase.Descriptor_Database:
-			descs[i] = desc.GetDatabase()
+			descs = append(descs, desc.GetDatabase())
 		default:
-			return nil, errors.Errorf("Descriptor.Union has unexpected type %T", t)
+			return nil, errors.AssertionFailedf("Descriptor.Union has unexpected type %T", t)
 		}
 	}
 	return descs, nil
+}
+
+// GetAllDatabaseDescriptorIDs looks up and returns all available database
+// descriptor IDs.
+func GetAllDatabaseDescriptorIDs(ctx context.Context, txn *client.Txn) ([]sqlbase.ID, error) {
+	log.Eventf(ctx, "fetching all database descriptor IDs")
+	nameKey := sqlbase.NewDatabaseKey("" /* name */).Key()
+	kvs, err := txn.Scan(ctx, nameKey, nameKey.PrefixEnd(), 0 /*maxRows */)
+	if err != nil {
+		return nil, err
+	}
+
+	descIDs := make([]sqlbase.ID, 0, len(kvs))
+	for _, kv := range kvs {
+		descIDs = append(descIDs, sqlbase.ID(kv.ValueInt()))
+	}
+	return descIDs, nil
+}
+
+// writeDescToBatch adds a Put command writing a descriptor proto to the
+// descriptors table. It writes the descriptor desc at the id descID. If kvTrace
+// is enabled, it will log an event explaining the put that was performed.
+func writeDescToBatch(
+	ctx context.Context,
+	kvTrace bool,
+	s *cluster.Settings,
+	b *client.Batch,
+	descID sqlbase.ID,
+	desc sqlbase.DescriptorProto,
+) (err error) {
+	var tableToDowngrade *TableDescriptor
+	switch d := desc.(type) {
+	case *TableDescriptor:
+		tableToDowngrade = d
+	case *MutableTableDescriptor:
+		tableToDowngrade = d.TableDesc()
+	case *DatabaseDescriptor:
+	default:
+		return errors.AssertionFailedf("unexpected proto type %T", desc)
+	}
+	if tableToDowngrade != nil {
+		didDowngrade, downgraded, err := tableToDowngrade.MaybeDowngradeForeignKeyRepresentation(ctx, s)
+		if err != nil {
+			return err
+		}
+		if didDowngrade {
+			desc = downgraded
+		}
+	}
+	descKey := sqlbase.MakeDescMetadataKey(descID)
+	descDesc := sqlbase.WrapDescriptor(desc)
+	if kvTrace {
+		log.VEventf(ctx, 2, "Put %s -> %s", descKey, descDesc)
+	}
+	b.Put(descKey, descDesc)
+	return nil
+}
+
+// WriteNewDescToBatch adds a CPut command writing a descriptor proto to the
+// descriptors table. It writes the descriptor desc at the id descID, asserting
+// that there was no previous descriptor at that id present already. If kvTrace
+// is enabled, it will log an event explaining the CPut that was performed.
+func WriteNewDescToBatch(
+	ctx context.Context,
+	kvTrace bool,
+	s *cluster.Settings,
+	b *client.Batch,
+	tableID sqlbase.ID,
+	desc sqlbase.DescriptorProto,
+) (err error) {
+	var tableToDowngrade *TableDescriptor
+	switch d := desc.(type) {
+	case *TableDescriptor:
+		tableToDowngrade = d
+	case *MutableTableDescriptor:
+		tableToDowngrade = d.TableDesc()
+	case *DatabaseDescriptor:
+	default:
+		return errors.AssertionFailedf("unexpected proto type %T", desc)
+	}
+	if tableToDowngrade != nil {
+		didDowngrade, downgraded, err := tableToDowngrade.MaybeDowngradeForeignKeyRepresentation(ctx, s)
+		if err != nil {
+			return err
+		}
+		if didDowngrade {
+			desc = downgraded
+		}
+	}
+	descKey := sqlbase.MakeDescMetadataKey(tableID)
+	descDesc := sqlbase.WrapDescriptor(desc)
+	if kvTrace {
+		log.VEventf(ctx, 2, "CPut %s -> %s", descKey, descDesc)
+	}
+	b.CPut(descKey, descDesc, nil)
+	return nil
 }

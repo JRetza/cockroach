@@ -1,28 +1,25 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tpch
 
 import (
 	"context"
 	gosql "database/sql"
+	"fmt"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
+	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
 	"github.com/pkg/errors"
 	"github.com/spf13/pflag"
 )
@@ -45,7 +42,8 @@ type tpch struct {
 	seed        int64
 	scaleFactor int
 
-	distsql bool
+	distsql       bool
+	disableChecks bool
 
 	queriesRaw      string
 	selectedQueries []string
@@ -61,17 +59,21 @@ var tpchMeta = workload.Meta{
 	Version:     `1.0.0`,
 	New: func() workload.Generator {
 		g := &tpch{}
-		g.flags.FlagSet = pflag.NewFlagSet(`tpcc`, pflag.ContinueOnError)
+		g.flags.FlagSet = pflag.NewFlagSet(`tpch`, pflag.ContinueOnError)
 		g.flags.Meta = map[string]workload.FlagMeta{
-			`queries`:  {RuntimeOnly: true},
-			`dist-sql`: {RuntimeOnly: true},
+			`queries`:        {RuntimeOnly: true},
+			`dist-sql`:       {RuntimeOnly: true},
+			`disable-checks`: {RuntimeOnly: true},
 		}
 		g.flags.Int64Var(&g.seed, `seed`, 1, `Random number generator seed`)
 		g.flags.IntVar(&g.scaleFactor, `scale-factor`, 1,
 			`Linear scale of how much data to use (each SF is ~1GB)`)
-		g.flags.StringVar(&g.queriesRaw, `queries`, `1,3,7,8,9,19`,
+		g.flags.StringVar(&g.queriesRaw, `queries`, `1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22`,
 			`Queries to run. Use a comma separated list of query numbers`)
 		g.flags.BoolVar(&g.distsql, `dist-sql`, true, `Use DistSQL for query execution`)
+		g.flags.BoolVar(&g.disableChecks, `disable-checks`, false,
+			"Disable checking the output against the expected rows (default false). "+
+				"Note that the checks are only supported for scale factor 1")
 		g.connFlags = workload.NewConnFlags(&g.flags)
 		return g
 	},
@@ -87,20 +89,18 @@ func (w *tpch) Flags() workload.Flags { return w.flags }
 func (w *tpch) Hooks() workload.Hooks {
 	return workload.Hooks{
 		Validate: func() error {
+			if w.scaleFactor != 1 {
+				fmt.Printf("check for expected rows is only supported with " +
+					"scale factor 1, so it was disabled\n")
+				w.disableChecks = true
+			}
 			for _, queryName := range strings.Split(w.queriesRaw, `,`) {
-				queryName = strings.TrimSpace(queryName)
-				switch queryName {
-				case `2`, `4`, `13`, `16`, `17`, `18`, `20`, `21`, `22`:
-					return errors.Errorf(`query is unsupported: %s`, queryName)
-				case `5`, `6`, `10`, `12`, `14`:
-					return errors.Errorf(`query causes Cockroach panic (see #13692): %s`, queryName)
-				case `11`:
-					return errors.Errorf(`group with having not supported yet: %s`, queryName)
-				}
 				if _, ok := queriesByName[queryName]; !ok {
 					return errors.Errorf(`unknown query: %s`, queryName)
 				}
-				w.selectedQueries = append(w.selectedQueries, queryName)
+				if !queriesToSkip[queryName] {
+					w.selectedQueries = append(w.selectedQueries, queryName)
+				}
 			}
 			return nil
 		},
@@ -157,7 +157,7 @@ func (w *tpch) Tables() []workload.Table {
 }
 
 // Ops implements the Opser interface.
-func (w *tpch) Ops(urls []string, reg *workload.HistogramRegistry) (workload.QueryLoad, error) {
+func (w *tpch) Ops(urls []string, reg *histogram.Registry) (workload.QueryLoad, error) {
 	sqlDatabase, err := workload.SanitizeUrls(w, w.connFlags.DBOverride, urls)
 	if err != nil {
 		return workload.QueryLoad{}, err
@@ -184,7 +184,7 @@ func (w *tpch) Ops(urls []string, reg *workload.HistogramRegistry) (workload.Que
 
 type worker struct {
 	config *tpch
-	hists  *workload.Histograms
+	hists  *histogram.Histograms
 	db     *gosql.DB
 	ops    int
 }
@@ -200,17 +200,49 @@ func (w *worker) run(ctx context.Context) error {
 		query = `SET DISTSQL = 'off'; ` + queriesByName[queryName]
 	}
 
+	vals := make([]interface{}, maxCols)
+	for i := range vals {
+		vals[i] = new(interface{})
+	}
+
 	start := timeutil.Now()
 	rows, err := w.db.Query(query)
+	if rows != nil {
+		defer rows.Close()
+	}
 	if err != nil {
 		return err
 	}
 	var numRows int
 	for rows.Next() {
+		if !w.config.disableChecks {
+			if !queriesToCheckOnlyNumRows[queryName] && !queriesToSkip[queryName] {
+				if err = rows.Scan(vals[:numColsByQueryName[queryName]]...); err != nil {
+					return err
+				}
+
+				expectedRow := expectedRowsByQueryName[queryName][numRows]
+				for i, expectedValue := range expectedRow {
+					if val := *vals[i].(*interface{}); val != nil {
+						if strings.Compare(expectedValue, fmt.Sprint(val)) != 0 {
+							return errors.Errorf("wrong result on query %s in row %d in column %d: got %q, expected %q",
+								queryName, numRows, i, fmt.Sprint(val), expectedValue)
+						}
+					}
+				}
+			}
+		}
 		numRows++
 	}
 	if err := rows.Err(); err != nil {
 		return err
+	}
+	if !w.config.disableChecks {
+		if !queriesToSkip[queryName] {
+			if numRows != numExpectedRowsByQueryName[queryName] {
+				return errors.Errorf("query %s returned wrong number of rows: got %d, expected %d", queryName, numRows, numExpectedRowsByQueryName[queryName])
+			}
+		}
 	}
 	elapsed := timeutil.Since(start)
 	w.hists.Get(queryName).Record(elapsed)
@@ -240,7 +272,7 @@ const (
 		p_type            VARCHAR(25) NOT NULL,
 		p_size            INTEGER NOT NULL,
 		p_container       CHAR(10) NOT NULL,
-		p_retailprice     DECIMAL(15,2) NOT NULL,
+		p_retailprice     FLOAT NOT NULL,
 		p_comment         VARCHAR(23) NOT NULL
 	)`
 	tpchSupplierSchema = `(
@@ -249,7 +281,7 @@ const (
 		s_address         VARCHAR(40) NOT NULL,
 		s_nationkey       INTEGER NOT NULL,
 		s_phone           CHAR(15) NOT NULL,
-		s_acctbal         DECIMAL(15,2) NOT NULL,
+		s_acctbal         FLOAT NOT NULL,
 		s_comment         VARCHAR(101) NOT NULL,
 		INDEX s_nk (s_nationkey ASC)
 	)`
@@ -257,11 +289,10 @@ const (
 		ps_partkey            INTEGER NOT NULL,
 		ps_suppkey            INTEGER NOT NULL,
 		ps_availqty           INTEGER NOT NULL,
-		ps_supplycost         DECIMAL(15,2) NOT NULL,
+		ps_supplycost         FLOAT NOT NULL,
 		ps_comment            VARCHAR(199) NOT NULL,
-		INDEX ps_sk (ps_suppkey ASC),
 		PRIMARY KEY (ps_partkey ASC, ps_suppkey ASC),
-		UNIQUE INDEX ps_sk_pk (ps_suppkey ASC, ps_partkey ASC)
+		INDEX ps_sk (ps_suppkey ASC)
 	)`
 	tpchCustomerSchema = `(
 		c_custkey         INTEGER NOT NULL PRIMARY KEY,
@@ -269,7 +300,7 @@ const (
 		c_address         VARCHAR(40) NOT NULL,
 		c_nationkey       INTEGER NOT NULL,
 		c_phone           CHAR(15) NOT NULL,
-		c_acctbal         DECIMAL(15,2)   NOT NULL,
+		c_acctbal         FLOAT NOT NULL,
 		c_mktsegment      CHAR(10) NOT NULL,
 		c_comment         VARCHAR(117) NOT NULL,
 		INDEX c_nk (c_nationkey ASC)
@@ -278,7 +309,7 @@ const (
 		o_orderkey           INTEGER NOT NULL PRIMARY KEY,
 		o_custkey            INTEGER NOT NULL,
 		o_orderstatus        CHAR(1) NOT NULL,
-		o_totalprice         DECIMAL(15,2) NOT NULL,
+		o_totalprice         FLOAT NOT NULL,
 		o_orderdate          DATE NOT NULL,
 		o_orderpriority      CHAR(15) NOT NULL,
 		o_clerk              CHAR(15) NOT NULL,
@@ -292,10 +323,10 @@ const (
 		l_partkey       INTEGER NOT NULL,
 		l_suppkey       INTEGER NOT NULL,
 		l_linenumber    INTEGER NOT NULL,
-		l_quantity      DECIMAL(15,2) NOT NULL,
-		l_extendedprice DECIMAL(15,2) NOT NULL,
-		l_discount      DECIMAL(15,2) NOT NULL,
-		l_tax           DECIMAL(15,2) NOT NULL,
+		l_quantity      FLOAT NOT NULL,
+		l_extendedprice FLOAT NOT NULL,
+		l_discount      FLOAT NOT NULL,
+		l_tax           FLOAT NOT NULL,
 		l_returnflag    CHAR(1) NOT NULL,
 		l_linestatus    CHAR(1) NOT NULL,
 		l_shipdate      DATE NOT NULL,

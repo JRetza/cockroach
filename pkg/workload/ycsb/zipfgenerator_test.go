@@ -1,17 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package ycsb
 
@@ -22,6 +17,7 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
@@ -36,6 +32,7 @@ var gens = []params{
 }
 
 func TestCreateZipfGenerator(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	for _, gen := range gens {
 		rng := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
 		_, err := NewZipfGenerator(rng, gen.iMin, gen.iMax, gen.theta, false)
@@ -62,6 +59,10 @@ var tests = []struct {
 }
 
 func TestZetaFromScratch(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	if testing.Short() {
+		t.Skip("short")
+	}
 	for _, test := range tests {
 		computedZeta, err := computeZetaFromScratch(test.n, test.theta)
 		if err != nil {
@@ -74,6 +75,10 @@ func TestZetaFromScratch(t *testing.T) {
 }
 
 func TestZetaIncrementally(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	if testing.Short() {
+		t.Skip("short")
+	}
 	// Theta cannot be 1 by definition, so this is a safe initial value.
 	oldTheta := 1.0
 	var oldZetaN float64
@@ -121,7 +126,7 @@ func runZipfGenerators(t *testing.T, withIncrements bool) {
 			t.Fatalf("zipf(%d,%d,%f) rolled %d at index %d", z.iMin, z.zipfGenMu.iMax, z.theta, x[i], i)
 			z.zipfGenMu.mu.Unlock()
 			if withIncrements {
-				if err := z.IncrementIMax(); err != nil {
+				if err := z.IncrementIMax(1); err != nil {
 					t.Fatalf("could not increment iMax: %s", err)
 				}
 			}
@@ -142,7 +147,7 @@ func runZipfGenerators(t *testing.T, withIncrements bool) {
 	for i := 0; i < max; i += step {
 		count = 0
 		for {
-			if x[index] >= i {
+			if x[index] >= i+step {
 				break
 			}
 			index++
@@ -159,6 +164,7 @@ func runZipfGenerators(t *testing.T, withIncrements bool) {
 }
 
 func TestZipfGenerator(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	runZipfGenerators(t, false)
 	runZipfGenerators(t, true)
 }

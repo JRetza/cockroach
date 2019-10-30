@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -30,7 +26,7 @@ func assertStmt(t *testing.T, cmd Command, exp string) {
 	if !ok {
 		t.Fatalf("%s: expected ExecStmt, got %T", testutils.Caller(1), cmd)
 	}
-	if stmt.Stmt.String() != exp {
+	if stmt.AST.String() != exp {
 		t.Fatalf("%s: expected statement %s, got %s", testutils.Caller(1), exp, stmt)
 	}
 }
@@ -72,16 +68,16 @@ func TestStmtBuf(t *testing.T) {
 		t.Fatal(err)
 	}
 	buf := NewStmtBuf()
-	mustPush(ctx, t, buf, ExecStmt{Stmt: s1})
-	mustPush(ctx, t, buf, ExecStmt{Stmt: s2})
-	mustPush(ctx, t, buf, ExecStmt{Stmt: s3})
-	mustPush(ctx, t, buf, ExecStmt{Stmt: s4})
+	mustPush(ctx, t, buf, ExecStmt{Statement: s1})
+	mustPush(ctx, t, buf, ExecStmt{Statement: s2})
+	mustPush(ctx, t, buf, ExecStmt{Statement: s3})
+	mustPush(ctx, t, buf, ExecStmt{Statement: s4})
 
 	// Check that, while we don't manually advance the cursor, we keep getting the
 	// same statement.
 	expPos := CmdPos(0)
 	for i := 0; i < 2; i++ {
-		cmd, pos, err := buf.curCmd()
+		cmd, pos, err := buf.CurCmd()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -91,9 +87,9 @@ func TestStmtBuf(t *testing.T) {
 		assertStmt(t, cmd, "SELECT 1")
 	}
 
-	buf.advanceOne()
+	buf.AdvanceOne()
 	expPos++
-	cmd, pos, err := buf.curCmd()
+	cmd, pos, err := buf.CurCmd()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,9 +98,9 @@ func TestStmtBuf(t *testing.T) {
 	}
 	assertStmt(t, cmd, "SELECT 2")
 
-	buf.advanceOne()
+	buf.AdvanceOne()
 	expPos++
-	cmd, pos, err = buf.curCmd()
+	cmd, pos, err = buf.CurCmd()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,9 +109,9 @@ func TestStmtBuf(t *testing.T) {
 	}
 	assertStmt(t, cmd, "SELECT 3")
 
-	buf.advanceOne()
+	buf.AdvanceOne()
 	expPos++
-	cmd, pos, err = buf.curCmd()
+	cmd, pos, err = buf.CurCmd()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,8 +122,8 @@ func TestStmtBuf(t *testing.T) {
 
 	// Now rewind.
 	expPos = 1
-	buf.rewind(ctx, expPos)
-	cmd, pos, err = buf.curCmd()
+	buf.Rewind(ctx, expPos)
+	cmd, pos, err = buf.CurCmd()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,11 +145,11 @@ func TestStmtBufSignal(t *testing.T) {
 		t.Fatal(err)
 	}
 	go func() {
-		_ = buf.Push(ctx, ExecStmt{Stmt: s1})
+		_ = buf.Push(ctx, ExecStmt{Statement: s1})
 	}()
 
 	expPos := CmdPos(0)
-	cmd, pos, err := buf.curCmd()
+	cmd, pos, err := buf.CurCmd()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,14 +170,14 @@ func TestStmtBufLtrim(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		mustPush(ctx, t, buf, ExecStmt{Stmt: stmt})
+		mustPush(ctx, t, buf, ExecStmt{Statement: stmt})
 	}
 	// Advance the cursor so that we can trim.
-	buf.advanceOne()
-	buf.advanceOne()
+	buf.AdvanceOne()
+	buf.AdvanceOne()
 	trimPos := CmdPos(2)
 	buf.ltrim(ctx, trimPos)
-	if l := len(buf.mu.data); l != 3 {
+	if l := buf.mu.data.Len(); l != 3 {
 		t.Fatalf("expected 3 left, got: %d", l)
 	}
 	if s := buf.mu.startPos; s != 2 {
@@ -189,7 +185,7 @@ func TestStmtBufLtrim(t *testing.T) {
 	}
 }
 
-// Test that, after Close() is called, buf.curCmd() returns io.EOF even if
+// Test that, after Close() is called, buf.CurCmd() returns io.EOF even if
 // there were commands queued up.
 func TestStmtBufClose(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -200,16 +196,16 @@ func TestStmtBufClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mustPush(ctx, t, buf, ExecStmt{Stmt: stmt})
+	mustPush(ctx, t, buf, ExecStmt{Statement: stmt})
 	buf.Close()
 
-	_, _, err = buf.curCmd()
+	_, _, err = buf.CurCmd()
 	if err != io.EOF {
 		t.Fatalf("expected EOF, got: %v", err)
 	}
 }
 
-// Test that a call to Close() unblocks a curCmd() call.
+// Test that a call to Close() unblocks a CurCmd() call.
 func TestStmtBufCloseUnblocksReader(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -219,7 +215,7 @@ func TestStmtBufCloseUnblocksReader(t *testing.T) {
 		buf.Close()
 	}()
 
-	_, _, err := buf.curCmd()
+	_, _, err := buf.CurCmd()
 	if err != io.EOF {
 		t.Fatalf("expected EOF, got: %v", err)
 	}
@@ -237,33 +233,33 @@ func TestStmtBufPreparedStmt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mustPush(ctx, t, buf, ExecStmt{Stmt: s1})
+	mustPush(ctx, t, buf, ExecStmt{Statement: s1})
 	mustPush(ctx, t, buf, PrepareStmt{Name: "p1"})
 	mustPush(ctx, t, buf, PrepareStmt{Name: "p2"})
 
-	cmd, _, err := buf.curCmd()
+	cmd, _, err := buf.CurCmd()
 	if err != nil {
 		t.Fatal(err)
 	}
 	assertStmt(t, cmd, "SELECT 1")
 
-	buf.advanceOne()
-	cmd, _, err = buf.curCmd()
+	buf.AdvanceOne()
+	cmd, _, err = buf.CurCmd()
 	if err != nil {
 		t.Fatal(err)
 	}
 	assertPrepareStmt(t, cmd, "p1")
 
-	buf.advanceOne()
-	cmd, _, err = buf.curCmd()
+	buf.AdvanceOne()
+	cmd, _, err = buf.CurCmd()
 	if err != nil {
 		t.Fatal(err)
 	}
 	assertPrepareStmt(t, cmd, "p2")
 
 	// Rewind to the first prepared stmt.
-	buf.rewind(ctx, CmdPos(1))
-	cmd, _, err = buf.curCmd()
+	buf.Rewind(ctx, CmdPos(1))
+	cmd, _, err = buf.CurCmd()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,26 +280,26 @@ func TestStmtBufBatching(t *testing.T) {
 	// Start a new batch.
 	mustPush(ctx, t, buf, Sync{})
 
-	mustPush(ctx, t, buf, ExecStmt{Stmt: s1})
-	mustPush(ctx, t, buf, ExecStmt{Stmt: s1})
+	mustPush(ctx, t, buf, ExecStmt{Statement: s1})
+	mustPush(ctx, t, buf, ExecStmt{Statement: s1})
 
 	// Start a new batch.
 	mustPush(ctx, t, buf, Sync{})
 
-	mustPush(ctx, t, buf, ExecStmt{Stmt: s1})
-	mustPush(ctx, t, buf, ExecStmt{Stmt: s1})
-	mustPush(ctx, t, buf, ExecStmt{Stmt: s1})
+	mustPush(ctx, t, buf, ExecStmt{Statement: s1})
+	mustPush(ctx, t, buf, ExecStmt{Statement: s1})
+	mustPush(ctx, t, buf, ExecStmt{Statement: s1})
 
 	// Start a new batch.
 	mustPush(ctx, t, buf, Sync{})
 
-	mustPush(ctx, t, buf, ExecStmt{Stmt: s1})
+	mustPush(ctx, t, buf, ExecStmt{Statement: s1})
 
 	// Go to 2nd batch.
 	if err := buf.seekToNextBatch(); err != nil {
 		t.Fatal(err)
 	}
-	_, pos, err := buf.curCmd()
+	_, pos, err := buf.CurCmd()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -315,7 +311,7 @@ func TestStmtBufBatching(t *testing.T) {
 	if err := buf.seekToNextBatch(); err != nil {
 		t.Fatal(err)
 	}
-	_, pos, err = buf.curCmd()
+	_, pos, err = buf.CurCmd()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,14 +322,14 @@ func TestStmtBufBatching(t *testing.T) {
 	// Async start a 4th batch; that will unblock the seek below.
 	go func() {
 		mustPush(ctx, t, buf, Sync{})
-		_ = buf.Push(ctx, ExecStmt{Stmt: s1})
+		_ = buf.Push(ctx, ExecStmt{Statement: s1})
 	}()
 
 	// Go to 4th batch.
 	if err := buf.seekToNextBatch(); err != nil {
 		t.Fatal(err)
 	}
-	_, pos, err = buf.curCmd()
+	_, pos, err = buf.CurCmd()
 	if err != nil {
 		t.Fatal(err)
 	}

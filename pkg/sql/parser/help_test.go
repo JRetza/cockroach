@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package parser
 
@@ -69,6 +65,12 @@ func TestContextualHelp(t *testing.T) {
 
 		{`ALTER USER IF ??`, `ALTER USER`},
 		{`ALTER USER foo WITH PASSWORD ??`, `ALTER USER`},
+
+		{`ALTER RANGE foo CONFIGURE ??`, `ALTER RANGE`},
+		{`ALTER RANGE ??`, `ALTER RANGE`},
+
+		{`ALTER PARTITION ??`, `ALTER PARTITION`},
+		{`ALTER PARTITION p OF INDEX tbl@idx ??`, `ALTER PARTITION`},
 
 		{`CANCEL ??`, `CANCEL`},
 		{`CANCEL JOB ??`, `CANCEL JOBS`},
@@ -242,7 +244,9 @@ func TestContextualHelp(t *testing.T) {
 		{`SHOW TRACE FOR SESSION ??`, `SHOW TRACE`},
 		{`SHOW TRACE FOR ??`, `SHOW TRACE`},
 
+		{`SHOW JOB ??`, `SHOW JOBS`},
 		{`SHOW JOBS ??`, `SHOW JOBS`},
+		{`SHOW AUTOMATIC JOBS ??`, `SHOW JOBS`},
 
 		{`SHOW BACKUP 'foo' ??`, `SHOW BACKUP`},
 
@@ -255,11 +259,10 @@ func TestContextualHelp(t *testing.T) {
 		{`SHOW CONSTRAINTS FROM ??`, `SHOW CONSTRAINTS`},
 		{`SHOW CONSTRAINTS FROM foo ??`, `SHOW CONSTRAINTS`},
 
-		{`SHOW CREATE TABLE blah ??`, `SHOW CREATE TABLE`},
-
-		{`SHOW CREATE VIEW blah ??`, `SHOW CREATE VIEW`},
-
-		{`SHOW CREATE SEQUENCE blah ??`, `SHOW CREATE SEQUENCE`},
+		{`SHOW CREATE ??`, `SHOW CREATE`},
+		{`SHOW CREATE TABLE blah ??`, `SHOW CREATE`},
+		{`SHOW CREATE VIEW blah ??`, `SHOW CREATE`},
+		{`SHOW CREATE SEQUENCE blah ??`, `SHOW CREATE`},
 
 		{`SHOW DATABASES ??`, `SHOW DATABASES`},
 
@@ -276,10 +279,15 @@ func TestContextualHelp(t *testing.T) {
 		{`SHOW INDEXES FROM ??`, `SHOW INDEXES`},
 		{`SHOW INDEXES FROM blah ??`, `SHOW INDEXES`},
 
+		{`SHOW PARTITIONS FROM ??`, `SHOW PARTITIONS`},
+
 		{`SHOW ROLES ??`, `SHOW ROLES`},
 
 		{`SHOW SCHEMAS FROM ??`, `SHOW SCHEMAS`},
 		{`SHOW SCHEMAS FROM blah ??`, `SHOW SCHEMAS`},
+
+		{`SHOW SEQUENCES FROM ??`, `SHOW SEQUENCES`},
+		{`SHOW SEQUENCES FROM blah ??`, `SHOW SEQUENCES`},
 
 		{`SHOW TABLES FROM ??`, `SHOW TABLES`},
 		{`SHOW TABLES FROM blah ??`, `SHOW TABLES`},
@@ -291,7 +299,9 @@ func TestContextualHelp(t *testing.T) {
 		{`SHOW SYNTAX ??`, `SHOW SYNTAX`},
 		{`SHOW SYNTAX 'foo' ??`, `SHOW SYNTAX`},
 
-		{`SHOW EXPERIMENTAL_RANGES ??`, `SHOW RANGES`},
+		{`SHOW RANGE ??`, `SHOW RANGE`},
+
+		{`SHOW RANGES ??`, `SHOW RANGES`},
 
 		{`SHOW USERS ??`, `SHOW USERS`},
 
@@ -396,13 +406,10 @@ func TestContextualHelp(t *testing.T) {
 				t.Fatalf("parser didn't trigger error")
 			}
 
-			if err.Error() != "help token in input" {
+			if !strings.HasPrefix(err.Error(), "help token in input") {
 				t.Fatal(err)
 			}
-			pgerr, ok := pgerror.GetPGCause(err)
-			if !ok {
-				t.Fatalf("expected pg error, got %v", err)
-			}
+			pgerr := pgerror.Flatten(err)
 			help := pgerr.Hint
 			msg := HelpMessage{Command: test.key, HelpMessageBody: HelpMessages[test.key]}
 			expected := msg.String()

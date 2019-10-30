@@ -1,21 +1,18 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package batcheval
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -30,15 +27,9 @@ func init() {
 }
 
 func declareKeysHeartbeatTransaction(
-	desc roachpb.RangeDescriptor, header roachpb.Header, req roachpb.Request, spans *spanset.SpanSet,
+	desc *roachpb.RangeDescriptor, header roachpb.Header, req roachpb.Request, spans *spanset.SpanSet,
 ) {
-	DeclareKeysWriteTransaction(desc, header, req, spans)
-	if header.Txn != nil {
-		header.Txn.AssertInitialized(context.TODO())
-		spans.Add(spanset.SpanReadOnly, roachpb.Span{
-			Key: keys.AbortSpanKey(header.RangeID, header.Txn.ID),
-		})
-	}
+	declareKeysWriteTransaction(desc, header, req, spans)
 }
 
 // HeartbeatTxn updates the transaction status and heartbeat
@@ -51,26 +42,36 @@ func HeartbeatTxn(
 	h := cArgs.Header
 	reply := resp.(*roachpb.HeartbeatTxnResponse)
 
-	if err := VerifyTransaction(h, args); err != nil {
+	if err := VerifyTransaction(h, args, roachpb.PENDING, roachpb.STAGING); err != nil {
 		return result.Result{}, err
+	}
+
+	if args.Now.IsEmpty() {
+		return result.Result{}, fmt.Errorf("now not specified for heartbeat")
 	}
 
 	key := keys.TransactionKey(h.Txn.Key, h.Txn.ID)
 
 	var txn roachpb.Transaction
-	if ok, err := engine.MVCCGetProto(ctx, batch, key, hlc.Timestamp{}, true, nil, &txn); err != nil {
+	if ok, err := engine.MVCCGetProto(
+		ctx, batch, key, hlc.Timestamp{}, &txn, engine.MVCCGetOptions{},
+	); err != nil {
 		return result.Result{}, err
 	} else if !ok {
-		// If no existing transaction record was found, skip heartbeat.
-		// This could mean the heartbeat is a delayed relic or it could
-		// mean that the BeginTransaction call was delayed. In either
-		// case, there's no reason to persist a new transaction record.
-		return result.Result{}, roachpb.NewTransactionNotFoundStatusError()
+		// No existing transaction record was found - create one by writing
+		// it below.
+		txn = *h.Txn
+
+		// Verify that it is safe to create the transaction record.
+		if err := CanCreateTxnRecord(cArgs.EvalCtx, &txn); err != nil {
+			return result.Result{}, err
+		}
 	}
 
-	if txn.Status == roachpb.PENDING {
+	if !txn.Status.IsFinalized() {
 		txn.LastHeartbeat.Forward(args.Now)
-		if err := engine.MVCCPutProto(ctx, batch, cArgs.Stats, key, hlc.Timestamp{}, nil, &txn); err != nil {
+		txnRecord := txn.AsRecord()
+		if err := engine.MVCCPutProto(ctx, batch, cArgs.Stats, key, hlc.Timestamp{}, nil, &txnRecord); err != nil {
 			return result.Result{}, err
 		}
 	}

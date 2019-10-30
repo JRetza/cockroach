@@ -14,19 +14,29 @@
 =>
 $input
 
+# EliminateOffset discards an Offset operator if its offset value is zero.
+[EliminateOffset, Normalize]
+(Offset
+    $input:*
+    (Const 0)
+)
+=>
+$input
+
 # PushLimitIntoProject pushes the Limit operator into its Project input. It is
 # desirable to push the Limit operator as low in the query as possible, in order
 # to minimize the number of rows that other operators need to process.
 [PushLimitIntoProject, Normalize]
 (Limit
-    (Project $input:* $projections:*)
+    (Project $input:* $projections:* $passthrough:*)
     $limit:*
-    $ordering:*
+    $ordering:* & (HasColsInOrdering $input $ordering)
 )
 =>
 (Project
-    (Limit $input $limit $ordering)
+    (Limit $input $limit (PruneOrdering $ordering (OutputCols $input)))
     $projections
+    $passthrough
 )
 
 # PushOffsetIntoProject pushes the Offset operator into its Project input. It is
@@ -34,12 +44,38 @@ $input
 # order to minimize the number of rows that other operators need to process.
 [PushOffsetIntoProject, Normalize]
 (Offset
-    (Project $input:* $projections:*)
+    (Project $input:* $projections:* $passthrough:*)
     $offset:*
-    $ordering:*
+    $ordering:* & (HasColsInOrdering $input $ordering)
 )
 =>
 (Project
-    (Offset $input $offset $ordering)
+    (Offset $input $offset (PruneOrdering $ordering (OutputCols $input)))
     $projections
+    $passthrough
+)
+
+# PushLimitIntoOffset pushes the Limit operator into the offset. This should
+# not have a negative impact but it would allow the use of the GenerateLimitedScans
+# rule.
+[PushLimitIntoOffset, Normalize]
+(Limit
+    (Offset
+        $input:*
+        (Const $offset:* & (IsPositiveLimit $offset))
+        $offsetOrdering:*
+    )
+    (Const $limit:* & (IsPositiveLimit $limit))
+    $limitOrdering:* & (IsSameOrdering $offsetOrdering $limitOrdering) &
+        (CanAddConstInts $limit $offset)
+)
+=>
+(Offset
+    (Limit
+        $input
+        (Const (AddConstInts $offset $limit))
+        $limitOrdering
+     )
+    (Const $offset)
+    $offsetOrdering
 )

@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package batcheval
 
@@ -32,18 +28,34 @@ func init() {
 // of the previous lease (or zero). If this range replica is already the lease
 // holder, the expiration will be extended or shortened as indicated. For a new
 // lease, all duties required of the range lease holder are commenced, including
-// clearing the command queue and timestamp cache.
+// releasing all latches and clearing the timestamp cache.
 func RequestLease(
 	ctx context.Context, batch engine.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
 ) (result.Result, error) {
+	// When returning an error from this method, must always return a
+	// newFailedLeaseTrigger() to satisfy stats.
 	args := cArgs.Args.(*roachpb.RequestLeaseRequest)
-	// When returning an error from this method, must always return
-	// a newFailedLeaseTrigger() to satisfy stats.
-	prevLease, _ := cArgs.EvalCtx.GetLease()
 
+	prevLease, _ := cArgs.EvalCtx.GetLease()
 	rErr := &roachpb.LeaseRejectedError{
 		Existing:  prevLease,
 		Requested: args.Lease,
+	}
+
+	// For now, don't allow replicas of type LEARNER to be leaseholders. There's
+	// no reason this wouldn't work in principle, but it seems inadvisable. In
+	// particular, learners can't become raft leaders, so we wouldn't be able to
+	// co-locate the leaseholder + raft leader, which is going to affect tail
+	// latencies. Additionally, as of the time of writing, learner replicas are
+	// only used for a short time in replica addition, so it's not worth working
+	// out the edge cases. If we decide to start using long-lived learners at some
+	// point, that math may change.
+	//
+	// If this check is removed at some point, the filtering of learners on the
+	// sending side would have to be removed as well.
+	if err := checkCanReceiveLease(cArgs.EvalCtx); err != nil {
+		rErr.Message = err.Error()
+		return newFailedLeaseTrigger(false /* isTransfer */), rErr
 	}
 
 	// MIGRATION(tschottdorf): needed to apply Raft commands which got proposed
@@ -76,13 +88,13 @@ func RequestLease(
 		// If the lease holder promised to not propose any commands below
 		// MinProposedTS, it must also not be allowed to extend a lease before that
 		// timestamp. We make sure that when a node restarts, its earlier in-flight
-		// commands (which are not tracked by the command queue post restart)
+		// commands (which are not tracked by the spanlatch manager post restart)
 		// receive an error under the new lease by making sure the sequence number
 		// of that lease is higher. This in turn is achieved by forwarding its start
 		// time here, which makes it not Equivalent() to the preceding lease for the
 		// same store.
 		//
-		// Note also that leastPostApply makes sure to update the timestamp cache in
+		// Note also that leasePostApply makes sure to update the timestamp cache in
 		// this case: even though the lease holder does not change, the the sequence
 		// number does and this triggers a low water mark bump.
 		//

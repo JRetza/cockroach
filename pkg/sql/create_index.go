@@ -1,23 +1,19 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
 	"context"
-	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -26,7 +22,7 @@ import (
 
 type createIndexNode struct {
 	n         *tree.CreateIndex
-	tableDesc *sqlbase.TableDescriptor
+	tableDesc *sqlbase.MutableTableDescriptor
 }
 
 // CreateIndex creates an index.
@@ -34,17 +30,9 @@ type createIndexNode struct {
 //   notes: postgres requires CREATE on the table.
 //          mysql requires INDEX on the table.
 func (p *planner) CreateIndex(ctx context.Context, n *tree.CreateIndex) (planNode, error) {
-	tn, err := n.Table.Normalize()
-	if err != nil {
-		return nil, err
-	}
-
-	var tableDesc *TableDescriptor
-	// DDL statements avoid the cache to avoid leases, and can view non-public descriptors.
-	// TODO(vivek): check if the cache can be used.
-	p.runWithOptions(resolveFlags{skipCache: true}, func() {
-		tableDesc, err = ResolveExistingObject(ctx, p, tn, true /*required*/, requireTableDesc)
-	})
+	tableDesc, err := p.ResolveMutableTableDescriptor(
+		ctx, &n.Table, true /*required*/, ResolveRequireTableDesc,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -56,48 +44,66 @@ func (p *planner) CreateIndex(ctx context.Context, n *tree.CreateIndex) (planNod
 	return &createIndexNode{tableDesc: tableDesc, n: n}, nil
 }
 
+// MakeIndexDescriptor creates an index descriptor from a CreateIndex node.
+func MakeIndexDescriptor(n *tree.CreateIndex) (*sqlbase.IndexDescriptor, error) {
+	indexDesc := sqlbase.IndexDescriptor{
+		Name:             string(n.Name),
+		Unique:           n.Unique,
+		StoreColumnNames: n.Storing.ToStrings(),
+	}
+
+	if n.Inverted {
+		if n.Interleave != nil {
+			return nil, pgerror.New(pgcode.InvalidSQLStatementName, "inverted indexes don't support interleaved tables")
+		}
+
+		if n.PartitionBy != nil {
+			return nil, pgerror.New(pgcode.InvalidSQLStatementName, "inverted indexes don't support partitioning")
+		}
+
+		if len(indexDesc.StoreColumnNames) > 0 {
+			return nil, pgerror.New(pgcode.InvalidSQLStatementName, "inverted indexes don't support stored columns")
+		}
+
+		if n.Unique {
+			return nil, pgerror.New(pgcode.InvalidSQLStatementName, "inverted indexes can't be unique")
+		}
+		indexDesc.Type = sqlbase.IndexDescriptor_INVERTED
+	}
+
+	if err := indexDesc.FillColumns(n.Columns); err != nil {
+		return nil, err
+	}
+	return &indexDesc, nil
+}
+
 func (n *createIndexNode) startExec(params runParams) error {
 	_, dropped, err := n.tableDesc.FindIndexByName(string(n.n.Name))
 	if err == nil {
 		if dropped {
-			return fmt.Errorf("index %q being dropped, try again later", string(n.n.Name))
+			return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
+				"index %q being dropped, try again later", string(n.n.Name))
 		}
 		if n.n.IfNotExists {
 			return nil
 		}
 	}
 
-	indexDesc := sqlbase.IndexDescriptor{
-		Name:             string(n.n.Name),
-		Unique:           n.n.Unique,
-		StoreColumnNames: n.n.Storing.ToStrings(),
+	// Guard against creating a non-partitioned index on a partitioned table,
+	// which is undesirable in most cases.
+	if params.SessionData().SafeUpdates && n.n.PartitionBy == nil &&
+		n.tableDesc.PrimaryIndex.Partitioning.NumColumns > 0 {
+		return pgerror.DangerousStatementf("non-partitioned index on partitioned table")
 	}
 
-	if n.n.Inverted {
-		if n.n.Interleave != nil {
-			return pgerror.NewError(pgerror.CodeInvalidSQLStatementNameError, "inverted indexes don't support interleaved tables")
-		}
-
-		if n.n.PartitionBy != nil {
-			return pgerror.NewError(pgerror.CodeInvalidSQLStatementNameError, "inverted indexes don't support partitioning")
-		}
-
-		if len(indexDesc.StoreColumnNames) > 0 {
-			return pgerror.NewError(pgerror.CodeInvalidSQLStatementNameError, "inverted indexes don't support stored columns")
-		}
-
-		if n.n.Unique {
-			return pgerror.NewError(pgerror.CodeInvalidSQLStatementNameError, "inverted indexes can't be unique")
-		}
-		indexDesc.Type = sqlbase.IndexDescriptor_INVERTED
-	}
-
-	if err := indexDesc.FillColumns(n.n.Columns); err != nil {
+	indexDesc, err := MakeIndexDescriptor(n.n)
+	if err != nil {
 		return err
 	}
+
 	if n.n.PartitionBy != nil {
 		partitioning, err := CreatePartitioning(params.ctx, params.p.ExecCfg().Settings,
-			params.EvalContext(), n.tableDesc, &indexDesc, n.n.PartitionBy)
+			params.EvalContext(), n.tableDesc, indexDesc, n.n.PartitionBy)
 		if err != nil {
 			return err
 		}
@@ -112,29 +118,35 @@ func (n *createIndexNode) startExec(params runParams) error {
 		return err
 	}
 
+	// The index name may have changed as a result of
+	// AllocateIDs(). Retrieve it for the event log below.
+	index := n.tableDesc.Mutations[mutationIdx].GetIndex()
+	indexName := index.Name
+
 	if n.n.Interleave != nil {
-		index := n.tableDesc.Mutations[mutationIdx].GetIndex()
 		if err := params.p.addInterleave(params.ctx, n.tableDesc, index, n.n.Interleave); err != nil {
 			return err
 		}
-		if err := params.p.finalizeInterleave(params.ctx, n.tableDesc, *index); err != nil {
+		if err := params.p.finalizeInterleave(params.ctx, n.tableDesc, index); err != nil {
 			return err
 		}
 	}
 
-	mutationID, err := params.p.createSchemaChangeJob(params.ctx, n.tableDesc,
-		tree.AsStringWithFlags(n.n, tree.FmtAlwaysQualifyTableNames))
+	mutationID, err := params.p.createOrUpdateSchemaChangeJob(
+		params.ctx, n.tableDesc,
+		tree.AsStringWithFQNames(n.n, params.Ann()),
+	)
 	if err != nil {
 		return err
 	}
-	if err := params.p.writeTableDesc(params.ctx, n.tableDesc); err != nil {
+	if err := params.p.writeSchemaChange(params.ctx, n.tableDesc, mutationID); err != nil {
 		return err
 	}
 
 	// Record index creation in the event log. This is an auditable log
 	// event and is recorded in the same transaction as the table descriptor
 	// update.
-	if err := MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
+	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
 		params.ctx,
 		params.p.txn,
 		EventLogCreateIndex,
@@ -147,15 +159,10 @@ func (n *createIndexNode) startExec(params runParams) error {
 			User       string
 			MutationID uint32
 		}{
-			n.n.Table.TableName().FQString(), n.n.Name.String(), n.n.String(),
+			n.n.Table.FQString(), indexName, n.n.String(),
 			params.SessionData().User, uint32(mutationID),
 		},
-	); err != nil {
-		return err
-	}
-	params.p.notifySchemaChange(n.tableDesc, mutationID)
-
-	return nil
+	)
 }
 
 func (*createIndexNode) Next(runParams) (bool, error) { return false, nil }

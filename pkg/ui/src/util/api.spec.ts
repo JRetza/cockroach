@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import { assert } from "chai";
 import _ from "lodash";
 import moment from "moment";
@@ -449,7 +459,7 @@ describe("rest api", function() {
 
       return api.getHealth(new protos.cockroach.server.serverpb.HealthRequest()).then((result) => {
         assert.lengthOf(fetchMock.calls(healthUrl), 1);
-        assert.deepEqual(result.toJSON(), new protos.cockroach.server.serverpb.HealthResponse().toJSON());
+        assert.deepEqual(result, new protos.cockroach.server.serverpb.HealthResponse());
       });
     });
 

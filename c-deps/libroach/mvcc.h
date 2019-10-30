@@ -1,23 +1,21 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 #pragma once
 
+#include <algorithm>
 #include "chunked_buffer.h"
 #include "db.h"
 #include "encoding.h"
 #include "iterator.h"
+#include "keys.h"
 #include "protos/storage/engine/enginepb/mvcc.pb.h"
 #include "status.h"
 #include "timestamp.h"
@@ -50,7 +48,7 @@ static const int kMaxItersBeforeSeek = 10;
 template <bool reverse> class mvccScanner {
  public:
   mvccScanner(DBIterator* iter, DBSlice start, DBSlice end, DBTimestamp timestamp, int64_t max_keys,
-              DBTxn txn, bool consistent, bool tombstones)
+              DBTxn txn, bool inconsistent, bool tombstones, bool ignore_sequence)
       : iter_(iter),
         iter_rep_(iter->rep.get()),
         start_key_(ToSlice(start)),
@@ -59,14 +57,15 @@ template <bool reverse> class mvccScanner {
         timestamp_(timestamp),
         txn_id_(ToSlice(txn.id)),
         txn_epoch_(txn.epoch),
+        txn_sequence_(txn.sequence),
         txn_max_timestamp_(txn.max_timestamp),
-        consistent_(consistent),
+        inconsistent_(inconsistent),
         tombstones_(tombstones),
+        ignore_sequence_(ignore_sequence),
         check_uncertainty_(timestamp < txn.max_timestamp),
         kvs_(new chunkedBuffer),
         intents_(new rocksdb::WriteBatch),
         peeked_(false),
-        is_get_(false),
         iters_before_seek_(kMaxItersBeforeSeek / 2) {
     memset(&results_, 0, sizeof(results_));
     results_.status = kSuccess;
@@ -104,13 +103,10 @@ template <bool reverse> class mvccScanner {
   // reading transactionally and we own the intent.
 
   const DBScanResults& get() {
-    is_get_ = true;
     if (!iterSeek(EncodeKey(start_key_, 0, 0))) {
       return results_;
     }
-    if (cur_key_ == start_key_) {
-      getAndAdvance();
-    }
+    getAndAdvance();
     return fillResults();
   }
 
@@ -127,19 +123,25 @@ template <bool reverse> class mvccScanner {
       if (!iterSeekReverse(EncodeKey(start_key_, 0, 0))) {
         return results_;
       }
-      for (; cur_key_.compare(end_key_) >= 0;) {
-        if (!getAndAdvance()) {
-          break;
-        }
-      }
     } else {
       if (!iterSeek(EncodeKey(start_key_, 0, 0))) {
         return results_;
       }
-      for (; cur_key_.compare(end_key_) < 0;) {
-        if (!getAndAdvance()) {
-          break;
-        }
+    }
+
+    while (getAndAdvance()) {
+    }
+
+    if (kvs_->Count() == max_keys_ && advanceKey()) {
+      if (reverse) {
+        // It is possible for cur_key_ to be pointing into mvccScanner.saved_buf_
+        // instead of iter_rep_'s underlying storage if iterating in reverse (see
+        // iterPeekPrev), so copy the key onto the DBIterator struct to ensure it
+        // has a lifetime that outlives the DBScanResults.
+        iter_->rev_resume_key.assign(cur_key_.data(), cur_key_.size());
+        results_.resume_key = ToDBSlice(iter_->rev_resume_key);
+      } else {
+        results_.resume_key = ToDBSlice(cur_key_);
       }
     }
 
@@ -160,6 +162,34 @@ template <bool reverse> class mvccScanner {
       iter_->intents.reset(intents_.release());
     }
     return results_;
+  }
+
+  bool getFromIntentHistory() {
+    cockroach::storage::engine::enginepb::MVCCMetadata_SequencedIntent readIntent;
+    readIntent.set_sequence(txn_sequence_);
+    // Look for the intent with the sequence number less than or equal to the
+    // read sequence. To do so, search using upper_bound, which returns an
+    // iterator pointing to the first element in the range [first, last) that is
+    // greater than value, or last if no such element is found. Then, return the
+    // previous value.
+    auto up = std::upper_bound(
+        meta_.intent_history().begin(), meta_.intent_history().end(), readIntent,
+        [](const cockroach::storage::engine::enginepb::MVCCMetadata_SequencedIntent& a,
+           const cockroach::storage::engine::enginepb::MVCCMetadata_SequencedIntent& b) -> bool {
+          return a.sequence() < b.sequence();
+        });
+    if (up == meta_.intent_history().begin()) {
+      // It is possible that no intent exists such that the sequence is less
+      // than the read sequence. In this case, we cannot read a value from the
+      // intent history.
+      return false;
+    }
+    const auto intent = *(up - 1);
+    rocksdb::Slice value = intent.value();
+    if (value.size() > 0 || tombstones_) {
+      kvs_->Put(cur_raw_key_, value);
+    }
+    return true;
   }
 
   bool uncertaintyError(DBTimestamp ts) {
@@ -204,6 +234,10 @@ template <bool reverse> class mvccScanner {
       return seekVersion(timestamp_, false);
     }
 
+    if (cur_value_.size() == 0) {
+      return setStatus(FmtStatus("zero-length mvcc metadata"));
+    }
+
     if (!meta_.ParseFromArray(cur_value_.data(), cur_value_.size())) {
       return setStatus(FmtStatus("unable to decode MVCCMetadata"));
     }
@@ -219,7 +253,18 @@ template <bool reverse> class mvccScanner {
 
     const bool own_intent = (meta_.txn().id() == txn_id_);
     const DBTimestamp meta_timestamp = ToDBTimestamp(meta_.timestamp());
-    if (timestamp_ < meta_timestamp && !own_intent) {
+    // meta_timestamp is the timestamp of an intent value, which we may or may
+    // not end up ignoring, depending on factors codified below. If we do ignore
+    // the intent then we want to read at a lower timestamp that's strictly
+    // below the intent timestamp (to skip the intent), but also does not exceed
+    // our read timestamp (to avoid erroneously picking up future committed
+    // values); this timestamp is prev_timestamp.
+    const DBTimestamp prev_timestamp =
+        timestamp_ < meta_timestamp ? timestamp_ : PrevTimestamp(meta_timestamp);
+    // Intents for other transactions are visible at or below:
+    //   max(txn.max_timestamp, read_timestamp)
+    const DBTimestamp max_visible_timestamp = check_uncertainty_ ? txn_max_timestamp_ : timestamp_;
+    if (max_visible_timestamp < meta_timestamp && !own_intent) {
       // 5. The key contains an intent, but we're reading before the
       // intent. Seek to the desired version. Note that if we own the
       // intent (i.e. we're reading transactionally) we want to read
@@ -228,27 +273,22 @@ template <bool reverse> class mvccScanner {
       return seekVersion(timestamp_, false);
     }
 
-    if (!consistent_) {
+    if (inconsistent_) {
       // 6. The key contains an intent and we're doing an inconsistent
       // read at a timestamp newer than the intent. We ignore the
       // intent by insisting that the timestamp we're reading at is a
       // historical timestamp < the intent timestamp. However, we
       // return the intent separately; the caller may want to resolve
       // it.
-      if (kvs_->Count() == max_keys_ && !is_get_) {
+      if (kvs_->Count() == max_keys_) {
         // We've already retrieved the desired number of keys and now
         // we're adding the resume key. We don't want to add the
         // intent here as the intents should only correspond to KVs
-        // that lie before the resume key. The "!is_get_" is necessary
-        // to handle MVCCGet which specifies max_keys_==0 in order to
-        // avoid iterating to the next key. In the "get" path we want
-        // to return the intent associated with the key even though
-        // max_keys_==0.
-        kvs_->Put(cur_raw_key_, rocksdb::Slice());
+        // that lie before the resume key.
         return false;
       }
       intents_->Put(cur_raw_key_, cur_value_);
-      return seekVersion(PrevTimestamp(ToDBTimestamp(meta_.timestamp())), false);
+      return seekVersion(prev_timestamp, false);
     }
 
     if (!own_intent) {
@@ -262,15 +302,35 @@ template <bool reverse> class mvccScanner {
     }
 
     if (txn_epoch_ == meta_.txn().epoch()) {
-      // 8. We're reading our own txn's intent. Note that we read at
-      // the intent timestamp, not at our read timestamp as the intent
-      // timestamp may have been pushed forward by another
-      // transaction. Txn's always need to read their own writes.
-      return seekVersion(meta_timestamp, false);
+      if ((ignore_sequence_) || (txn_sequence_ >= meta_.txn().sequence())) {
+        // 8. We're reading our own txn's intent at an equal or higher sequence.
+        // Note that we read at the intent timestamp, not at our read timestamp
+        // as the intent timestamp may have been pushed forward by another
+        // transaction. Txn's always need to read their own writes.
+        return seekVersion(meta_timestamp, false);
+      } else {
+        // 9. We're reading our own txn's intent at a lower sequence than is
+        // currently present in the intent. This means the intent we're seeing
+        // was written at a higher sequence than the read and that there may or
+        // may not be earlier versions of the intent (with lower sequence
+        // numbers) that we should read. If there exists a value in the intent
+        // history that has a sequence number equal to or less than the read
+        // sequence, read that value.
+        const bool found = getFromIntentHistory();
+        if (found) {
+          return advanceKey();
+        }
+        // 10. If no value in the intent history has a sequence number equal to
+        // or less than the read, we must ignore the intents laid down by the
+        // transaction all together. We ignore the intent by insisting that the
+        // timestamp we're reading at is a historical timestamp < the intent
+        // timestamp.
+        return seekVersion(prev_timestamp, false);
+      }
     }
 
     if (txn_epoch_ < meta_.txn().epoch()) {
-      // 9. We're reading our own txn's intent but the current txn has
+      // 11. We're reading our own txn's intent but the current txn has
       // an earlier epoch than the intent. Return an error so that the
       // earlier incarnation of our transaction aborts (presumably
       // this is some operation that was retried).
@@ -278,27 +338,18 @@ template <bool reverse> class mvccScanner {
                                  txn_epoch_, meta_.txn().epoch()));
     }
 
-    // 10. We're reading our own txn's intent but the current txn has a
+    // 12. We're reading our own txn's intent but the current txn has a
     // later epoch than the intent. This can happen if the txn was
     // restarted and an earlier iteration wrote the value we're now
     // reading. In this case, we ignore the intent and read the
     // previous value as if the transaction were starting fresh.
-    return seekVersion(PrevTimestamp(ToDBTimestamp(meta_.timestamp())), false);
+    return seekVersion(prev_timestamp, false);
   }
 
   // nextKey advances the iterator to point to the next MVCC key
   // greater than cur_key_. Returns false if the iterator is exhausted
   // or an error occurs.
   bool nextKey() {
-    // Check to see if the next key is the end key. This avoids
-    // advancing the iterator unnecessarily. For example, SQL can take
-    // advantage of this when doing single row reads with an
-    // appropriately set end key.
-    if (cur_key_.size() + 1 == end_key_.size() && end_key_.starts_with(cur_key_) &&
-        end_key_[cur_key_.size()] == '\0') {
-      return false;
-    }
-
     key_buf_.assign(cur_key_.data(), cur_key_.size());
 
     for (int i = 0; i < iters_before_seek_; ++i) {
@@ -352,17 +403,17 @@ template <bool reverse> class mvccScanner {
   // than the specified key. Returns false if the iterator is
   // exhausted or an error occurs.
   bool prevKey(const rocksdb::Slice& key) {
-    if (peeked_ && iter_rep_->key().compare(end_key_) < 0) {
-      // No need to look at the previous key if it is less than our
-      // end key.
-      return false;
-    }
-
     key_buf_.assign(key.data(), key.size());
 
     for (int i = 0; i < iters_before_seek_; ++i) {
       rocksdb::Slice peeked_key;
       if (!iterPeekPrev(&peeked_key)) {
+        return false;
+      }
+      if (peeked_key.empty()) {
+        // `iterPeekPrev()` may return true even when it did not find a key. This
+        // case is indicated by `peeked_key.empty()`. In that case there is not
+        // going to be any prev key, so we are done.
         return false;
       }
       if (peeked_key != key_buf_) {
@@ -423,7 +474,7 @@ template <bool reverse> class mvccScanner {
     // instructed to include tombstones in the results.
     if (value.size() > 0 || tombstones_) {
       kvs_->Put(cur_raw_key_, value);
-      if (kvs_->Count() > max_keys_) {
+      if (kvs_->Count() == max_keys_) {
         return false;
       }
     }
@@ -507,10 +558,12 @@ template <bool reverse> class mvccScanner {
   bool iterSeekReverse(const rocksdb::Slice& key) {
     clearPeeked();
 
-    // SeekForPrev positions the iterator at the key that is less than
-    // key. NB: the doc comment on SeekForPrev suggests it positions
-    // less than or equal, but this is a lie.
+    // `SeekForPrev` positions the iterator at the last key that is less than or
+    // equal to `key` AND strictly less than `ReadOptions::iterate_upper_bound`.
     iter_rep_->SeekForPrev(key);
+    if (iter_rep_->Valid() && key.compare(iter_rep_->key()) == 0) {
+      iter_rep_->Prev();
+    }
     if (!updateCurrent()) {
       return false;
     }
@@ -606,9 +659,11 @@ template <bool reverse> class mvccScanner {
   const DBTimestamp timestamp_;
   const rocksdb::Slice txn_id_;
   const uint32_t txn_epoch_;
+  const int32_t txn_sequence_;
   const DBTimestamp txn_max_timestamp_;
-  const bool consistent_;
+  const bool inconsistent_;
   const bool tombstones_;
+  const bool ignore_sequence_;
   const bool check_uncertainty_;
   DBScanResults results_;
   std::unique_ptr<chunkedBuffer> kvs_;
@@ -616,7 +671,6 @@ template <bool reverse> class mvccScanner {
   std::string key_buf_;
   std::string saved_buf_;
   bool peeked_;
-  bool is_get_;
   cockroach::storage::engine::enginepb::MVCCMetadata meta_;
   // cur_raw_key_ holds either iter_rep_->key() or the saved value of
   // iter_rep_->key() if we've peeked at the previous key (and peeked_

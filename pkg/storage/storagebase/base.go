@@ -1,24 +1,43 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storagebase
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 )
+
+// MergeQueueEnabled is a setting that controls whether the merge queue is
+// enabled.
+var MergeQueueEnabled = settings.RegisterBoolSetting(
+	"kv.range_merge.queue_enabled",
+	"whether the automatic merge queue is enabled",
+	true,
+)
+
+// TxnCleanupThreshold is the threshold after which a transaction is
+// considered abandoned and fit for removal, as measured by the
+// maximum of its last heartbeat and timestamp. Abort spans for the
+// transaction are cleaned up at the same time.
+//
+// TODO(tschottdorf): need to enforce at all times that this is much
+// larger than the heartbeat interval used by the coordinator.
+const TxnCleanupThreshold = time.Hour
 
 // CmdIDKey is a Raft command id.
 type CmdIDKey string
@@ -36,14 +55,14 @@ type FilterArgs struct {
 // ProposalFilterArgs groups the arguments to ReplicaProposalFilter.
 type ProposalFilterArgs struct {
 	Ctx   context.Context
-	Cmd   RaftCommand
+	Cmd   storagepb.RaftCommand
 	CmdID CmdIDKey
 	Req   roachpb.BatchRequest
 }
 
 // ApplyFilterArgs groups the arguments to a ReplicaApplyFilter.
 type ApplyFilterArgs struct {
-	ReplicatedEvalResult
+	storagepb.ReplicatedEvalResult
 	CmdID   CmdIDKey
 	RangeID roachpb.RangeID
 	StoreID roachpb.StoreID
@@ -56,9 +75,8 @@ func (f *FilterArgs) InRaftCmd() bool {
 }
 
 // ReplicaRequestFilter can be used in testing to influence the error returned
-// from a request before it is evaluated. Notably, the filter is run before the
-// request is added to the CommandQueue, so blocking in the filter will not
-// block interfering requests.
+// from a request before it is evaluated. Return nil to continue with regular
+// processing or non-nil to terminate processing with the returned error.
 type ReplicaRequestFilter func(roachpb.BatchRequest) *roachpb.Error
 
 // ReplicaCommandFilter may be used in tests through the StoreTestingKnobs to
@@ -72,32 +90,92 @@ type ReplicaCommandFilter func(args FilterArgs) *roachpb.Error
 type ReplicaProposalFilter func(args ProposalFilterArgs) *roachpb.Error
 
 // A ReplicaApplyFilter can be used in testing to influence the error returned
-// from proposals after they apply.
-type ReplicaApplyFilter func(args ApplyFilterArgs) *roachpb.Error
+// from proposals after they apply. The returned int is treated as a
+// storage.proposalReevaluationReason and will only take an effect when it is
+// nonzero and the existing reason is zero. Similarly, the error is only applied
+// if there's no error so far.
+type ReplicaApplyFilter func(args ApplyFilterArgs) (int, *roachpb.Error)
 
 // ReplicaResponseFilter is used in unittests to modify the outbound
 // response returned to a waiting client after a replica command has
 // been processed. This filter is invoked only by the command proposer.
 type ReplicaResponseFilter func(roachpb.BatchRequest, *roachpb.BatchResponse) *roachpb.Error
 
-// CommandQueueAction is an action taken by a BatchRequest's batchCmdSet on the
-// CommandQueue.
-type CommandQueueAction int
+// ContainsKey returns whether this range contains the specified key.
+func ContainsKey(desc roachpb.RangeDescriptor, key roachpb.Key) bool {
+	if bytes.HasPrefix(key, keys.LocalRangeIDPrefix) {
+		return bytes.HasPrefix(key, keys.MakeRangeIDPrefix(desc.RangeID))
+	}
+	keyAddr, err := keys.Addr(key)
+	if err != nil {
+		return false
+	}
+	return desc.ContainsKey(keyAddr)
+}
 
-const (
-	// CommandQueueWaitForPrereqs represents the state of a batchCmdSet when it
-	// has just inserted itself into the CommandQueue and is beginning to wait
-	// for prereqs to finish execution.
-	CommandQueueWaitForPrereqs CommandQueueAction = iota
-	// CommandQueueCancellation represents the state of a batchCmdSet when it
-	// is canceled while waiting for prerequisites to finish and is forced to
-	// remove itself from the CommandQueue without executing.
-	CommandQueueCancellation
-	// CommandQueueBeginExecuting represents the state of a batchCmdSet when it
-	// has finished waiting for all prereqs to finish execution and is now free
-	// to execute itself.
-	CommandQueueBeginExecuting
-	// CommandQueueFinishExecuting represents the state of a batchCmdSet when it
-	// has finished executing and will remove itself from the CommandQueue.
-	CommandQueueFinishExecuting
-)
+// ContainsKeyRange returns whether this range contains the specified key range
+// from start to end.
+func ContainsKeyRange(desc roachpb.RangeDescriptor, start, end roachpb.Key) bool {
+	startKeyAddr, err := keys.Addr(start)
+	if err != nil {
+		return false
+	}
+	endKeyAddr, err := keys.Addr(end)
+	if err != nil {
+		return false
+	}
+	return desc.ContainsKeyRange(startKeyAddr, endKeyAddr)
+}
+
+// IntersectSpan takes an intent and a descriptor. It then splits the
+// intent's range into up to three pieces: A first piece which is contained in
+// the Range, and a slice of up to two further intents which are outside of the
+// key range. An intent for which [Key, EndKey) is empty does not result in any
+// intents; thus intersectIntent only applies to intent ranges.
+// A range-local intent range is never split: It's returned as either
+// belonging to or outside of the descriptor's key range, and passing an intent
+// which begins range-local but ends non-local results in a panic.
+// TODO(tschottdorf): move to proto, make more gen-purpose - kv.truncate does
+// some similar things.
+func IntersectSpan(
+	span roachpb.Span, desc roachpb.RangeDescriptor,
+) (middle *roachpb.Span, outside []roachpb.Span) {
+	start, end := desc.StartKey.AsRawKey(), desc.EndKey.AsRawKey()
+	if len(span.EndKey) == 0 {
+		outside = append(outside, span)
+		return
+	}
+	if bytes.Compare(span.Key, keys.LocalRangeMax) < 0 {
+		if bytes.Compare(span.EndKey, keys.LocalRangeMax) >= 0 {
+			panic(fmt.Sprintf("a local intent range may not have a non-local portion: %s", span))
+		}
+		if ContainsKeyRange(desc, span.Key, span.EndKey) {
+			return &span, nil
+		}
+		return nil, append(outside, span)
+	}
+	// From now on, we're dealing with plain old key ranges - no more local
+	// addressing.
+	if bytes.Compare(span.Key, start) < 0 {
+		// Intent spans a part to the left of [start, end).
+		iCopy := span
+		if bytes.Compare(start, span.EndKey) < 0 {
+			iCopy.EndKey = start
+		}
+		span.Key = iCopy.EndKey
+		outside = append(outside, iCopy)
+	}
+	if bytes.Compare(span.Key, span.EndKey) < 0 && bytes.Compare(end, span.EndKey) < 0 {
+		// Intent spans a part to the right of [start, end).
+		iCopy := span
+		if bytes.Compare(iCopy.Key, end) < 0 {
+			iCopy.Key = end
+		}
+		span.EndKey = iCopy.Key
+		outside = append(outside, iCopy)
+	}
+	if bytes.Compare(span.Key, span.EndKey) < 0 && bytes.Compare(span.Key, start) >= 0 && bytes.Compare(end, span.EndKey) >= 0 {
+		middle = &span
+	}
+	return
+}

@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 #include "mvcc.h"
 #include "comparator.h"
@@ -23,7 +19,7 @@ namespace cockroach {
 
 namespace {
 
-bool IsValidSplitKey(const rocksdb::Slice& key, bool allow_meta2_splits) {
+bool IsValidSplitKey(const rocksdb::Slice& key) {
   if (key == kMeta2KeyMax) {
     // We do not allow splits at Meta2KeyMax. The reason for this is that range
     // decriptors are stored at RangeMetaKey(range.EndKey), so the new range
@@ -35,13 +31,10 @@ bool IsValidSplitKey(const rocksdb::Slice& key, bool allow_meta2_splits) {
     // would overlap. See #1206.
     return false;
   }
-  const auto& no_split_spans =
-      allow_meta2_splits ? kSortedNoSplitSpans : kSortedNoSplitSpansWithoutMeta2Splits;
-  for (auto span : no_split_spans) {
-    // kSortedNoSplitSpans and kSortedNoSplitSpansWithoutMeta2Splits are
-    // both reverse sorted (largest to smallest) on the span end key which
-    // allows us to early exit if our key to check is above the end of the
-    // last no-split span.
+  for (auto span : kSortedNoSplitSpans) {
+    // kSortedNoSplitSpans is both reverse sorted (largest to smallest) on the
+    // span end key which allows us to early exit if our key to check is above
+    // the end of the last no-split span.
     if (key.compare(span.second) >= 0) {
       return true;
     }
@@ -218,25 +211,21 @@ MVCCStatsResult MVCCComputeStats(DBIterator* iter, DBKey start, DBKey end, int64
   return MVCCComputeStatsInternal(iter->rep.get(), start, end, now_nanos);
 }
 
-bool MVCCIsValidSplitKey(DBSlice key, bool allow_meta2_splits) {
-  return IsValidSplitKey(ToSlice(key), allow_meta2_splits);
-}
+bool MVCCIsValidSplitKey(DBSlice key) { return IsValidSplitKey(ToSlice(key)); }
 
-DBStatus MVCCFindSplitKey(DBIterator* iter, DBKey start, DBKey end, DBKey min_split,
-                          int64_t target_size, bool allow_meta2_splits, DBString* split_key) {
+DBStatus MVCCFindSplitKey(DBIterator* iter, DBKey start, DBKey min_split,
+                          int64_t target_size, DBString* split_key) {
   auto iter_rep = iter->rep.get();
   const std::string start_key = EncodeKey(start);
   iter_rep->Seek(start_key);
-  const std::string end_key = EncodeKey(end);
   const rocksdb::Slice min_split_key = ToSlice(min_split.key);
 
   int64_t size_so_far = 0;
   std::string best_split_key = start_key;
   int64_t best_split_diff = std::numeric_limits<int64_t>::max();
   std::string prev_key;
-  int n = 0;
 
-  for (; iter_rep->Valid() && kComparator.Compare(iter_rep->key(), end_key) < 0; iter_rep->Next()) {
+  for (; iter_rep->Valid(); iter_rep->Next()) {
     const rocksdb::Slice key = iter_rep->key();
     rocksdb::Slice decoded_key;
     int64_t wall_time = 0;
@@ -245,9 +234,7 @@ DBStatus MVCCFindSplitKey(DBIterator* iter, DBKey start, DBKey end, DBKey min_sp
       return FmtStatus("unable to decode key");
     }
 
-    ++n;
-    const bool valid = n > 1 && IsValidSplitKey(decoded_key, allow_meta2_splits) &&
-                       decoded_key.compare(min_split_key) >= 0;
+    const bool valid = IsValidSplitKey(decoded_key) && decoded_key.compare(min_split_key) >= 0;
     int64_t diff = target_size - size_so_far;
     if (diff < 0) {
       diff = -diff;
@@ -282,31 +269,26 @@ DBStatus MVCCFindSplitKey(DBIterator* iter, DBKey start, DBKey end, DBKey min_sp
 }
 
 DBScanResults MVCCGet(DBIterator* iter, DBSlice key, DBTimestamp timestamp, DBTxn txn,
-                      bool consistent, bool tombstones) {
-  // Get is implemented as a scan where we retrieve a single key. Note
-  // that the semantics of max_keys is that we retrieve one more key
-  // than is specified in order to maintain the existing semantics of
-  // resume span. See storage/engine/mvcc.go:MVCCScan.
-  //
-  // We specify an empty key for the end key which will ensure we
-  // don't retrieve a key different than the start key. This is a bit
-  // of a hack.
+                      bool inconsistent, bool tombstones, bool ignore_sequence) {
+  // Get is implemented as a scan where we retrieve a single key. We specify an
+  // empty key for the end key which will ensure we don't retrieve a key
+  // different than the start key. This is a bit of a hack.
   const DBSlice end = {0, 0};
   ScopedStats scoped_iter(iter);
-  mvccForwardScanner scanner(iter, key, end, timestamp, 0 /* max_keys */, txn, consistent,
-                             tombstones);
+  mvccForwardScanner scanner(iter, key, end, timestamp, 1 /* max_keys */, txn, inconsistent,
+                             tombstones, ignore_sequence);
   return scanner.get();
 }
 
 DBScanResults MVCCScan(DBIterator* iter, DBSlice start, DBSlice end, DBTimestamp timestamp,
-                       int64_t max_keys, DBTxn txn, bool consistent, bool reverse,
-                       bool tombstones) {
+                       int64_t max_keys, DBTxn txn, bool inconsistent, bool reverse,
+                       bool tombstones, bool ignore_sequence) {
   ScopedStats scoped_iter(iter);
   if (reverse) {
-    mvccReverseScanner scanner(iter, end, start, timestamp, max_keys, txn, consistent, tombstones);
+    mvccReverseScanner scanner(iter, end, start, timestamp, max_keys, txn, inconsistent, tombstones, ignore_sequence);
     return scanner.scan();
   } else {
-    mvccForwardScanner scanner(iter, start, end, timestamp, max_keys, txn, consistent, tombstones);
+    mvccForwardScanner scanner(iter, start, end, timestamp, max_keys, txn, inconsistent, tombstones, ignore_sequence);
     return scanner.scan();
   }
 }

@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cli
 
@@ -24,14 +20,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pkg/errors"
-	"github.com/spf13/cobra"
-
-	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
+	"github.com/cockroachdb/cockroach/pkg/util/version"
+	"github.com/cockroachdb/errors"
+	"github.com/spf13/cobra"
 )
 
 // dumpCmd dumps SQL tables.
@@ -46,14 +43,22 @@ is omitted, dump all tables in the database.
 	RunE: MaybeDecorateGRPCError(runDump),
 }
 
+// We accept versions that are strictly newer than v2.1.0-alpha.20180416
+// (hence the "-0" at the end).
+var verDump = version.MustParse("v2.1.0-alpha.20180416-0")
+
+// runDumps performs a dump of a table or database.
+//
+// The approach here and its current flaws are summarized
+// in https://github.com/cockroachdb/cockroach/issues/28948.
 func runDump(cmd *cobra.Command, args []string) error {
-	conn, err := getPasswordAndMakeSQLClient("cockroach dump")
+	conn, err := makeSQLClient("cockroach dump", useDefaultDb)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
 
-	if err := conn.requireServerVersion(">v2.1.0-alpha.20180416"); err != nil {
+	if err := conn.requireServerVersion(verDump); err != nil {
 		return err
 	}
 
@@ -187,7 +192,7 @@ type tableMetadata struct {
 	basicMetadata
 
 	columnNames string
-	columnTypes map[string]string
+	columnTypes map[string]*types.T
 }
 
 // getDumpMetadata retrieves the table information for the specified table(s).
@@ -204,7 +209,7 @@ func getDumpMetadata(
 		clusterTS = string(vals[0].([]byte))
 	} else {
 		// Validate the timestamp. This prevents SQL injection.
-		if _, err := tree.ParseDTimestamp(asOf, time.Nanosecond); err != nil {
+		if _, err := tree.ParseDTimestamp(nil, asOf, time.Nanosecond); err != nil {
 			return nil, "", err
 		}
 		clusterTS = asOf
@@ -357,7 +362,7 @@ func extractArray(val interface{}) ([]string, error) {
 	if !ok {
 		return nil, fmt.Errorf("unexpected value: %T", b)
 	}
-	arr, err := tree.ParseDArrayFromString(tree.NewTestingEvalContext(serverCfg.Settings), string(b), coltypes.String)
+	arr, err := tree.ParseDArrayFromString(tree.NewTestingEvalContext(serverCfg.Settings), string(b), types.String)
 	if err != nil {
 		return nil, err
 	}
@@ -370,22 +375,54 @@ func extractArray(val interface{}) ([]string, error) {
 
 func getMetadataForTable(conn *sqlConn, md basicMetadata, ts string) (tableMetadata, error) {
 	// Fetch column types.
-	rows, err := conn.Query(fmt.Sprintf(`
-		SELECT COLUMN_NAME, DATA_TYPE
+	//
+	// TODO(knz): this approach is flawed, see #28948.
+
+	makeQuery := func(colname string) string {
+		// This query is parameterized by the column name because of
+		// 2.0/2.1beta/2.1 trans-version compatibility requirements.  See
+		// below for details.
+		return fmt.Sprintf(`
+		SELECT COLUMN_NAME, %s
 		FROM %s.information_schema.columns
 		AS OF SYSTEM TIME %s
 		WHERE TABLE_CATALOG = $1
 			AND TABLE_SCHEMA = $2
 			AND TABLE_NAME = $3
 			AND GENERATION_EXPRESSION = ''
-		`, &md.name.CatalogName, lex.EscapeSQLString(ts)),
+		`, colname, &md.name.CatalogName, lex.EscapeSQLString(ts))
+	}
+	rows, err := conn.Query(makeQuery("CRDB_SQL_TYPE")+` AND IS_HIDDEN = 'NO'`,
 		[]driver.Value{md.name.Catalog(), md.name.Schema(), md.name.Table()})
 	if err != nil {
-		return tableMetadata{}, err
+		// IS_HIDDEN was introduced in the first 2.1 beta. CRDB_SQL_TYPE
+		// some time after that.  To ensure `cockroach dump` works across
+		// versions we must try the previous forms if the first form
+		// fails.
+		//
+		// TODO(knz): Remove this fallback logic post-2.2.
+		if strings.Contains(err.Error(), "column \"crdb_sql_type\" does not exist") {
+			// Pre-2.1 CRDB_SQL_HIDDEN did not exist in
+			// information_schema.columns. When it does not exist,
+			// information_schema.columns.data_type contains a usable SQL
+			// type name instead. Use that.
+			rows, err = conn.Query(makeQuery("DATA_TYPE")+` AND IS_HIDDEN = 'NO'`,
+				[]driver.Value{md.name.Catalog(), md.name.Schema(), md.name.Table()})
+		}
+		if strings.Contains(err.Error(), "column \"is_hidden\" does not exist") {
+			// Pre-2.1 IS_HIDDEN did not exist in information_schema.columns.
+			// When it does not exist, information_schema.columns only returns
+			// non-hidden columns so we can still use that.
+			rows, err = conn.Query(makeQuery("DATA_TYPE"),
+				[]driver.Value{md.name.Catalog(), md.name.Schema(), md.name.Table()})
+		}
+		if err != nil {
+			return tableMetadata{}, err
+		}
 	}
 	vals := make([]driver.Value, 2)
-	coltypes := make(map[string]string)
-	colnames := tree.NewFmtCtxWithBuf(tree.FmtSimple)
+	coltypes := make(map[string]*types.T)
+	colnames := tree.NewFmtCtx(tree.FmtSimple)
 	defer colnames.Close()
 	for {
 		if err := rows.Next(vals); err == io.EOF {
@@ -402,7 +439,16 @@ func getMetadataForTable(conn *sqlConn, md basicMetadata, ts string) (tableMetad
 		if !ok {
 			return tableMetadata{}, fmt.Errorf("unexpected value: %T", typI)
 		}
-		coltypes[name] = typ
+
+		// Transform the type name to an internal coltype.
+		sql := fmt.Sprintf("ALTER TABLE woo ALTER COLUMN woo SET DATA TYPE %s", typ)
+		stmt, err := parser.ParseOne(sql)
+		if err != nil {
+			return tableMetadata{}, fmt.Errorf("type %s is not a valid CockroachDB type", typ)
+		}
+		coltyp := stmt.AST.(*tree.AlterTable).Cmds[0].(*tree.AlterTableAlterColumnType).ToType
+
+		coltypes[name] = coltyp
 		if colnames.Len() > 0 {
 			colnames.WriteString(", ")
 		}
@@ -490,6 +536,20 @@ func dumpTableData(w io.Writer, conn *sqlConn, clusterTS string, bmd basicMetada
 		return err
 	}
 
+	if strings.TrimSpace(md.columnNames) == "" {
+		// A table with no columns may still have one or more rows. In
+		// fact, it can have arbitrary many rows, each with a different
+		// (hidden) PK value. Unfortunately, the dump command today simply
+		// omits the hidden PKs from the dump, so it is not possible to
+		// restore the invisible values.
+		// Instead of failing with an incomprehensible error below, inform
+		// the user more clearly.
+		err := errors.Newf("table %q has no visible columns", tree.ErrString(bmd.name))
+		err = errors.WithHint(err, "To proceed with the dump, either omit this table from the list of tables to dump, drop the table, or add some visible columns.")
+		err = errors.WithIssueLink(err, errors.IssueLink{IssueURL: "https://github.com/cockroachdb/cockroach/issues/37768"})
+		return err
+	}
+
 	bs := fmt.Sprintf("SELECT %s FROM %s AS OF SYSTEM TIME %s ORDER BY PRIMARY KEY %[2]s",
 		md.columnNames,
 		md.name,
@@ -519,6 +579,7 @@ func dumpTableData(w io.Writer, conn *sqlConn, clusterTS string, bmd basicMetada
 	g.GoCtx(func(ctx context.Context) error {
 		// Fetch SQL rows and put them onto valsCh.
 		defer close(valsCh)
+		done := ctx.Done()
 		for i := 0; ; i++ {
 			vals := valArray[i%len(valArray)]
 			if err := rows.Next(vals); err == io.EOF {
@@ -527,8 +588,8 @@ func dumpTableData(w io.Writer, conn *sqlConn, clusterTS string, bmd basicMetada
 				return err
 			}
 			select {
-			case <-g.Done:
-				return g.Err()
+			case <-done:
+				return ctx.Err()
 			case valsCh <- vals:
 			}
 		}
@@ -536,8 +597,9 @@ func dumpTableData(w io.Writer, conn *sqlConn, clusterTS string, bmd basicMetada
 	g.GoCtx(func(ctx context.Context) error {
 		// Convert SQL rows into VALUE strings.
 		defer close(stringsCh)
-		f := tree.NewFmtCtxWithBuf(tree.FmtParsable)
+		f := tree.NewFmtCtx(tree.FmtParsableNumerics)
 		defer f.Close()
+		done := ctx.Done()
 		for vals := range valsCh {
 			f.Reset()
 			// Values need to be correctly encoded for INSERT statements in a text file.
@@ -546,6 +608,7 @@ func dumpTableData(w io.Writer, conn *sqlConn, clusterTS string, bmd basicMetada
 					f.WriteString(", ")
 				}
 				var d tree.Datum
+				// TODO(knz): this approach is brittle+flawed, see #28948.
 				switch t := sv.(type) {
 				case nil:
 					d = tree.DNull
@@ -558,68 +621,64 @@ func dumpTableData(w io.Writer, conn *sqlConn, clusterTS string, bmd basicMetada
 				case string:
 					d = tree.NewDString(t)
 				case []byte:
-					switch ct := md.columnTypes[cols[si]]; ct {
-					case "INTERVAL":
+					// TODO(knz): this approach is brittle+flawed, see #28948.
+					switch ct := md.columnTypes[cols[si]]; ct.Family() {
+					case types.IntervalFamily:
 						d, err = tree.ParseDInterval(string(t))
 						if err != nil {
 							return err
 						}
-					case "BYTES":
+					case types.BytesFamily:
 						d = tree.NewDBytes(tree.DBytes(t))
-					case "UUID":
+					case types.UuidFamily:
 						d, err = tree.ParseDUuidFromString(string(t))
 						if err != nil {
 							return err
 						}
-					case "INET":
+					case types.INetFamily:
 						d, err = tree.ParseDIPAddrFromINetString(string(t))
 						if err != nil {
 							return err
 						}
-					case "JSON":
+					case types.JsonFamily:
 						d, err = tree.ParseDJSON(string(t))
 						if err != nil {
 							return err
 						}
-					default:
-						// STRING and DECIMAL types can have optional length
-						// suffixes, so only examine the prefix of the type.
-						// In addition, we can only observe ARRAY types by their [] suffix.
-						if strings.HasSuffix(md.columnTypes[cols[si]], "[]") {
-							typ := strings.TrimRight(md.columnTypes[cols[si]], "[]")
-							elemType, err := tree.StringToColType(typ)
-							if err != nil {
-								return err
-							}
-							d, err = tree.ParseDArrayFromString(
-								tree.NewTestingEvalContext(serverCfg.Settings), string(t), elemType)
-							if err != nil {
-								return err
-							}
-						} else if strings.HasPrefix(md.columnTypes[cols[si]], "STRING") {
-							d = tree.NewDString(string(t))
-						} else if strings.HasPrefix(md.columnTypes[cols[si]], "DECIMAL") {
-							d, err = tree.ParseDDecimal(string(t))
-							if err != nil {
-								return err
-							}
-						} else {
-							return errors.Errorf("unknown []byte type: %s, %v: %s", t, cols[si], md.columnTypes[cols[si]])
+					case types.ArrayFamily:
+						// We can only observe ARRAY types by their [] suffix.
+						d, err = tree.ParseDArrayFromString(
+							tree.NewTestingEvalContext(serverCfg.Settings), string(t), ct.ArrayContents())
+						if err != nil {
+							return err
 						}
+					case types.StringFamily:
+						// STRING types can have optional length suffixes, so only
+						// examine the prefix of the type.
+						d = tree.NewDString(string(t))
+					case types.DecimalFamily:
+						// DECIMAL types can have optional length suffixes, so only
+						// examine the prefix of the type.
+						d, err = tree.ParseDDecimal(string(t))
+						if err != nil {
+							return err
+						}
+					default:
+						return errors.Errorf("unknown []byte type: %s, %v: %s", t, cols[si], md.columnTypes[cols[si]])
 					}
 				case time.Time:
-					ct := md.columnTypes[cols[si]]
-					switch ct {
-					case "DATE":
-						d = tree.NewDDateFromTime(t, time.UTC)
-					case "TIME":
+					switch ct := md.columnTypes[cols[si]]; ct.Family() {
+					case types.DateFamily:
+						d, err = tree.NewDDateFromTime(t)
+						if err != nil {
+							return err
+						}
+					case types.TimeFamily:
 						// pq awkwardly represents TIME as a time.Time with date 0000-01-01.
 						d = tree.MakeDTime(timeofday.FromTime(t))
-					case "TIME WITH TIME ZONE", "TIMETZ":
-						d = tree.MakeDTimeTZ(timeofday.FromTime(t), t.Location())
-					case "TIMESTAMP":
+					case types.TimestampFamily:
 						d = tree.MakeDTimestamp(t, time.Nanosecond)
-					case "TIMESTAMP WITH TIME ZONE":
+					case types.TimestampTZFamily:
 						d = tree.MakeDTimestampTZ(t, time.Nanosecond)
 					default:
 						return errors.Errorf("unknown timestamp type: %s, %v: %s", t, cols[si], md.columnTypes[cols[si]])
@@ -627,11 +686,11 @@ func dumpTableData(w io.Writer, conn *sqlConn, clusterTS string, bmd basicMetada
 				default:
 					return errors.Errorf("unknown field type: %T (%s)", t, cols[si])
 				}
-				d.Format(&f.FmtCtx)
+				d.Format(f)
 			}
 			select {
-			case <-g.Done:
-				return g.Err()
+			case <-done:
+				return ctx.Err()
 			case stringsCh <- f.String():
 			}
 		}

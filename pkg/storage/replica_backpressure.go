@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -18,13 +14,11 @@ import (
 	"context"
 	"time"
 
-	"github.com/pkg/errors"
-
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/pkg/errors"
 )
 
 var backpressureLogLimiter = log.Every(500 * time.Millisecond)
@@ -45,58 +39,39 @@ var backpressureRangeSizeMultiplier = settings.RegisterValidatedFloatSetting(
 	},
 )
 
-// backpressurableReqMethods is the set of all request methods that can
-// be backpressured. If a batch contains any method outside of this set,
-// it will not be backpressured.
-var backpressurableReqMethods = util.MakeFastIntSet(
-	int(roachpb.BeginTransaction),
-	int(roachpb.EndTransaction),
-	int(roachpb.Put),
-	int(roachpb.InitPut),
-	int(roachpb.ConditionalPut),
-	int(roachpb.Merge),
-	int(roachpb.Increment),
-	int(roachpb.Delete),
-	int(roachpb.DeleteRange),
-	int(roachpb.ClearRange),
-)
-
 // backpressurableSpans contains spans of keys where write backpressuring
-// is permitted. Writes to any keys outside of these spans will never be
-// backpressured.
+// is permitted. Writes to any keys within these spans may cause a batch
+// to be backpressured.
 var backpressurableSpans = []roachpb.Span{
 	{Key: keys.TimeseriesPrefix, EndKey: keys.TimeseriesKeyMax},
-	{Key: keys.TableDataMin, EndKey: keys.TableDataMax},
+	// Backpressure from the end of the system config forward instead of
+	// over all table data to avoid backpressuring unsplittable ranges.
+	{Key: keys.SystemConfigTableDataMax, EndKey: keys.TableDataMax},
 }
 
 // canBackpressureBatch returns whether the provided BatchRequest is eligible
 // for backpressure.
-func canBackpressureBatch(ba roachpb.BatchRequest) bool {
+func canBackpressureBatch(ba *roachpb.BatchRequest) bool {
 	// Don't backpressure splits themselves.
 	if ba.Txn != nil && ba.Txn.Name == splitTxnName {
 		return false
 	}
 
-	// Only backpressure batches consisting exclusively of "backpressurable"
-	// methods that are all within "backpressurable" key spans.
-	for _, union := range ba.Requests {
-		req := union.GetInner()
-		if !backpressurableReqMethods.Contains(int(req.Method())) {
-			return false
+	// Only backpressure batches containing a "backpressurable"
+	// method that is within a "backpressurable" key span.
+	for _, ru := range ba.Requests {
+		req := ru.GetInner()
+		if !roachpb.CanBackpressure(req) {
+			continue
 		}
 
-		inSpan := false
 		for _, s := range backpressurableSpans {
-			if s.Contains(req.Header()) {
-				inSpan = true
-				break
+			if s.Contains(req.Header().Span()) {
+				return true
 			}
 		}
-		if !inSpan {
-			return false
-		}
 	}
-	return true
+	return false
 }
 
 // shouldBackpressureWrites returns whether writes to the range should be
@@ -117,7 +92,7 @@ func (r *Replica) shouldBackpressureWrites() bool {
 
 // maybeBackpressureWriteBatch blocks to apply backpressure if the replica
 // deems that backpressure is necessary.
-func (r *Replica) maybeBackpressureWriteBatch(ctx context.Context, ba roachpb.BatchRequest) error {
+func (r *Replica) maybeBackpressureWriteBatch(ctx context.Context, ba *roachpb.BatchRequest) error {
 	if !canBackpressureBatch(ba) {
 		return nil
 	}
@@ -151,10 +126,14 @@ func (r *Replica) maybeBackpressureWriteBatch(ctx context.Context, ba roachpb.Ba
 		// Wait for the callback to be called.
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return errors.Wrapf(
+				ctx.Err(), "aborted while applying backpressure to %s on range %s", ba, r.Desc(),
+			)
 		case err := <-splitC:
 			if err != nil {
-				return errors.Wrap(err, "split failed while applying backpressure")
+				return errors.Wrapf(
+					err, "split failed while applying backpressure to %s on range %s", ba, r.Desc(),
+				)
 			}
 		}
 	}

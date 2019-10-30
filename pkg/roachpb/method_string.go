@@ -4,9 +4,59 @@ package roachpb
 
 import "strconv"
 
-const _Method_name = "GetPutConditionalPutIncrementDeleteDeleteRangeClearRangeScanReverseScanBeginTransactionEndTransactionAdminSplitAdminMergeAdminTransferLeaseAdminChangeReplicasHeartbeatTxnGCPushTxnQueryTxnDeprecatedRangeLookupResolveIntentResolveIntentRangeNoopMergeTruncateLogRequestLeaseTransferLeaseLeaseInfoComputeChecksumDeprecatedVerifyChecksumCheckConsistencyInitPutWriteBatchExportImportAdminScatterAddSSTableRecomputeStatsRefreshRefreshRange"
+func _() {
+	// An "invalid array index" compiler error signifies that the constant values have changed.
+	// Re-run the stringer command to generate them again.
+	var x [1]struct{}
+	_ = x[Get-0]
+	_ = x[Put-1]
+	_ = x[ConditionalPut-2]
+	_ = x[Increment-3]
+	_ = x[Delete-4]
+	_ = x[DeleteRange-5]
+	_ = x[ClearRange-6]
+	_ = x[RevertRange-7]
+	_ = x[Scan-8]
+	_ = x[ReverseScan-9]
+	_ = x[BeginTransaction-10]
+	_ = x[EndTransaction-11]
+	_ = x[AdminSplit-12]
+	_ = x[AdminUnsplit-13]
+	_ = x[AdminMerge-14]
+	_ = x[AdminTransferLease-15]
+	_ = x[AdminChangeReplicas-16]
+	_ = x[AdminRelocateRange-17]
+	_ = x[HeartbeatTxn-18]
+	_ = x[GC-19]
+	_ = x[PushTxn-20]
+	_ = x[RecoverTxn-21]
+	_ = x[QueryTxn-22]
+	_ = x[QueryIntent-23]
+	_ = x[ResolveIntent-24]
+	_ = x[ResolveIntentRange-25]
+	_ = x[Merge-26]
+	_ = x[TruncateLog-27]
+	_ = x[RequestLease-28]
+	_ = x[TransferLease-29]
+	_ = x[LeaseInfo-30]
+	_ = x[ComputeChecksum-31]
+	_ = x[CheckConsistency-32]
+	_ = x[InitPut-33]
+	_ = x[WriteBatch-34]
+	_ = x[Export-35]
+	_ = x[Import-36]
+	_ = x[AdminScatter-37]
+	_ = x[AddSSTable-38]
+	_ = x[RecomputeStats-39]
+	_ = x[Refresh-40]
+	_ = x[RefreshRange-41]
+	_ = x[Subsume-42]
+	_ = x[RangeStats-43]
+}
 
-var _Method_index = [...]uint16{0, 3, 6, 20, 29, 35, 46, 56, 60, 71, 87, 101, 111, 121, 139, 158, 170, 172, 179, 187, 208, 221, 239, 243, 248, 259, 271, 284, 293, 308, 332, 348, 355, 365, 371, 377, 389, 399, 413, 420, 432}
+const _Method_name = "GetPutConditionalPutIncrementDeleteDeleteRangeClearRangeRevertRangeScanReverseScanBeginTransactionEndTransactionAdminSplitAdminUnsplitAdminMergeAdminTransferLeaseAdminChangeReplicasAdminRelocateRangeHeartbeatTxnGCPushTxnRecoverTxnQueryTxnQueryIntentResolveIntentResolveIntentRangeMergeTruncateLogRequestLeaseTransferLeaseLeaseInfoComputeChecksumCheckConsistencyInitPutWriteBatchExportImportAdminScatterAddSSTableRecomputeStatsRefreshRefreshRangeSubsumeRangeStats"
+
+var _Method_index = [...]uint16{0, 3, 6, 20, 29, 35, 46, 56, 67, 71, 82, 98, 112, 122, 134, 144, 162, 181, 199, 211, 213, 220, 230, 238, 249, 262, 280, 285, 296, 308, 321, 330, 345, 361, 368, 378, 384, 390, 402, 412, 426, 433, 445, 452, 462}
 
 func (i Method) String() string {
 	if i < 0 || i >= Method(len(_Method_index)-1) {

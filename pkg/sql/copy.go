@@ -1,36 +1,34 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"io"
 	"strconv"
 	"time"
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/errors"
 )
 
 // copyMachine supports the Copy-in pgwire subprotocol (COPY...FROM STDIN). The
@@ -50,12 +48,19 @@ type copyMachine struct {
 	table         tree.TableExpr
 	columns       tree.NameList
 	resultColumns sqlbase.ResultColumns
-	buf           bytes.Buffer
-	rows          []*tree.Tuple
+	// buf is used to parse input data into rows. It also accumulates a partial
+	// row between protocol messages.
+	buf bytes.Buffer
+	// rows accumulates a batch of rows to be eventually inserted.
+	rows []tree.Exprs
 	// insertedRows keeps track of the total number of rows inserted by the
 	// machine.
 	insertedRows int
-	rowsMemAcc   mon.BoundAccount
+	// rowsMemAcc accounts for memory used by `rows`.
+	rowsMemAcc mon.BoundAccount
+	// bufMemAcc accounts for memory used by `buf`; it is kept in sync with
+	// buf.Cap().
+	bufMemAcc mon.BoundAccount
 
 	// conn is the pgwire connection from which data is to be read.
 	conn pgwirebase.Conn
@@ -63,6 +68,10 @@ type copyMachine struct {
 	// resetPlanner is a function to be used to prepare the planner for inserting
 	// data.
 	resetPlanner func(p *planner, txn *client.Txn, txnTS time.Time, stmtTS time.Time)
+
+	// execInsertPlan is a function to be used to execute the plan (stored in the
+	// planner) which performs an INSERT.
+	execInsertPlan func(ctx context.Context, p *planner, res RestrictedCommandResult) error
 
 	txnOpt copyTxnOpt
 
@@ -84,6 +93,7 @@ func newCopyMachine(
 	txnOpt copyTxnOpt,
 	execCfg *ExecutorConfig,
 	resetPlanner func(p *planner, txn *client.Txn, txnTS time.Time, stmtTS time.Time),
+	execInsertPlan func(ctx context.Context, p *planner, res RestrictedCommandResult) error,
 ) (_ *copyMachine, retErr error) {
 	c := &copyMachine{
 		conn:    conn,
@@ -91,8 +101,9 @@ func newCopyMachine(
 		columns: n.Columns,
 		txnOpt:  txnOpt,
 		// The planner will be prepared before use.
-		p:            planner{execCfg: execCfg},
-		resetPlanner: resetPlanner,
+		p:              planner{execCfg: execCfg},
+		resetPlanner:   resetPlanner,
+		execInsertPlan: execInsertPlan,
 	}
 	c.resetPlanner(&c.p, nil /* txn */, time.Time{} /* txnTS */, time.Time{} /* stmtTS */)
 	c.parsingEvalCtx = c.p.EvalContext()
@@ -102,27 +113,24 @@ func newCopyMachine(
 		retErr = cleanup(ctx, retErr)
 	}()
 
-	tn, err := n.Table.Normalize()
-	if err != nil {
-		return nil, err
-	}
-	tableDesc, err := ResolveExistingObject(ctx, &c.p, tn, true /*required*/, requireTableDesc)
+	tableDesc, err := ResolveExistingObject(ctx, &c.p, &n.Table, tree.ObjectLookupFlagsWithRequired(), ResolveRequireTableDesc)
 	if err != nil {
 		return nil, err
 	}
 	if err := c.p.CheckPrivilege(ctx, tableDesc, privilege.INSERT); err != nil {
 		return nil, err
 	}
-	cols, err := c.p.processColumns(tableDesc, n.Columns,
+	cols, err := sqlbase.ProcessTargetColumns(tableDesc, n.Columns,
 		true /* ensureColumns */, false /* allowMutations */)
 	if err != nil {
 		return nil, err
 	}
 	c.resultColumns = make(sqlbase.ResultColumns, len(cols))
-	for i, col := range cols {
-		c.resultColumns[i] = sqlbase.ResultColumn{Typ: col.Type.ToDatumType()}
+	for i := range cols {
+		c.resultColumns[i] = sqlbase.ResultColumn{Typ: &cols[i].Type}
 	}
 	c.rowsMemAcc = c.p.extendedEvalCtx.Mon.MakeBoundAccount()
+	c.bufMemAcc = c.p.extendedEvalCtx.Mon.MakeBoundAccount()
 	return c, nil
 }
 
@@ -143,6 +151,7 @@ type copyTxnOpt struct {
 // in the database.
 func (c *copyMachine) run(ctx context.Context) error {
 	defer c.rowsMemAcc.Close(ctx)
+	defer c.bufMemAcc.Close(ctx)
 
 	// Send the message describing the columns to the client.
 	if err := c.conn.BeginCopyIn(ctx, c.resultColumns); err != nil {
@@ -167,12 +176,6 @@ Loop:
 				return err
 			}
 		case pgwirebase.ClientMsgCopyDone:
-			// If there's a line in the buffer without \n at EOL, add it here.
-			if c.buf.Len() > 0 {
-				if err := c.addRow(ctx, c.buf.Bytes()); err != nil {
-					return err
-				}
-			}
 			if err := c.processCopyData(
 				ctx, "" /* data */, c.p.EvalContext(), true, /* final */
 			); err != nil {
@@ -180,7 +183,7 @@ Loop:
 			}
 			break Loop
 		case pgwirebase.ClientMsgCopyFail:
-			return fmt.Errorf("client canceled COPY")
+			return errors.Newf("client canceled COPY")
 		case pgwirebase.ClientMsgFlush, pgwirebase.ClientMsgSync:
 			// Spec says to "ignore Flush and Sync messages received during copy-in mode".
 		default:
@@ -213,16 +216,35 @@ var (
 // final: If set, buffered data is written even if the buffer is not full.
 func (c *copyMachine) processCopyData(
 	ctx context.Context, data string, evalCtx *tree.EvalContext, final bool,
-) error {
+) (retErr error) {
+	// At the end, adjust the mem accounting to reflect what's left in the buffer.
+	defer func() {
+		if err := c.bufMemAcc.ResizeTo(ctx, int64(c.buf.Cap())); err != nil && retErr == nil {
+			retErr = err
+		}
+	}()
+
 	// When this many rows are in the copy buffer, they are inserted.
 	const copyBatchRowSize = 100
 
+	if len(data) > (c.buf.Cap() - c.buf.Len()) {
+		// If it looks like the buffer will need to allocate to accommodate data,
+		// account for the memory here. This is not particularly accurate - we don't
+		// know how much the buffer will actually grow by.
+		if err := c.bufMemAcc.ResizeTo(ctx, int64(len(data))); err != nil {
+			return err
+		}
+	}
 	c.buf.WriteString(data)
 	for c.buf.Len() > 0 {
 		line, err := c.buf.ReadBytes(lineDelim)
 		if err != nil {
 			if err != io.EOF {
 				return err
+			} else if !final {
+				// Put the incomplete row back in the buffer, to be processed next time.
+				c.buf.Write(line)
+				break
 			}
 		} else {
 			// Remove lineDelim from end.
@@ -261,7 +283,7 @@ func (c *copyMachine) preparePlanner(ctx context.Context) func(context.Context, 
 	stmtTs := c.txnOpt.stmtTimestamp
 	autoCommit := false
 	if txn == nil {
-		txn = client.NewTxn(c.p.execCfg.DB, c.p.execCfg.NodeID.Get(), client.RootTxn)
+		txn = client.NewTxn(ctx, c.p.execCfg.DB, c.p.execCfg.NodeID.Get(), client.RootTxn)
 		txnTs = c.p.execCfg.Clock.PhysicalTime()
 		stmtTs = txnTs
 		autoCommit = true
@@ -291,13 +313,14 @@ func (c *copyMachine) insertRows(ctx context.Context) (retErr error) {
 		retErr = cleanup(ctx, retErr)
 	}()
 
-	vc := &tree.ValuesClause{Tuples: c.rows}
+	vc := &tree.ValuesClause{Rows: c.rows}
 	numRows := len(c.rows)
 	// Reuse the same backing array once the Insert is complete.
 	c.rows = c.rows[:0]
 	c.rowsMemAcc.Clear(ctx)
 
-	in := tree.Insert{
+	c.p.stmt = &Statement{}
+	c.p.stmt.AST = &tree.Insert{
 		Table:   c.table,
 		Columns: c.columns,
 		Rows: &tree.Select{
@@ -305,29 +328,24 @@ func (c *copyMachine) insertRows(ctx context.Context) (retErr error) {
 		},
 		Returning: tree.AbsentReturningClause,
 	}
-	insertNode, err := c.p.Insert(ctx, &in, nil /* desiredTypes */)
-	if err != nil {
+	if err := c.p.makeOptimizerPlan(ctx); err != nil {
 		return err
 	}
-	defer insertNode.Close(ctx)
 
-	params := runParams{
-		ctx:             ctx,
-		extendedEvalCtx: &c.p.extendedEvalCtx,
-		p:               &c.p,
-	}
-	if err := startPlan(params, insertNode); err != nil {
-		return err
-	}
-	rows, err := countRowsAffected(params, insertNode)
+	var res bufferedCommandResult
+	err := c.execInsertPlan(ctx, &c.p, &res)
 	if err != nil {
 		return err
 	}
-	if rows != numRows {
-		log.Fatalf(params.ctx, "didn't insert all buffered rows and yet no error was reported. "+
+	if err := res.Err(); err != nil {
+		return err
+	}
+
+	if rows := res.RowsAffected(); rows != numRows {
+		log.Fatalf(ctx, "didn't insert all buffered rows and yet no error was reported. "+
 			"Inserted %d out of %d rows.", rows, numRows)
 	}
-	c.insertedRows += rows
+	c.insertedRows += numRows
 
 	return nil
 }
@@ -336,7 +354,8 @@ func (c *copyMachine) addRow(ctx context.Context, line []byte) error {
 	var err error
 	parts := bytes.Split(line, fieldDelim)
 	if len(parts) != len(c.resultColumns) {
-		return fmt.Errorf("expected %d values, got %d", len(c.resultColumns), len(parts))
+		return pgerror.Newf(pgcode.ProtocolViolation,
+			"expected %d values, got %d", len(c.resultColumns), len(parts))
 	}
 	exprs := make(tree.Exprs, len(parts))
 	for i, part := range parts {
@@ -345,15 +364,15 @@ func (c *copyMachine) addRow(ctx context.Context, line []byte) error {
 			exprs[i] = tree.DNull
 			continue
 		}
-		switch t := c.resultColumns[i].Typ; t {
-		case types.Bytes,
-			types.Date,
-			types.Interval,
-			types.INet,
-			types.String,
-			types.Timestamp,
-			types.TimestampTZ,
-			types.UUID:
+		switch t := c.resultColumns[i].Typ; t.Family() {
+		case types.BytesFamily,
+			types.DateFamily,
+			types.IntervalFamily,
+			types.INetFamily,
+			types.StringFamily,
+			types.TimestampFamily,
+			types.TimestampTZFamily,
+			types.UuidFamily:
 			s, err = decodeCopy(s)
 			if err != nil {
 				return err
@@ -371,12 +390,11 @@ func (c *copyMachine) addRow(ctx context.Context, line []byte) error {
 
 		exprs[i] = d
 	}
-	tuple := &tree.Tuple{Exprs: exprs}
-	if err := c.rowsMemAcc.Grow(ctx, int64(unsafe.Sizeof(*tuple))); err != nil {
+	if err := c.rowsMemAcc.Grow(ctx, int64(unsafe.Sizeof(exprs))); err != nil {
 		return err
 	}
 
-	c.rows = append(c.rows, tuple)
+	c.rows = append(c.rows, exprs)
 	return nil
 }
 
@@ -393,7 +411,8 @@ func decodeCopy(in string) (string, error) {
 		buf.WriteString(in[start:i])
 		i++
 		if i >= n {
-			return "", fmt.Errorf("unknown escape sequence: %q", in[i-1:])
+			return "", pgerror.Newf(pgcode.Syntax,
+				"unknown escape sequence: %q", in[i-1:])
 		}
 
 		ch := in[i]
@@ -403,12 +422,14 @@ func decodeCopy(in string) (string, error) {
 			// \x can be followed by 1 or 2 hex digits.
 			i++
 			if i >= n {
-				return "", fmt.Errorf("unknown escape sequence: %q", in[i-2:])
+				return "", pgerror.Newf(pgcode.Syntax,
+					"unknown escape sequence: %q", in[i-2:])
 			}
 			ch = in[i]
 			digit, ok := decodeHexDigit(ch)
 			if !ok {
-				return "", fmt.Errorf("unknown escape sequence: %q", in[i-2:i])
+				return "", pgerror.Newf(pgcode.Syntax,
+					"unknown escape sequence: %q", in[i-2:i])
 			}
 			if i+1 < n {
 				if v, ok := decodeHexDigit(in[i+1]); ok {
@@ -437,7 +458,8 @@ func decodeCopy(in string) (string, error) {
 			}
 			buf.WriteByte(digit)
 		} else {
-			return "", fmt.Errorf("unknown escape sequence: %q", in[i-1:i+1])
+			return "", pgerror.Newf(pgcode.Syntax,
+				"unknown escape sequence: %q", in[i-1:i+1])
 		}
 		start = i + 1
 	}

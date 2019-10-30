@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import _ from "lodash";
 import Long from "long";
 import React from "react";
@@ -14,9 +24,7 @@ import { FixLong } from "src/util/fixLong";
 import ConnectionsTable from "src/views/reports/containers/problemRanges/connectionsTable";
 import Loading from "src/views/shared/components/loading";
 
-import spinner from "assets/spinner.gif";
-
-type NodeProblems$Properties = protos.cockroach.server.serverpb.ProblemRangesResponse.NodeProblems$Properties;
+type NodeProblems$Properties = protos.cockroach.server.serverpb.ProblemRangesResponse.INodeProblems;
 
 interface ProblemRangesOwnProps {
   problemRanges: CachedDataReducerState<protos.cockroach.server.serverpb.ProblemRangesResponse>;
@@ -168,6 +176,16 @@ class ProblemRanges extends React.Component<ProblemRangesProps, {}> {
           problems={problems}
           extract={(problem) => problem.underreplicated_range_ids}
         />
+        <ProblemRangeList
+          name="Overreplicated"
+          problems={problems}
+          extract={(problem) => problem.overreplicated_range_ids}
+        />
+        <ProblemRangeList
+          name="Quiescent equals ticking"
+          problems={problems}
+          extract={(problem) => problem.quiescent_equals_ticking_range_ids}
+        />
       </div>
     );
   }
@@ -181,14 +199,14 @@ class ProblemRanges extends React.Component<ProblemRangesProps, {}> {
         <h1>Problem Ranges Report</h1>
         <Loading
           loading={isLoading(this.props.problemRanges)}
-          className="loading-image loading-image__spinner-left loading-image__spinner-left__padded"
-          image={spinner}
-        >
-          <div>
-            {this.renderReportBody()}
-            <ConnectionsTable problemRanges={this.props.problemRanges} />
-          </div>
-        </Loading>
+          error={this.props.problemRanges && this.props.problemRanges.lastError}
+          render={() => (
+            <div>
+              {this.renderReportBody()}
+              <ConnectionsTable problemRanges={this.props.problemRanges} />
+            </div>
+          )}
+        />
       </div>
     );
   }

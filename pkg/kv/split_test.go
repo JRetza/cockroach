@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package kv
 
@@ -22,8 +18,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
@@ -37,6 +31,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/gogo/protobuf/proto"
+	"github.com/pkg/errors"
 )
 
 // startTestWriter creates a writer which initiates a sequence of
@@ -112,14 +108,14 @@ func TestRangeSplitMeta(t *testing.T) {
 	for _, splitRKey := range splitKeys {
 		splitKey := roachpb.Key(splitRKey)
 		log.Infof(ctx, "starting split at key %q...", splitKey)
-		if err := s.DB.AdminSplit(ctx, splitKey, splitKey); err != nil {
+		if err := s.DB.AdminSplit(ctx, splitKey, splitKey, hlc.MaxTimestamp /* expirationTime */); err != nil {
 			t.Fatal(err)
 		}
 		log.Infof(ctx, "split at key %q complete", splitKey)
 	}
 
 	testutils.SucceedsSoon(t, func() error {
-		if _, _, _, err := engine.MVCCScan(ctx, s.Eng, keys.LocalMax, roachpb.KeyMax, math.MaxInt64, hlc.MaxTimestamp, true, nil); err != nil {
+		if _, _, _, err := engine.MVCCScan(ctx, s.Eng, keys.LocalMax, roachpb.KeyMax, math.MaxInt64, hlc.MaxTimestamp, engine.MVCCScanOptions{}); err != nil {
 			return errors.Errorf("failed to verify no dangling intents: %s", err)
 		}
 		return nil
@@ -158,7 +154,7 @@ func TestRangeSplitsWithConcurrentTxns(t *testing.T) {
 			<-txnChannel
 		}
 		log.Infof(ctx, "starting split at key %q...", splitKey)
-		if pErr := s.DB.AdminSplit(context.TODO(), splitKey, splitKey); pErr != nil {
+		if pErr := s.DB.AdminSplit(context.TODO(), splitKey, splitKey, hlc.MaxTimestamp /* expirationTime */); pErr != nil {
 			t.Error(pErr)
 		}
 		log.Infof(ctx, "split at key %q complete", splitKey)
@@ -178,13 +174,15 @@ func TestRangeSplitsWithConcurrentTxns(t *testing.T) {
 func TestRangeSplitsWithWritePressure(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	// Override default zone config.
-	cfg := config.DefaultZoneConfig()
-	cfg.RangeMaxBytes = 1 << 18
-	defer config.TestingSetDefaultZoneConfig(cfg)()
+	cfg := config.DefaultZoneConfigRef()
+	cfg.RangeMaxBytes = proto.Int64(1 << 18)
 
 	// Manually create the local test cluster so that the split queue
 	// is not disabled (LocalTestCluster disables it by default).
 	s := &localtestcluster.LocalTestCluster{
+		Cfg: storage.StoreConfig{
+			DefaultZoneConfig: cfg,
+		},
 		StoreTestingKnobs: &storage.StoreTestingKnobs{
 			DisableScanner: true,
 		},
@@ -227,7 +225,7 @@ func TestRangeSplitsWithWritePressure(t *testing.T) {
 	// for timing of finishing the test writer and a possibly-ongoing
 	// asynchronous split.
 	testutils.SucceedsSoon(t, func() error {
-		if _, _, _, err := engine.MVCCScan(ctx, s.Eng, keys.LocalMax, roachpb.KeyMax, math.MaxInt64, hlc.MaxTimestamp, true, nil); err != nil {
+		if _, _, _, err := engine.MVCCScan(ctx, s.Eng, keys.LocalMax, roachpb.KeyMax, math.MaxInt64, hlc.MaxTimestamp, engine.MVCCScanOptions{}); err != nil {
 			return errors.Errorf("failed to verify no dangling intents: %s", err)
 		}
 		return nil
@@ -238,18 +236,75 @@ func TestRangeSplitsWithWritePressure(t *testing.T) {
 // on the same splitKey succeeds.
 func TestRangeSplitsWithSameKeyTwice(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := createTestDB(t)
+	s := createTestDBWithContextAndKnobs(t, client.DefaultDBContext(), &storage.StoreTestingKnobs{
+		DisableScanner:    true,
+		DisableSplitQueue: true,
+		DisableMergeQueue: true,
+	})
 	defer s.Stop()
 
 	ctx := context.TODO()
 
 	splitKey := roachpb.Key("aa")
 	log.Infof(ctx, "starting split at key %q...", splitKey)
-	if err := s.DB.AdminSplit(ctx, splitKey, splitKey); err != nil {
+	if err := s.DB.AdminSplit(ctx, splitKey, splitKey, hlc.MaxTimestamp /* expirationTime */); err != nil {
 		t.Fatal(err)
 	}
 	log.Infof(ctx, "split at key %q first time complete", splitKey)
-	if err := s.DB.AdminSplit(ctx, splitKey, splitKey); err != nil {
+	if err := s.DB.AdminSplit(ctx, splitKey, splitKey, hlc.MaxTimestamp /* expirationTime */); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestSplitStickyBit checks that the sticky bit is set when performing a manual
+// split. There are two cases to consider:
+// 1. Range is split so sticky bit is updated on RHS.
+// 2. Range is already split and split key is the start key of a range, so update
+//    the sticky bit of that range, but no range is split.
+func TestRangeSplitsStickyBit(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s := createTestDBWithContextAndKnobs(t, client.DefaultDBContext(), &storage.StoreTestingKnobs{
+		DisableScanner:    true,
+		DisableSplitQueue: true,
+		DisableMergeQueue: true,
+	})
+	defer s.Stop()
+
+	ctx := context.TODO()
+	splitKey := roachpb.RKey("aa")
+	descKey := keys.RangeDescriptorKey(splitKey)
+
+	// Splitting range.
+	if err := s.DB.AdminSplit(ctx, splitKey.AsRawKey(), splitKey.AsRawKey(), hlc.MaxTimestamp /* expirationTime */); err != nil {
+		t.Fatal(err)
+	}
+
+	// Checking sticky bit.
+	var desc roachpb.RangeDescriptor
+	err := s.DB.GetProto(ctx, descKey, &desc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if (desc.GetStickyBit() == hlc.Timestamp{}) {
+		t.Fatal("Sticky bit not set after splitting")
+	}
+
+	// Removing sticky bit.
+	if err := s.DB.AdminUnsplit(ctx, splitKey.AsRawKey()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Splitting range.
+	if err := s.DB.AdminSplit(ctx, splitKey.AsRawKey(), splitKey.AsRawKey(), hlc.MaxTimestamp /* expirationTime */); err != nil {
+		t.Fatal(err)
+	}
+
+	// Checking sticky bit.
+	err = s.DB.GetProto(ctx, descKey, &desc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if (desc.GetStickyBit() == hlc.Timestamp{}) {
+		t.Fatal("Sticky bit not set after splitting")
 	}
 }

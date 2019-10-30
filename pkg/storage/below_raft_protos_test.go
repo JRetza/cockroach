@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage_test
 
@@ -21,13 +17,12 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/coreos/etcd/raft/raftpb"
-
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"go.etcd.io/etcd/raft/raftpb"
 )
 
 func verifyHash(b []byte, expectedSum uint64) error {
@@ -64,7 +59,7 @@ var belowRaftGoldenProtos = map[reflect.Type]fixture{
 			return m
 		},
 		emptySum:     7551962144604783939,
-		populatedSum: 3716674106872807900,
+		populatedSum: 12720006657210437557,
 	},
 	reflect.TypeOf(&enginepb.RangeAppliedState{}): {
 		populatedConstructor: func(r *rand.Rand) protoutil.Message {
@@ -72,15 +67,6 @@ var belowRaftGoldenProtos = map[reflect.Type]fixture{
 		},
 		emptySum:     615555020845646359,
 		populatedSum: 94706924697857278,
-	},
-	// MVCCStats is still serialized beneath Raft in tests that use old cluster
-	// versions before the RangeAppliedState key.
-	reflect.TypeOf(&enginepb.MVCCStats{}): {
-		populatedConstructor: func(r *rand.Rand) protoutil.Message {
-			return enginepb.NewPopulatedMVCCStats(r, false)
-		},
-		emptySum:     18064891702890239528,
-		populatedSum: 4287370248246326846,
 	},
 	reflect.TypeOf(&raftpb.HardState{}): {
 		populatedConstructor: func(r *rand.Rand) protoutil.Message {
@@ -110,14 +96,25 @@ var belowRaftGoldenProtos = map[reflect.Type]fixture{
 			return roachpb.NewPopulatedRangeDescriptor(r, false)
 		},
 		emptySum:     5524024218313206949,
-		populatedSum: 7661699749677660364,
+		populatedSum: 3507997910320018655,
 	},
-	reflect.TypeOf(&storage.Liveness{}): {
+	reflect.TypeOf(&storagepb.Liveness{}): {
 		populatedConstructor: func(r *rand.Rand) protoutil.Message {
-			return storage.NewPopulatedLiveness(r, false)
+			return storagepb.NewPopulatedLiveness(r, false)
 		},
 		emptySum:     892800390935990883,
 		populatedSum: 16231745342114354146,
+	},
+	// This is used downstream of Raft only to write it into unreplicated keyspace
+	// as part of VersionUnreplicatedRaftTruncatedState.
+	// However, it has been sent through Raft for a long time, as part of
+	// ReplicatedEvalResult.
+	reflect.TypeOf(&roachpb.RaftTruncatedState{}): {
+		populatedConstructor: func(r *rand.Rand) protoutil.Message {
+			return roachpb.NewPopulatedRaftTruncatedState(r, false)
+		},
+		emptySum:     5531676819244041709,
+		populatedSum: 14781226418259198098,
 	},
 }
 

@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cluster
 
@@ -20,7 +16,9 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -63,6 +61,9 @@ type Settings struct {
 	// Manual defaults to false. If set, lets this ClusterSetting's MakeUpdater
 	// method return a dummy updater that simply throws away all values. This is
 	// for use in tests for which manual control is desired.
+	//
+	// Also see the Override() method that different types of settings provide for
+	// overwriting the default of a single setting.
 	Manual atomic.Value // bool
 
 	Version ExposedClusterVersion
@@ -71,6 +72,32 @@ type Settings struct {
 	ExternalIODir string
 
 	Initialized bool
+
+	// Set to 1 if a profile is active (if the profile is being grabbed through
+	// the `pprofui` server as opposed to the raw endpoint).
+	cpuProfiling int32 // atomic
+}
+
+// TelemetryOptOut is a place for controlling whether to opt out of telemetry or not.
+func TelemetryOptOut() bool {
+	return envutil.EnvOrDefaultBool("COCKROACH_SKIP_ENABLING_DIAGNOSTIC_REPORTING", false)
+}
+
+// IsCPUProfiling returns true if a pprofui CPU profile is being recorded. This can
+// be used by moving parts across the system to add profiler labels which are
+// too expensive to be enabled at all times.
+func (s *Settings) IsCPUProfiling() bool {
+	return atomic.LoadInt32(&s.cpuProfiling) == 1
+}
+
+// SetCPUProfiling is called from the pprofui to inform the system that a CPU
+// profile is being recorded.
+func (s *Settings) SetCPUProfiling(to bool) {
+	i := int32(0)
+	if to {
+		i = 1
+	}
+	atomic.StoreInt32(&s.cpuProfiling, i)
 }
 
 // NoSettings is used when a func requires a Settings but none is available
@@ -81,7 +108,7 @@ var NoSettings *Settings // = nil
 const KeyVersionSetting = "version"
 
 var version = settings.RegisterStateMachineSetting(KeyVersionSetting,
-	"set the active cluster version in the format '<major>.<minor>'.", // hide optional `-<unstable>`
+	"set the active cluster version in the format '<major>.<minor>'", // hide optional `-<unstable>`
 	settings.TransformerFn(versionTransformer),
 )
 
@@ -95,7 +122,7 @@ var preserveDowngradeVersion = settings.RegisterValidatedStringSetting(
 		}
 		opaque := sv.Opaque()
 		st := opaque.(*Settings)
-		clusterVersion := st.Version.Version().MinimumVersion
+		clusterVersion := st.Version.Version().Version
 		downgradeVersion, err := roachpb.ParseVersion(s)
 		if err != nil {
 			return err
@@ -166,23 +193,17 @@ func (ecv *ExposedClusterVersion) Version() ClusterVersion {
 	return v
 }
 
-// HasBeenInitialized returns whether the cluster version has been initialized
-// yet and if Version can be safely called.
-func (ecv *ExposedClusterVersion) HasBeenInitialized() bool {
-	v := *ecv.baseVersion.Load().(*ClusterVersion)
-	return v != ClusterVersion{}
-}
-
 // BootstrapVersion returns the version a newly initialized cluster should have.
 func (ecv *ExposedClusterVersion) BootstrapVersion() ClusterVersion {
-	return ClusterVersion{
-		MinimumVersion: ecv.ServerVersion,
-		UseVersion:     ecv.ServerVersion,
-	}
+	return ClusterVersion{Version: ecv.ServerVersion}
 }
 
 // IsActive returns true if the features of the supplied version key are active
-// at the running version.
+// at the running version. In other words, if a particular version returns true
+// from this method, it means that you're guaranteed that all of the nodes in
+// the cluster have running binaries that are at least as new as that version,
+// and that you're guaranteed that those nodes will never be downgraded to an
+// older version.
 //
 // If this returns true then all nodes in the cluster will eventually see this
 // version. However, this is not atomic because versions are gossiped. Because
@@ -199,18 +220,12 @@ func (ecv *ExposedClusterVersion) IsActive(versionKey VersionKey) bool {
 	return ecv.Version().IsActive(versionKey)
 }
 
-// IsMinSupported returns true if the features of the supplied version will be
-// permanently available (i.e. cannot be downgraded away).
-func (ecv *ExposedClusterVersion) IsMinSupported(versionKey VersionKey) bool {
-	return ecv.Version().IsMinSupported(versionKey)
-}
-
-// CheckVersion is like IsMinSupported but returns an appropriate error in the
+// CheckVersion is like IsActive but returns an appropriate error in the
 // case of a cluster version which is too low.
 func (ecv *ExposedClusterVersion) CheckVersion(versionKey VersionKey, feature string) error {
-	if !ecv.Version().IsMinSupported(versionKey) {
-		return pgerror.NewErrorf(
-			pgerror.CodeFeatureNotSupportedError,
+	if !ecv.Version().IsActive(versionKey) {
+		return pgerror.Newf(
+			pgcode.FeatureNotSupported,
 			"cluster version does not support %s (>= %s required)",
 			feature,
 			VersionByKey(versionKey).String(),
@@ -218,6 +233,9 @@ func (ecv *ExposedClusterVersion) CheckVersion(versionKey VersionKey, feature st
 	}
 	return nil
 }
+
+// Silence unused warning.
+var _ = (*ExposedClusterVersion)(nil).CheckVersion
 
 // MakeTestingClusterSettings returns a Settings object that has had its version
 // initialized to BinaryServerVersion.
@@ -230,7 +248,6 @@ func MakeTestingClusterSettings() *Settings {
 func MakeTestingClusterSettingsWithVersion(minVersion, serverVersion roachpb.Version) *Settings {
 	st := MakeClusterSettings(minVersion, serverVersion)
 	cv := st.Version.BootstrapVersion()
-	cv.MinimumVersion = minVersion
 	// Initialize with all features enabled.
 	if err := st.InitializeVersion(cv); err != nil {
 		log.Fatalf(context.TODO(), "unable to initialize version: %s", err)
@@ -241,6 +258,7 @@ func MakeTestingClusterSettingsWithVersion(minVersion, serverVersion roachpb.Ver
 // MakeClusterSettings makes a new ClusterSettings object for the given minimum
 // supported and server version, respectively.
 func MakeClusterSettings(minVersion, serverVersion roachpb.Version) *Settings {
+
 	s := &Settings{}
 
 	// Initialize the setting. Note that baseVersion starts out with the zero
@@ -259,7 +277,7 @@ func MakeClusterSettings(minVersion, serverVersion roachpb.Version) *Settings {
 	s.Tracer.Configure(sv)
 
 	version.SetOnChange(sv, func() {
-		_, obj, err := version.Validate(sv, []byte(version.Get(sv)), nil)
+		_, obj, err := version.Validate(sv, []byte(version.Get(sv)), nil /* update */)
 		if err != nil {
 			log.Fatal(context.Background(), err)
 		}
@@ -295,13 +313,23 @@ func (sv *stringedVersion) String() string {
 	if sv == nil {
 		sv = &stringedVersion{}
 	}
-	return sv.MinimumVersion.String()
+	return sv.Version.String()
 }
 
 // versionTransformer is the transformer function for the version StateMachine.
 // It has access to the Settings struct via the opaque member of settings.Values.
 // The returned versionStringer must, when printed, only return strings that are
 // safe to include in diagnostics reporting.
+//
+// Args:
+// curRawProto: The current value of the setting - an encoded ClusterVersion
+//   proto. Can be empty if the setting is not yet set, in which case the
+//   "default" value will be used.
+// versionBump: A string indicating the proposed new value of the setting. Can
+//   be nil, in which case validation is performed and the current value (or the
+//   "default") is returned. Gossip updates pass the incoming gossipped value to
+//   curRawProto and nil for versionBump. SHOW CLUSTE SETTING passes the KV
+//   value as curRawProto and nil as versionBump.
 func versionTransformer(
 	sv *settings.Values, curRawProto []byte, versionBump *string,
 ) (newRawProto []byte, versionStringer interface{}, _ error) {
@@ -342,41 +370,44 @@ func versionTransformer(
 		// Round-trip the existing value, but only if it passes sanity
 		// checks. This is also the path taken when the setting gets updated
 		// via the gossip callback.
-		if serverVersion.Less(oldV.MinimumVersion) {
-			log.Fatalf(context.TODO(), "node at %s cannot run at %s", serverVersion, oldV.MinimumVersion)
+		if serverVersion.Less(oldV.Version) {
+			log.Fatalf(context.TODO(), "node at %s cannot run at %s", serverVersion, oldV.Version)
 		}
-		if (oldV.MinimumVersion != roachpb.Version{}) && oldV.MinimumVersion.Less(minSupportedVersion) {
-			log.Fatalf(context.TODO(), "node at %s cannot run at %s (minimum version is %s)", serverVersion, oldV.MinimumVersion, minSupportedVersion)
+		if (oldV.Version != roachpb.Version{}) && oldV.Less(minSupportedVersion) {
+			log.Fatalf(context.TODO(), "node at %s cannot run at %s (minimum version is %s)", serverVersion, oldV.Version, minSupportedVersion)
 		}
 		return curRawProto, &oldV, nil
 	}
 
 	// We have a new proposed update to the value, validate it.
-	minVersion, err := roachpb.ParseVersion(*versionBump)
+	newVersion, err := roachpb.ParseVersion(*versionBump)
 	if err != nil {
 		return nil, nil, err
 	}
-	newV := oldV
-	newV.UseVersion = minVersion
-	newV.MinimumVersion = minVersion
+	newV := ClusterVersion{Version: newVersion}
 
 	// Prevent cluster version upgrade until cluster.preserve_downgrade_option is reset.
 	if downgrade := preserveDowngradeVersion.Get(sv); downgrade != "" {
-		return nil, nil, errors.Errorf("cannot upgrade to %s: cluster.preserve_downgrade_option is set to %s", minVersion, downgrade)
+		return nil, nil, errors.Errorf(
+			"cannot upgrade to %s: cluster.preserve_downgrade_option is set to %s",
+			newVersion, downgrade)
 	}
 
-	if minVersion.Less(oldV.MinimumVersion) {
-		return nil, nil, errors.Errorf("cannot downgrade from %s to %s", oldV.MinimumVersion, minVersion)
+	if newVersion.Less(oldV.Version) {
+		return nil, nil, errors.Errorf(
+			"versions cannot be downgraded (attempting to downgrade from %s to %s)",
+			oldV.Version, newVersion)
 	}
 
-	if oldV != (ClusterVersion{}) && !oldV.MinimumVersion.CanBump(minVersion) {
-		return nil, nil, errors.Errorf("cannot upgrade directly from %s to %s", oldV.MinimumVersion, minVersion)
+	if oldV != (ClusterVersion{}) && !oldV.CanBump(newVersion) {
+		return nil, nil, errors.Errorf(
+			"cannot upgrade directly from %s to %s", oldV.Version, newVersion)
 	}
 
-	if serverVersion.Less(minVersion) {
+	if serverVersion.Less(newVersion) {
 		// TODO(tschottdorf): also ask gossip about other nodes.
 		return nil, nil, errors.Errorf("cannot upgrade to %s: node running %s",
-			minVersion, serverVersion)
+			newVersion, serverVersion)
 	}
 
 	b, err := protoutil.Marshal(&newV)

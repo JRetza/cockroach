@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import _ from "lodash";
 import React from "react";
 import { Helmet } from "react-helmet";
@@ -9,6 +19,7 @@ import { certificatesRequestKey, refreshCertificates } from "src/redux/apiReduce
 import { AdminUIState } from "src/redux/state";
 import { nodeIDAttr } from "src/util/constants";
 import { LongToMoment } from "src/util/convert";
+import Loading from "src/views/shared/components/loading";
 
 interface CertificatesOwnProps {
   certificates: protos.cockroach.server.serverpb.CertificatesResponse;
@@ -93,7 +104,7 @@ class Certificates extends React.Component<CertificatesProps, {}> {
     return this.renderSimpleRow(header, timestamp, title);
   }
 
-  renderFields(fields: protos.cockroach.server.serverpb.CertificateDetails.Fields$Properties, id: number) {
+  renderFields(fields: protos.cockroach.server.serverpb.CertificateDetails.IFields, id: number) {
     return [
       this.renderSimpleRow("Cert ID", id.toString()),
       this.renderSimpleRow("Issuer", fields.issuer),
@@ -108,14 +119,26 @@ class Certificates extends React.Component<CertificatesProps, {}> {
     ];
   }
 
-  renderCert(cert: protos.cockroach.server.serverpb.CertificateDetails$Properties, key: number) {
+  renderCert(cert: protos.cockroach.server.serverpb.ICertificateDetails, key: number) {
     let certType: string;
     switch (cert.type) {
       case protos.cockroach.server.serverpb.CertificateDetails.CertificateType.CA:
         certType = "Certificate Authority";
         break;
       case protos.cockroach.server.serverpb.CertificateDetails.CertificateType.NODE:
-        certType = "Node";
+        certType = "Node Certificate";
+        break;
+      case protos.cockroach.server.serverpb.CertificateDetails.CertificateType.CLIENT_CA:
+        certType = "Client Certificate Authority";
+        break;
+      case protos.cockroach.server.serverpb.CertificateDetails.CertificateType.CLIENT:
+        certType = "Client Certificate";
+        break;
+      case protos.cockroach.server.serverpb.CertificateDetails.CertificateType.UI_CA:
+        certType = "UI Certificate Authority";
+        break;
+      case protos.cockroach.server.serverpb.CertificateDetails.CertificateType.UI:
+        certType = "UI Certificate";
         break;
       default:
         certType = "Unknown";
@@ -138,41 +161,15 @@ class Certificates extends React.Component<CertificatesProps, {}> {
     );
   }
 
-  render() {
-    const nodeID = this.props.params[nodeIDAttr];
-    if (!_.isNil(this.props.lastError)) {
-      return (
-        <div className="section">
-          <Helmet>
-            <title>Certificates | Debug</title>
-          </Helmet>
-          <h1>Certificates</h1>
-          <h2>Error loading certificates for node {nodeID}</h2>
-        </div>
-      );
-    }
+  renderContent = () => {
     const { certificates } = this.props;
-    if (_.isEmpty(certificates)) {
-      return (
-        <div className="section">
-          <Helmet>
-            <title>Certificates | Debug</title>
-          </Helmet>
-          <h1>Certificates</h1>
-          <h2>Loading cluster status...</h2>
-        </div>
-      );
-    }
+    const nodeID = this.props.params[nodeIDAttr];
 
     if (_.isEmpty(certificates.certificates)) {
       return (
-        <div className="section">
-          <Helmet>
-            <title>Certificates | Debug</title>
-          </Helmet>
-          <h1>Certificates</h1>
+        <React.Fragment>
           <h2>No certificates were found on node {this.props.params[nodeIDAttr]}.</h2>
-        </div>
+        </React.Fragment>
       );
     }
 
@@ -184,17 +181,32 @@ class Certificates extends React.Component<CertificatesProps, {}> {
     }
 
     return (
-      <div className="section">
-        <Helmet>
-          <title>Certificates | Debug</title>
-        </Helmet>
-        <h1>Certificates</h1>
+      <React.Fragment>
         <h2>{header} certificates</h2>
         {
           _.map(certificates.certificates, (cert, key) => (
             this.renderCert(cert, key)
           ))
         }
+      </React.Fragment>
+    );
+  }
+
+  render() {
+    return (
+      <div className="section">
+        <Helmet>
+          <title>Certificates | Debug</title>
+        </Helmet>
+        <h1>Certificates</h1>
+
+        <section className="section">
+          <Loading
+            loading={!this.props.certificates}
+            error={this.props.lastError}
+            render={this.renderContent}
+          />
+        </section>
       </div>
     );
   }

@@ -1,21 +1,10 @@
 exec-ddl
 CREATE TABLE a (x INT PRIMARY KEY, y INT)
 ----
-TABLE a
- ├── x int not null
- ├── y int
- └── INDEX primary
-      └── x int not null
 
 exec-ddl
 CREATE TABLE t.b (x INT, y FLOAT)
 ----
-TABLE b
- ├── x int
- ├── y float
- ├── rowid int not null (hidden)
- └── INDEX primary
-      └── rowid int not null (hidden)
 
 # Scan operator.
 opt
@@ -32,8 +21,8 @@ select
  ├── columns: y:2(int!null) x:1(int!null) y2:2(int!null)
  ├── scan a
  │    └── columns: x:1(int!null) y:2(int)
- └── filters [type=bool]
-      └── a.y = 1 [type=bool]
+ └── filters
+      └── y = 1 [type=bool]
 
 # Project operator.
 opt
@@ -44,29 +33,33 @@ project
  ├── scan a
  │    └── columns: x:1(int!null) y:2(int)
  └── projections
-      └── a.y + 1 [type=int]
+      └── y + 1 [type=int]
 
 # Join operator.
 opt
 SELECT b.x, rowid, a.y, a.x, a.y y2, b.y FROM a, b
 ----
-inner-join
+inner-join (hash)
  ├── columns: x:3(int) rowid:5(int!null) y:2(int) x:1(int!null) y2:2(int) y:4(float)
  ├── scan a
  │    └── columns: a.x:1(int!null) a.y:2(int)
  ├── scan b
  │    └── columns: b.x:3(int) b.y:4(float) rowid:5(int!null)
- └── true [type=bool]
+ └── filters (true)
 
 # Groupby operator.
 opt
-SELECT MAX(y), y, y, x FROM a GROUP BY a.x, a.y
+SELECT max(y), y, y, x FROM a GROUP BY a.x, a.y
 ----
 group-by
  ├── columns: max:3(int) y:2(int) y:2(int) x:1(int!null)
- ├── grouping columns: x:1(int!null) y:2(int)
+ ├── grouping columns: x:1(int!null)
+ ├── internal-ordering: +1
  ├── scan a
- │    └── columns: x:1(int!null) y:2(int)
+ │    ├── columns: x:1(int!null) y:2(int)
+ │    └── ordering: +1
  └── aggregations
-      └── max [type=int]
-           └── variable: a.y [type=int]
+      ├── max [type=int]
+      │    └── variable: y [type=int]
+      └── const-agg [type=int]
+           └── variable: y [type=int]

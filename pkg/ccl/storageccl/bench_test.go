@@ -16,15 +16,16 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl/sampledataccl"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/workload/bank"
 )
@@ -65,7 +66,7 @@ func BenchmarkAddSSTable(b *testing.B) {
 					b.Fatalf("%+v", err)
 				}
 				for _, kv := range kvs {
-					if err := sst.Add(kv); err != nil {
+					if err := sst.Put(kv.Key, kv.Value); err != nil {
 						b.Fatalf("%+v", err)
 					}
 				}
@@ -77,7 +78,9 @@ func BenchmarkAddSSTable(b *testing.B) {
 				totalLen += int64(len(data))
 
 				b.StartTimer()
-				if err := kvDB.AddSSTable(ctx, span.Key, span.EndKey, data); err != nil {
+				if err := kvDB.AddSSTable(
+					ctx, span.Key, span.EndKey, data, false /* disallowShadowing */, nil /* stats */, false, /* ingestAsWrites */
+				); err != nil {
 					b.Fatalf("%+v", err)
 				}
 				b.StopTimer()
@@ -151,7 +154,7 @@ func BenchmarkImport(b *testing.B) {
 			if err != nil {
 				b.Fatalf("%+v", err)
 			}
-			storage, err := storageccl.ExportStorageConfFromURI(`nodelocal:///` + subdir)
+			storage, err := cloud.ExternalStorageConfFromURI(`nodelocal:///` + subdir)
 			if err != nil {
 				b.Fatalf("%+v", err)
 			}
@@ -173,7 +176,7 @@ func BenchmarkImport(b *testing.B) {
 				{
 					// TODO(dan): The following should probably make it into
 					// dataccl.Backup somehow.
-					tableDesc := backup.Desc.Descriptors[len(backup.Desc.Descriptors)-1].GetTable()
+					tableDesc := backup.Desc.Descriptors[len(backup.Desc.Descriptors)-1].Table(hlc.Timestamp{})
 					if tableDesc == nil || tableDesc.ParentID == keys.SystemDatabaseID {
 						b.Fatalf("bad table descriptor: %+v", tableDesc)
 					}
@@ -199,12 +202,12 @@ func BenchmarkImport(b *testing.B) {
 					// Import is a point request because we don't want DistSender to split
 					// it. Assume (but don't require) the entire post-rewrite span is on the
 					// same range.
-					Span:     roachpb.Span{Key: newStartKey},
-					DataSpan: roachpb.Span{Key: oldStartKey, EndKey: oldStartKey.PrefixEnd()},
-					Files:    files,
-					Rekeys:   rekeys,
+					RequestHeader: roachpb.RequestHeader{Key: newStartKey},
+					DataSpan:      roachpb.Span{Key: oldStartKey, EndKey: oldStartKey.PrefixEnd()},
+					Files:         files,
+					Rekeys:        rekeys,
 				}
-				res, pErr := client.SendWrapped(ctx, kvDB.GetSender(), req)
+				res, pErr := client.SendWrapped(ctx, kvDB.NonTransactionalSender(), req)
 				if pErr != nil {
 					b.Fatalf("%+v", pErr.GoError())
 				}

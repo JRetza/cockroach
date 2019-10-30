@@ -1,28 +1,23 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
 import (
 	"container/heap"
 	"context"
+	"fmt"
 	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
@@ -37,6 +32,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/gogo/protobuf/proto"
+	"github.com/pkg/errors"
+	"github.com/stretchr/testify/require"
 )
 
 // testQueueImpl implements queueImpl with a closure for shouldQueue.
@@ -50,12 +48,12 @@ type testQueueImpl struct {
 }
 
 func (tq *testQueueImpl) shouldQueue(
-	_ context.Context, now hlc.Timestamp, r *Replica, _ config.SystemConfig,
+	_ context.Context, now hlc.Timestamp, r *Replica, _ *config.SystemConfig,
 ) (bool, float64) {
 	return tq.shouldQueueFn(now, r)
 }
 
-func (tq *testQueueImpl) process(_ context.Context, _ *Replica, _ config.SystemConfig) error {
+func (tq *testQueueImpl) process(_ context.Context, _ *Replica, _ *config.SystemConfig) error {
 	atomic.AddInt32(&tq.processed, 1)
 	return tq.err
 }
@@ -101,7 +99,9 @@ func createReplicas(t *testing.T, tc *testContext, num int) []*Replica {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := tc.store.RemoveReplica(context.Background(), repl1, *repl1.Desc(), true); err != nil {
+	if err := tc.store.RemoveReplica(context.Background(), repl1, repl1.Desc().NextReplicaID, RemoveOptions{
+		DestroyData: true,
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -126,31 +126,32 @@ func TestQueuePriorityQueue(t *testing.T) {
 	// establish the priority queue (heap) invariants.
 	const count = 3
 	expRanges := make([]roachpb.RangeID, count+1)
-	pq := make(priorityQueue, count)
+	pq := priorityQueue{}
+	pq.sl = make([]*replicaItem, count)
 	for i := 0; i < count; {
-		pq[i] = &replicaItem{
-			value:    roachpb.RangeID(i),
+		pq.sl[i] = &replicaItem{
+			rangeID:  roachpb.RangeID(i),
 			priority: float64(i),
 			index:    i,
 		}
-		expRanges[3-i] = pq[i].value
+		expRanges[3-i] = pq.sl[i].rangeID
 		i++
 	}
 	heap.Init(&pq)
 
 	// Insert a new item and then modify its priority.
 	priorityItem := &replicaItem{
-		value:    -1,
+		rangeID:  -1,
 		priority: 1.0,
 	}
 	heap.Push(&pq, priorityItem)
 	pq.update(priorityItem, 4.0)
-	expRanges[0] = priorityItem.value
+	expRanges[0] = priorityItem.rangeID
 
 	// Take the items out; they should arrive in decreasing priority order.
 	for i := 0; pq.Len() > 0; i++ {
 		item := heap.Pop(&pq).(*replicaItem)
-		if item.value != expRanges[i] {
+		if item.rangeID != expRanges[i] {
 			t.Errorf("%d: unexpected range with priority %f", i, item.priority)
 		}
 	}
@@ -185,8 +186,8 @@ func TestBaseQueueAddUpdateAndRemove(t *testing.T) {
 	}
 	bq := makeTestBaseQueue("test", testQueue, tc.store, tc.gossip, queueConfig{maxSize: 2})
 
-	bq.MaybeAdd(r1, hlc.Timestamp{})
-	bq.MaybeAdd(r2, hlc.Timestamp{})
+	bq.maybeAdd(ctx, r1, hlc.Timestamp{})
+	bq.maybeAdd(ctx, r2, hlc.Timestamp{})
 	if bq.Length() != 2 {
 		t.Fatalf("expected length 2; got %d", bq.Length())
 	}
@@ -215,14 +216,14 @@ func TestBaseQueueAddUpdateAndRemove(t *testing.T) {
 
 	// Add again, but this time r2 shouldn't add.
 	shouldAddMap[r2] = false
-	bq.MaybeAdd(r1, hlc.Timestamp{})
-	bq.MaybeAdd(r2, hlc.Timestamp{})
+	bq.maybeAdd(ctx, r1, hlc.Timestamp{})
+	bq.maybeAdd(ctx, r2, hlc.Timestamp{})
 	if bq.Length() != 1 {
 		t.Errorf("expected length 1; got %d", bq.Length())
 	}
 
 	// Try adding same replica twice.
-	bq.MaybeAdd(r1, hlc.Timestamp{})
+	bq.maybeAdd(ctx, r1, hlc.Timestamp{})
 	if bq.Length() != 1 {
 		t.Errorf("expected length 1; got %d", bq.Length())
 	}
@@ -230,8 +231,8 @@ func TestBaseQueueAddUpdateAndRemove(t *testing.T) {
 	// Re-add r2 and update priority of r1.
 	shouldAddMap[r2] = true
 	priorityMap[r1] = 3.0
-	bq.MaybeAdd(r1, hlc.Timestamp{})
-	bq.MaybeAdd(r2, hlc.Timestamp{})
+	bq.maybeAdd(ctx, r1, hlc.Timestamp{})
+	bq.maybeAdd(ctx, r2, hlc.Timestamp{})
 	if bq.Length() != 2 {
 		t.Fatalf("expected length 2; got %d", bq.Length())
 	}
@@ -250,10 +251,10 @@ func TestBaseQueueAddUpdateAndRemove(t *testing.T) {
 	}
 
 	// Verify that priorities aren't lowered by a later MaybeAdd.
-	bq.MaybeAdd(r1, hlc.Timestamp{})
-	bq.MaybeAdd(r2, hlc.Timestamp{})
+	bq.maybeAdd(ctx, r1, hlc.Timestamp{})
+	bq.maybeAdd(ctx, r2, hlc.Timestamp{})
 	priorityMap[r1] = 1.0
-	bq.MaybeAdd(r1, hlc.Timestamp{})
+	bq.maybeAdd(ctx, r1, hlc.Timestamp{})
 	if bq.Length() != 2 {
 		t.Fatalf("expected length 2; got %d", bq.Length())
 	}
@@ -272,8 +273,8 @@ func TestBaseQueueAddUpdateAndRemove(t *testing.T) {
 	}
 
 	// Try removing a replica.
-	bq.MaybeAdd(r1, hlc.Timestamp{})
-	bq.MaybeAdd(r2, hlc.Timestamp{})
+	bq.maybeAdd(ctx, r1, hlc.Timestamp{})
+	bq.maybeAdd(ctx, r2, hlc.Timestamp{})
 	bq.MaybeRemove(r2.RangeID)
 	if bq.Length() != 1 {
 		t.Fatalf("expected length 1; got %d", bq.Length())
@@ -291,13 +292,56 @@ func TestBaseQueueAddUpdateAndRemove(t *testing.T) {
 	}
 }
 
+// TestBaseQueueSamePriorityFIFO verifies that if multiple items are queued at
+// the same priority, they will be processes in first-in-first-out order.
+// This avoids starvation scenarios, in particular in the Raft snapshot queue.
+//
+// See:
+// https://github.com/cockroachdb/cockroach/issues/31947#issuecomment-434383267
+func TestBaseQueueSamePriorityFIFO(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	tc := testContext{}
+	stopper := stop.NewStopper()
+	ctx := context.Background()
+	defer stopper.Stop(ctx)
+	tc.Start(t, stopper)
+
+	repls := createReplicas(t, &tc, 5)
+
+	testQueue := &testQueueImpl{
+		shouldQueueFn: func(now hlc.Timestamp, r *Replica) (shouldQueue bool, priority float64) {
+			t.Fatal("unexpected call to shouldQueue")
+			return false, 0.0
+		},
+	}
+
+	bq := makeTestBaseQueue("test", testQueue, tc.store, tc.gossip, queueConfig{maxSize: 100})
+
+	for _, repl := range repls {
+		added, err := bq.testingAdd(ctx, repl, 0.0)
+		if err != nil {
+			t.Fatal(errors.Wrap(err, repl.String()))
+		}
+		if !added {
+			t.Fatalf("%v not added", repl)
+		}
+	}
+	for _, expRepl := range repls {
+		actRepl := bq.pop()
+		if actRepl != expRepl {
+			t.Fatalf("expected %v, got %v", expRepl, actRepl)
+		}
+	}
+}
+
 // TestBaseQueueAdd verifies that calling Add() directly overrides the
 // ShouldQueue method.
 func TestBaseQueueAdd(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	tc := testContext{}
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	ctx := context.Background()
+	defer stopper.Stop(ctx)
 	tc.Start(t, stopper)
 
 	r, err := tc.store.GetReplica(1)
@@ -311,15 +355,15 @@ func TestBaseQueueAdd(t *testing.T) {
 		},
 	}
 	bq := makeTestBaseQueue("test", testQueue, tc.store, tc.gossip, queueConfig{maxSize: 1})
-	bq.MaybeAdd(r, hlc.Timestamp{})
+	bq.maybeAdd(context.Background(), r, hlc.Timestamp{})
 	if bq.Length() != 0 {
 		t.Fatalf("expected length 0; got %d", bq.Length())
 	}
-	if added, err := bq.Add(r, 1.0); err != nil || !added {
+	if added, err := bq.testingAdd(ctx, r, 1.0); err != nil || !added {
 		t.Fatalf("expected Add to succeed: %t, %s", added, err)
 	}
 	// Add again and verify it's not actually added (it's already there).
-	if added, err := bq.Add(r, 1.0); err != nil || added {
+	if added, err := bq.testingAdd(ctx, r, 1.0); err != nil || added {
 		t.Fatalf("expected Add to succeed: %t, %s", added, err)
 	}
 	if bq.Length() != 1 {
@@ -351,8 +395,9 @@ func TestBaseQueueProcess(t *testing.T) {
 	bq := makeTestBaseQueue("test", testQueue, tc.store, tc.gossip, queueConfig{maxSize: 2})
 	bq.Start(stopper)
 
-	bq.MaybeAdd(r1, hlc.Timestamp{})
-	bq.MaybeAdd(r2, hlc.Timestamp{})
+	ctx := context.Background()
+	bq.maybeAdd(ctx, r1, hlc.Timestamp{})
+	bq.maybeAdd(ctx, r2, hlc.Timestamp{})
 	if pc := testQueue.getProcessed(); pc != 0 {
 		t.Errorf("expected no processed ranges; got %d", pc)
 	}
@@ -402,7 +447,8 @@ func TestBaseQueueAddRemove(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	tc := testContext{}
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	ctx := context.Background()
+	defer stopper.Stop(ctx)
 	tc.Start(t, stopper)
 
 	r, err := tc.store.GetReplica(1)
@@ -421,7 +467,7 @@ func TestBaseQueueAddRemove(t *testing.T) {
 	bq := makeTestBaseQueue("test", testQueue, tc.store, tc.gossip, queueConfig{maxSize: 2})
 	bq.Start(stopper)
 
-	bq.MaybeAdd(r, hlc.Timestamp{})
+	bq.maybeAdd(ctx, r, hlc.Timestamp{})
 	bq.MaybeRemove(r.RangeID)
 
 	// Wake the queue
@@ -443,7 +489,8 @@ func TestNeedsSystemConfig(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	tc := testContext{}
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	ctx := context.Background()
+	defer stopper.Stop(ctx)
 	tc.Start(t, stopper)
 
 	r, err := tc.store.GetReplica(1)
@@ -465,7 +512,7 @@ func TestNeedsSystemConfig(t *testing.T) {
 		tc.store.cfg.AmbientCtx, &base.Config{Insecure: true}, tc.store.cfg.Clock, stopper,
 		&cluster.MakeTestingClusterSettings().Version)
 	emptyGossip := gossip.NewTest(
-		tc.gossip.NodeID.Get(), rpcContext, rpc.NewServer(rpcContext), stopper, tc.store.Registry())
+		tc.gossip.NodeID.Get(), rpcContext, rpc.NewServer(rpcContext), stopper, tc.store.Registry(), config.DefaultZoneConfigRef())
 	bqNeedsSysCfg := makeTestBaseQueue("test", testQueue, tc.store, emptyGossip, queueConfig{
 		needsSystemConfig:    true,
 		acceptsUnsplitRanges: true,
@@ -473,13 +520,13 @@ func TestNeedsSystemConfig(t *testing.T) {
 	})
 
 	bqNeedsSysCfg.Start(stopper)
-	bqNeedsSysCfg.MaybeAdd(r, hlc.Timestamp{})
+	bqNeedsSysCfg.maybeAdd(ctx, r, hlc.Timestamp{})
 	if queueFnCalled != 0 {
 		t.Fatalf("expected shouldQueueFn not to be called without valid system config, got %d calls", queueFnCalled)
 	}
 
 	// Manually add a replica and ensure that the process method doesn't get run.
-	if added, err := bqNeedsSysCfg.Add(r, 1.0); err != nil || !added {
+	if added, err := bqNeedsSysCfg.testingAdd(ctx, r, 1.0); err != nil || !added {
 		t.Fatalf("expected Add to succeed: %t, %s", added, err)
 	}
 	// Make sure the queue has actually run through a few times
@@ -498,7 +545,7 @@ func TestNeedsSystemConfig(t *testing.T) {
 		maxSize:              1,
 	})
 	bqNoSysCfg.Start(stopper)
-	bqNoSysCfg.MaybeAdd(r, hlc.Timestamp{})
+	bqNoSysCfg.maybeAdd(context.Background(), r, hlc.Timestamp{})
 	if queueFnCalled != 1 {
 		t.Fatalf("expected shouldQueueFn to be called even without valid system config, got %d calls", queueFnCalled)
 	}
@@ -519,7 +566,14 @@ func TestAcceptsUnsplitRanges(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.TODO())
-	s, _ := createTestStore(t, stopper)
+	s, _ := createTestStore(t,
+		testStoreOpts{
+			// This test was written before test stores could start with more than one
+			// range and was not adapted.
+			createSystemRanges: false,
+		},
+		stopper)
+	ctx := context.Background()
 
 	maxWontSplitAddr, err := keys.Addr(keys.SystemPrefix)
 	if err != nil {
@@ -535,7 +589,9 @@ func TestAcceptsUnsplitRanges(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
-	if err := s.RemoveReplica(context.Background(), repl1, *repl1.Desc(), true); err != nil {
+	if err := s.RemoveReplica(context.Background(), repl1, repl1.Desc().NextReplicaID, RemoveOptions{
+		DestroyData: true,
+	}); err != nil {
 		t.Error(err)
 	}
 
@@ -562,11 +618,10 @@ func TestAcceptsUnsplitRanges(t *testing.T) {
 	bq.Start(stopper)
 
 	// Check our config.
-	var sysCfg config.SystemConfig
+	var sysCfg *config.SystemConfig
 	testutils.SucceedsSoon(t, func() error {
-		var ok bool
-		sysCfg, ok = s.cfg.Gossip.GetSystemConfig()
-		if !ok {
+		sysCfg = s.cfg.Gossip.GetSystemConfig()
+		if sysCfg == nil {
 			return errors.New("system config not yet present")
 		}
 		return nil
@@ -582,8 +637,8 @@ func TestAcceptsUnsplitRanges(t *testing.T) {
 
 	// There are no user db/table entries, everything should be added and
 	// processed as usual.
-	bq.MaybeAdd(neverSplits, hlc.Timestamp{})
-	bq.MaybeAdd(willSplit, hlc.Timestamp{})
+	bq.maybeAdd(ctx, neverSplits, hlc.Timestamp{})
+	bq.maybeAdd(ctx, willSplit, hlc.Timestamp{})
 
 	testutils.SucceedsSoon(t, func() error {
 		if pc := testQueue.getProcessed(); pc != 2 {
@@ -602,7 +657,9 @@ func TestAcceptsUnsplitRanges(t *testing.T) {
 	// Now add a user object, it will trigger a split.
 	// The range willSplit starts at the beginning of the user data range,
 	// which means keys.MaxReservedDescID+1.
-	config.TestingSetZoneConfig(keys.MaxReservedDescID+2, config.ZoneConfig{RangeMaxBytes: 1 << 20})
+	zoneConfig := config.DefaultZoneConfig()
+	zoneConfig.RangeMaxBytes = proto.Int64(1 << 20)
+	config.TestingSetZoneConfig(keys.MaxReservedDescID+2, zoneConfig)
 
 	// Check our config.
 	neverSplitsDesc = neverSplits.Desc()
@@ -614,8 +671,8 @@ func TestAcceptsUnsplitRanges(t *testing.T) {
 		t.Fatal("System config says range does not need to be split")
 	}
 
-	bq.MaybeAdd(neverSplits, hlc.Timestamp{})
-	bq.MaybeAdd(willSplit, hlc.Timestamp{})
+	bq.maybeAdd(ctx, neverSplits, hlc.Timestamp{})
+	bq.maybeAdd(ctx, willSplit, hlc.Timestamp{})
 
 	testutils.SucceedsSoon(t, func() error {
 		if pc := testQueue.getProcessed(); pc != 3 {
@@ -632,13 +689,13 @@ func TestAcceptsUnsplitRanges(t *testing.T) {
 	})
 }
 
-type testError struct{}
+type testPurgatoryError struct{}
 
-func (*testError) Error() string {
-	return "test error"
+func (*testPurgatoryError) Error() string {
+	return "test purgatory error"
 }
 
-func (*testError) purgatoryErrorMarker() {
+func (*testPurgatoryError) purgatoryErrorMarker() {
 }
 
 // TestBaseQueuePurgatory verifies that if error is set on the test
@@ -660,7 +717,7 @@ func TestBaseQueuePurgatory(t *testing.T) {
 			return
 		},
 		pChan: make(chan time.Time, 1),
-		err:   &testError{},
+		err:   &testPurgatoryError{},
 	}
 
 	const replicaCount = 10
@@ -670,7 +727,7 @@ func TestBaseQueuePurgatory(t *testing.T) {
 	bq.Start(stopper)
 
 	for _, r := range repls {
-		bq.MaybeAdd(r, hlc.Timestamp{})
+		bq.maybeAdd(context.Background(), r, hlc.Timestamp{})
 	}
 
 	testutils.SucceedsSoon(t, func() error {
@@ -777,7 +834,7 @@ type processTimeoutQueueImpl struct {
 }
 
 func (pq *processTimeoutQueueImpl) process(
-	ctx context.Context, r *Replica, _ config.SystemConfig,
+	ctx context.Context, r *Replica, _ *config.SystemConfig,
 ) error {
 	<-ctx.Done()
 	atomic.AddInt32(&pq.processed, 1)
@@ -811,7 +868,7 @@ func TestBaseQueueProcessTimeout(t *testing.T) {
 			acceptsUnsplitRanges: true,
 		})
 	bq.Start(stopper)
-	bq.MaybeAdd(r, hlc.Timestamp{})
+	bq.maybeAdd(context.Background(), r, hlc.Timestamp{})
 
 	if l := bq.Length(); l != 1 {
 		t.Errorf("expected one queued replica; got %d", l)
@@ -835,7 +892,7 @@ type processTimeQueueImpl struct {
 }
 
 func (pq *processTimeQueueImpl) process(
-	_ context.Context, _ *Replica, _ config.SystemConfig,
+	_ context.Context, _ *Replica, _ *config.SystemConfig,
 ) error {
 	time.Sleep(5 * time.Millisecond)
 	return nil
@@ -867,7 +924,7 @@ func TestBaseQueueTimeMetric(t *testing.T) {
 			acceptsUnsplitRanges: true,
 		})
 	bq.Start(stopper)
-	bq.MaybeAdd(r, hlc.Timestamp{})
+	bq.maybeAdd(context.Background(), r, hlc.Timestamp{})
 
 	testutils.SucceedsSoon(t, func() error {
 		if v := bq.successes.Count(); v != 1 {
@@ -916,7 +973,8 @@ func TestBaseQueueDisable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	tc := testContext{}
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	ctx := context.Background()
+	defer stopper.Stop(ctx)
 	tc.Start(t, stopper)
 
 	r, err := tc.store.GetReplica(1)
@@ -936,13 +994,13 @@ func TestBaseQueueDisable(t *testing.T) {
 	bq.Start(stopper)
 
 	bq.SetDisabled(true)
-	bq.MaybeAdd(r, hlc.Timestamp{})
+	bq.maybeAdd(context.Background(), r, hlc.Timestamp{})
 	if shouldQueueCalled {
 		t.Error("shouldQueue should not have been called")
 	}
 
 	// Add the range directly, bypassing shouldQueue.
-	if _, err := bq.Add(r, 1.0); err != errQueueDisabled {
+	if _, err := bq.testingAdd(ctx, r, 1.0); err != errQueueDisabled {
 		t.Fatal(err)
 	}
 
@@ -966,7 +1024,7 @@ type parallelQueueImpl struct {
 }
 
 func (pq *parallelQueueImpl) process(
-	ctx context.Context, repl *Replica, cfg config.SystemConfig,
+	ctx context.Context, repl *Replica, cfg *config.SystemConfig,
 ) error {
 	atomic.AddInt32(&pq.processing, 1)
 	if pq.processBlocker != nil {
@@ -1008,9 +1066,10 @@ func TestBaseQueueProcessConcurrently(t *testing.T) {
 	)
 	bq.Start(stopper)
 
-	bq.MaybeAdd(r1, hlc.Timestamp{})
-	bq.MaybeAdd(r2, hlc.Timestamp{})
-	bq.MaybeAdd(r3, hlc.Timestamp{})
+	ctx := context.Background()
+	bq.maybeAdd(ctx, r1, hlc.Timestamp{})
+	bq.maybeAdd(ctx, r2, hlc.Timestamp{})
+	bq.maybeAdd(ctx, r3, hlc.Timestamp{})
 
 	if exp, l := 3, bq.Length(); l != exp {
 		t.Errorf("expected %d queued replica; got %d", exp, l)
@@ -1040,6 +1099,51 @@ func TestBaseQueueProcessConcurrently(t *testing.T) {
 
 	pQueue.processBlocker <- struct{}{}
 	assertProcessedAndProcessing(3, 0)
+}
+
+// TestBaseQueueReplicaChange ensures that if a replica is added to the queue
+// with a non-zero replica ID then it is only processed if the retrieved replica
+// from the getReplica() function has the same replica ID.
+func TestBaseQueueChangeReplicaID(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	// The testContext exists only to construct the baseQueue.
+	tc := testContext{}
+	stopper := stop.NewStopper()
+	ctx := context.Background()
+	defer stopper.Stop(ctx)
+	tc.Start(t, stopper)
+	testQueue := &testQueueImpl{
+		shouldQueueFn: func(now hlc.Timestamp, r *Replica) (shouldQueue bool, priority float64) {
+			return true, 1.0
+		},
+	}
+	bq := makeTestBaseQueue("test", testQueue, tc.store, tc.gossip, queueConfig{
+		maxSize:              defaultQueueMaxSize,
+		acceptsUnsplitRanges: true,
+	})
+	r := &fakeReplica{rangeID: 1, replicaID: 1}
+	bq.mu.Lock()
+	bq.getReplica = func(rangeID roachpb.RangeID) (replicaInQueue, error) {
+		if rangeID != 1 {
+			panic(fmt.Errorf("expected range id 1, got %d", rangeID))
+		}
+		return r, nil
+	}
+	bq.mu.Unlock()
+	require.Equal(t, 0, testQueue.getProcessed())
+	bq.maybeAdd(ctx, r, tc.store.Clock().Now())
+	bq.DrainQueue(tc.store.Stopper())
+	require.Equal(t, 1, testQueue.getProcessed())
+	bq.maybeAdd(ctx, r, tc.store.Clock().Now())
+	r.replicaID = 2
+	bq.DrainQueue(tc.store.Stopper())
+	require.Equal(t, 1, testQueue.getProcessed())
+	require.Equal(t, 0, bq.Length())
+	require.Equal(t, 0, bq.PurgatoryLength())
+	bq.mu.Lock()
+	defer bq.mu.Unlock()
+	_, exists := bq.mu.replicas[1]
+	require.False(t, exists, bq.mu.replicas)
 }
 
 func TestBaseQueueRequeue(t *testing.T) {
@@ -1095,9 +1199,9 @@ func TestBaseQueueRequeue(t *testing.T) {
 			return nil
 		})
 	}
-
+	ctx := context.Background()
 	// MaybeAdd a replica. Should queue after checking ShouldQueue.
-	bq.MaybeAdd(r1, hlc.Timestamp{})
+	bq.maybeAdd(ctx, r1, hlc.Timestamp{})
 	assertShouldQueueCount(1)
 	if exp, l := 1, bq.Length(); l != exp {
 		t.Errorf("expected %d queued replica; got %d", exp, l)
@@ -1108,7 +1212,7 @@ func TestBaseQueueRequeue(t *testing.T) {
 	assertProcessedAndProcessing(0, 1)
 
 	// MaybeAdd the same replica. Should requeue after checking ShouldQueue.
-	bq.MaybeAdd(r1, hlc.Timestamp{})
+	bq.maybeAdd(ctx, r1, hlc.Timestamp{})
 	assertShouldQueueCount(2)
 
 	// Let the first processing attempt finish.
@@ -1118,7 +1222,7 @@ func TestBaseQueueRequeue(t *testing.T) {
 	assertProcessedAndProcessing(1, 1)
 
 	// MaybeAdd the same replica. Should requeue after checking ShouldQueue.
-	bq.MaybeAdd(r1, hlc.Timestamp{})
+	bq.maybeAdd(ctx, r1, hlc.Timestamp{})
 	assertShouldQueueCount(4)
 
 	// Let the second processing attempt finish.
@@ -1128,7 +1232,7 @@ func TestBaseQueueRequeue(t *testing.T) {
 	assertProcessedAndProcessing(2, 0)
 
 	// MaybeAdd the same replica. Should NOT queue after checking ShouldQueue.
-	bq.MaybeAdd(r1, hlc.Timestamp{})
+	bq.maybeAdd(ctx, r1, hlc.Timestamp{})
 	assertShouldQueueCount(6)
 	assertProcessedAndProcessing(2, 0)
 }

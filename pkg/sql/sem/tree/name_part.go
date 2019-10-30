@@ -1,22 +1,16 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree
 
-import (
-	"github.com/cockroachdb/cockroach/pkg/sql/lex"
-)
+import "github.com/cockroachdb/cockroach/pkg/sql/lex"
 
 // A Name is an SQL identifier.
 //
@@ -33,10 +27,10 @@ type Name string
 // Format implements the NodeFormatter interface.
 func (n *Name) Format(ctx *FmtCtx) {
 	f := ctx.flags
-	if f.HasFlags(FmtAnonymize) {
+	if f.HasFlags(FmtAnonymize) && !isArityIndicatorString(string(*n)) {
 		ctx.WriteByte('_')
 	} else {
-		lex.EncodeRestrictedSQLIdent(ctx.Buffer, string(*n), f.EncodeFlags())
+		lex.EncodeRestrictedSQLIdent(&ctx.Buffer, string(*n), f.EncodeFlags())
 	}
 }
 
@@ -52,11 +46,17 @@ func NameString(s string) string {
 	return ((*Name)(&s)).String()
 }
 
-// ErrNameString escapes an identifier stored a string to a SQL
+// ErrNameStringP escapes an identifier stored a string to a SQL
 // identifier suitable for printing in error messages, avoiding a heap
 // allocation.
-func ErrNameString(s *string) string {
+func ErrNameStringP(s *string) string {
 	return ErrString(((*Name)(s)))
+}
+
+// ErrNameString escapes an identifier stored a string to a SQL
+// identifier suitable for printing in error messages.
+func ErrNameString(s string) string {
+	return ErrString(((*Name)(&s)))
 }
 
 // Normalize normalizes to lowercase and Unicode Normalization Form C
@@ -85,7 +85,7 @@ func (u *UnrestrictedName) Format(ctx *FmtCtx) {
 	if f.HasFlags(FmtAnonymize) {
 		ctx.WriteByte('_')
 	} else {
-		lex.EncodeUnrestrictedSQLIdent(ctx.Buffer, string(*u), f.EncodeFlags())
+		lex.EncodeUnrestrictedSQLIdent(&ctx.Buffer, string(*u), f.EncodeFlags())
 	}
 }
 
@@ -167,11 +167,11 @@ func (u *UnresolvedName) Format(ctx *FmtCtx) {
 	if u.Star {
 		stopAt = 2
 	}
-	// Every part after that is necessarily an unrestricted name.
 	for i := u.NumParts; i >= stopAt; i-- {
 		// The first part to print is the last item in u.Parts.  It is also
 		// a potentially restricted name to disambiguate from keywords in
-		// the grammar, so print it out as a "Name".
+		// the grammar, so print it out as a "Name". Every part after that is
+		// necessarily an unrestricted name.
 		if i == u.NumParts {
 			ctx.FormatNode((*Name)(&u.Parts[i-1]))
 		} else {
@@ -200,4 +200,128 @@ func MakeUnresolvedName(args ...string) UnresolvedName {
 		n.Parts[i] = args[len(args)-1-i]
 	}
 	return n
+}
+
+// UnresolvedObjectName is an unresolved qualified name for a database object
+// (table, view, etc). It is like UnresolvedName but more restrictive.
+// It should only be constructed via NewUnresolvedObjectName.
+type UnresolvedObjectName struct {
+	// NumParts indicates the number of name parts specified; always 1 or greater.
+	NumParts int
+
+	// Parts are the name components, in reverse order.
+	// There are at most 3: object name, schema, catalog/db.
+	//
+	// Note: Parts has a fixed size so that we avoid a heap allocation for the
+	// slice every time we construct an UnresolvedObjectName. It does imply
+	// however that Parts does not have a meaningful "length"; its actual length
+	// (the number of parts specified) is populated in NumParts above.
+	Parts [3]string
+
+	// UnresolvedObjectName cam be annotated with a *TableName.
+	AnnotatedNode
+}
+
+// UnresolvedObjectName implements TableExpr.
+func (*UnresolvedObjectName) tableExpr() {}
+
+// NewUnresolvedObjectName creates an unresolved object name, verifying that it
+// is well-formed.
+func NewUnresolvedObjectName(
+	numParts int, parts [3]string, annotationIdx AnnotationIdx,
+) (*UnresolvedObjectName, error) {
+	u := &UnresolvedObjectName{
+		NumParts:      numParts,
+		Parts:         parts,
+		AnnotatedNode: AnnotatedNode{AnnIdx: annotationIdx},
+	}
+	if u.NumParts < 1 {
+		return nil, newInvTableNameError(u)
+	}
+
+	// Check that all the parts specified are not empty.
+	// It's OK if the catalog name is empty.
+	// We allow this in e.g. `select * from "".crdb_internal.tables`.
+	lastCheck := u.NumParts
+	if lastCheck > 2 {
+		lastCheck = 2
+	}
+	for i := 0; i < lastCheck; i++ {
+		if len(u.Parts[i]) == 0 {
+			return nil, newInvTableNameError(u)
+		}
+	}
+	return u, nil
+}
+
+// Resolved returns the resolved name in the annotation for this node (or nil if
+// there isn't one).
+func (u *UnresolvedObjectName) Resolved(ann *Annotations) *TableName {
+	r := u.GetAnnotation(ann)
+	if r == nil {
+		return nil
+	}
+	return r.(*TableName)
+}
+
+// Format implements the NodeFormatter interface.
+func (u *UnresolvedObjectName) Format(ctx *FmtCtx) {
+	// If we want to format the corresponding resolved name, look it up in the
+	// annotation.
+	if ctx.HasFlags(FmtAlwaysQualifyTableNames) || ctx.tableNameFormatter != nil {
+		if ctx.tableNameFormatter != nil && ctx.ann == nil {
+			// TODO(radu): this is a temporary hack while we transition to using
+			// unresolved names everywhere. We will need to revisit and see if we need
+			// to switch to (or add) an UnresolvedObjectName formatter.
+			tn := u.ToTableName()
+			tn.Format(ctx)
+			return
+		}
+
+		if n := u.Resolved(ctx.ann); n != nil {
+			n.Format(ctx)
+			return
+		}
+	}
+
+	for i := u.NumParts; i > 0; i-- {
+		// The first part to print is the last item in u.Parts. It is also
+		// a potentially restricted name to disambiguate from keywords in
+		// the grammar, so print it out as a "Name". Every part after that is
+		// necessarily an unrestricted name.
+		if i == u.NumParts {
+			ctx.FormatNode((*Name)(&u.Parts[i-1]))
+		} else {
+			ctx.WriteByte('.')
+			ctx.FormatNode((*UnrestrictedName)(&u.Parts[i-1]))
+		}
+	}
+}
+
+func (u *UnresolvedObjectName) String() string { return AsString(u) }
+
+// ToTableName converts the unresolved name to a table name.
+//
+// TODO(radu): the schema and catalog names might not be in the right places; we
+// would only figure that out during name resolution. This method is temporary,
+// while we change all the code paths to only use TableName after resolution.
+func (u *UnresolvedObjectName) ToTableName() TableName {
+	return TableName{tblName{
+		TableName: Name(u.Parts[0]),
+		TableNamePrefix: TableNamePrefix{
+			SchemaName:      Name(u.Parts[1]),
+			CatalogName:     Name(u.Parts[2]),
+			ExplicitSchema:  u.NumParts >= 2,
+			ExplicitCatalog: u.NumParts >= 3,
+		},
+	}}
+}
+
+// ToUnresolvedName converts the unresolved object name to the more general
+// unresolved name.
+func (u *UnresolvedObjectName) ToUnresolvedName() *UnresolvedName {
+	return &UnresolvedName{
+		NumParts: u.NumParts,
+		Parts:    NameParts{u.Parts[0], u.Parts[1], u.Parts[2]},
+	}
 }

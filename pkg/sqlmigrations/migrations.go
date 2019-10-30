@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sqlmigrations
 
@@ -20,9 +16,8 @@ import (
 	"sort"
 	"time"
 
-	"github.com/pkg/errors"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -32,13 +27,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/util/envutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/pkg/errors"
 )
 
 var (
@@ -48,8 +44,6 @@ var (
 
 // MigrationManagerTestingKnobs contains testing knobs.
 type MigrationManagerTestingKnobs struct {
-	// DisableMigrations skips all migrations.
-	DisableMigrations bool
 	// DisableBackfillMigrations stops applying migrations once
 	// a migration with 'doesBackfill == true' is encountered.
 	// TODO(mberhault): we could skip only backfill migrations and dependencies
@@ -66,8 +60,13 @@ var _ base.ModuleTestingKnobs = &MigrationManagerTestingKnobs{}
 // startup. They will always be run from top-to-bottom, and because they are
 // assumed to be backward-compatible, they will be run regardless of what other
 // node versions are currently running within the cluster.
-// Migrations must be idempotent: a migration may run successfully but not be recorded
-// as completed, causing a second run.
+// Migrations must be idempotent: a migration may run successfully but not be
+// recorded as completed, causing a second run.
+//
+// Attention: If a migration is creating new tables, it should also be added to
+// the metadata schema written by bootstrap (see addSystemDatabaseToSchema())
+// and it should have the includedInBootstrap field set (see comments on that
+// field too).
 var backwardCompatibleMigrations = []migrationDescriptor{
 	{
 		// Introduced in v1.0. Baked into v2.0.
@@ -98,11 +97,6 @@ var backwardCompatibleMigrations = []migrationDescriptor{
 		// Introduced in v1.1. Permanent migration.
 		name:   "populate initial version cluster setting table entry",
 		workFn: populateVersionSetting,
-	},
-	{
-		// Introduced in v1.1. Permanent migration.
-		name:   "persist trace.debug.enable = 'false'",
-		workFn: disableNetTrace,
 	},
 	{
 		// Introduced in v2.0. Baked into v2.1.
@@ -170,8 +164,7 @@ var backwardCompatibleMigrations = []migrationDescriptor{
 	{
 		// Introduced in v2.1, repeat of 2.0 migration to catch mixed-version issues.
 		// TODO(mberhault): bake into v2.2.
-		name:   "repeat: ensure admin role privileges in all descriptors",
-		workFn: ensureMaxPrivileges,
+		name: "repeat: ensure admin role privileges in all descriptors",
 	},
 	{
 		// Introduced in v2.1.
@@ -186,6 +179,77 @@ var backwardCompatibleMigrations = []migrationDescriptor{
 		workFn:           createDefaultDbs,
 		newDescriptorIDs: databaseIDs(sessiondata.DefaultDatabaseName, sessiondata.PgDatabaseName),
 	},
+	{
+		// Introduced in v2.1.
+		// TODO(dt): Bake into v2.2.
+		name:   "add progress to system.jobs",
+		workFn: addJobsProgress,
+	},
+	{
+		// Introduced in v2.2.
+		// TODO(knz): bake this migration into v2.3.
+		name:                "create system.comment table",
+		workFn:              createCommentTable,
+		includedInBootstrap: true,
+		newDescriptorIDs:    staticIDs(keys.CommentsTableID),
+	},
+	{
+		name:                "create system.replication_constraint_stats table",
+		workFn:              createReplicationConstraintStatsTable,
+		includedInBootstrap: true,
+		newDescriptorIDs:    staticIDs(keys.ReplicationConstraintStatsTableID),
+	},
+	{
+		name:                "create system.replication_critical_localities table",
+		workFn:              createReplicationCriticalLocalitiesTable,
+		includedInBootstrap: true,
+		newDescriptorIDs:    staticIDs(keys.ReplicationCriticalLocalitiesTableID),
+	},
+	{
+		name:                "create system.reports_meta table",
+		workFn:              createReportsMetaTable,
+		includedInBootstrap: true,
+		newDescriptorIDs:    staticIDs(keys.ReportsMetaTableID),
+	},
+	{
+		name:                "create system.replication_stats table",
+		workFn:              createReplicationStatsTable,
+		includedInBootstrap: true,
+		newDescriptorIDs:    staticIDs(keys.ReplicationStatsTableID),
+	},
+	{
+		// Introduced in v19.1.
+		// TODO(knz): bake this migration into v19.2.
+		name:   "propagate the ts purge interval to the new setting names",
+		workFn: retireOldTsPurgeIntervalSettings,
+	},
+	{
+		// Introduced in v19.2.
+		name:   "update system.locations with default location data",
+		workFn: updateSystemLocationData,
+	},
+	{
+		// Introduced in v19.2.
+		name:                "change reports fields from timestamp to timestamptz",
+		includedInBootstrap: true,
+		workFn: func(ctx context.Context, r runner) error {
+			// Note that these particular schema changes are idempotent.
+			if _, err := r.sqlExecutor.ExecWithUser(ctx, "update-reports-meta-generated", nil, /* txn */
+				security.NodeUser,
+				`ALTER TABLE system.reports_meta ALTER generated TYPE TIMESTAMP WITH TIME ZONE`,
+			); err != nil {
+				return err
+			}
+			if _, err := r.sqlExecutor.ExecWithUser(ctx, "update-reports-meta-generated", nil, /* txn */
+				security.NodeUser,
+				"ALTER TABLE system.replication_constraint_stats ALTER violation_start "+
+					"TYPE TIMESTAMP WITH TIME ZONE",
+			); err != nil {
+				return err
+			}
+			return nil
+		},
+	},
 }
 
 func staticIDs(ids ...sqlbase.ID) func(ctx context.Context, db db) ([]sqlbase.ID, error) {
@@ -196,7 +260,7 @@ func databaseIDs(names ...string) func(ctx context.Context, db db) ([]sqlbase.ID
 	return func(ctx context.Context, db db) ([]sqlbase.ID, error) {
 		var ids []sqlbase.ID
 		for _, name := range names {
-			kv, err := db.Get(ctx, sqlbase.MakeNameMetadataKey(keys.RootNamespaceID, name))
+			kv, err := db.Get(ctx, sqlbase.NewTableKey(keys.RootNamespaceID, name).Key())
 			if err != nil {
 				return nil, err
 			}
@@ -213,8 +277,18 @@ type migrationDescriptor struct {
 	// name must be unique amongst all hard-coded migrations.
 	name string
 	// workFn must be idempotent so that we can safely re-run it if a node failed
-	// while running it.
+	// while running it. nil if the migration has been "backed in" and is no
+	// longer to be performed at cluster startup.
 	workFn func(context.Context, runner) error
+	// includedInBootstrap is set for migrations that need to be performed for
+	// updating old clusters, but are also covered by the MetadataSchema that gets
+	// created by hand for a new cluster when it bootstraps itself. This kind of
+	// duplication between a migration and the MetadataSchema is useful for
+	// migrations that create system descriptor - for new clusters (particularly
+	// for tests) we want to create these tables by hand so that a corresponding
+	// range is created at bootstrap time. Otherwise, we'd have the split queue
+	// asynchronously creating some ranges which is annoying for tests.
+	includedInBootstrap bool
 	// doesBackfill should be set to true if the migration triggers a backfill.
 	doesBackfill bool
 	// newDescriptorIDs is a function that returns the IDs of any additional
@@ -298,14 +372,22 @@ func NewManager(
 // NOTE: This value may be out-of-date if another node is actively running
 // migrations, and so should only be used in test code where the migration
 // lifecycle is tightly controlled.
-func ExpectedDescriptorIDs(ctx context.Context, db db) (sqlbase.IDs, error) {
+func ExpectedDescriptorIDs(
+	ctx context.Context,
+	db db,
+	defaultZoneConfig *config.ZoneConfig,
+	defaultSystemZoneConfig *config.ZoneConfig,
+) (sqlbase.IDs, error) {
 	completedMigrations, err := getCompletedMigrations(ctx, db)
 	if err != nil {
 		return nil, err
 	}
-	descriptorIDs := sqlbase.MakeMetadataSchema().DescriptorIDs()
+	descriptorIDs := sqlbase.MakeMetadataSchema(defaultZoneConfig, defaultSystemZoneConfig).DescriptorIDs()
 	for _, migration := range backwardCompatibleMigrations {
-		if migration.newDescriptorIDs == nil {
+		// Is the migration not creating descriptors?
+		if migration.newDescriptorIDs == nil ||
+			// Is the migration included in the metadata schema considered above?
+			migration.includedInBootstrap {
 			continue
 		}
 		if _, ok := completedMigrations[string(migrationKey(migration))]; ok {
@@ -320,15 +402,21 @@ func ExpectedDescriptorIDs(ctx context.Context, db db) (sqlbase.IDs, error) {
 	return descriptorIDs, nil
 }
 
+// MigrationFilter is used to indicate to EnsureMigrations what to run.
+type MigrationFilter bool
+
+const (
+	// AllMigrations means run all the migrations.
+	AllMigrations MigrationFilter = true
+	// ExcludeMigrationsIncludedInBootstrap means don't run migrations with the
+	// includedInBootstrap field set.
+	ExcludeMigrationsIncludedInBootstrap MigrationFilter = false
+)
+
 // EnsureMigrations should be run during node startup to ensure that all
 // required migrations have been run (and running all those that are definitely
 // safe to run).
-func (m *Manager) EnsureMigrations(ctx context.Context) error {
-	if m.testingKnobs.DisableMigrations {
-		log.Info(ctx, "skipping all migrations due to testing knob")
-		return nil
-	}
-
+func (m *Manager) EnsureMigrations(ctx context.Context, filter MigrationFilter) error {
 	// First, check whether there are any migrations that need to be run.
 	completedMigrations, err := getCompletedMigrations(ctx, m.db)
 	if err != nil {
@@ -336,8 +424,10 @@ func (m *Manager) EnsureMigrations(ctx context.Context) error {
 	}
 	allMigrationsCompleted := true
 	for _, migration := range backwardCompatibleMigrations {
-		if migration.workFn == nil {
-			// Migration has been baked in. Ignore it.
+		if migration.workFn == nil || // has the migration been baked in?
+			// is the migration unnecessary?
+			(migration.includedInBootstrap &&
+				filter == ExcludeMigrationsIncludedInBootstrap) {
 			continue
 		}
 		if m.testingKnobs.DisableBackfillMigrations && migration.doesBackfill {
@@ -368,7 +458,7 @@ func (m *Manager) EnsureMigrations(ctx context.Context) error {
 		if err == nil {
 			break
 		}
-		log.Errorf(ctx, "failed attempt to acquire migration lease: %s", err)
+		log.Infof(ctx, "failed attempt to acquire migration lease: %s", err)
 	}
 	if err != nil {
 		return errors.Wrapf(err, "failed to acquire lease for running necessary migrations")
@@ -428,8 +518,10 @@ func (m *Manager) EnsureMigrations(ctx context.Context) error {
 		sqlExecutor: m.sqlExecutor,
 	}
 	for _, migration := range backwardCompatibleMigrations {
-		if migration.workFn == nil {
-			// Migration has been baked in. Ignore it.
+		if migration.workFn == nil || // has the migration been baked in?
+			// is the migration unnecessary?
+			(migration.includedInBootstrap &&
+				filter == ExcludeMigrationsIncludedInBootstrap) {
 			continue
 		}
 
@@ -451,9 +543,7 @@ func (m *Manager) EnsureMigrations(ctx context.Context) error {
 			return errors.Wrapf(err, "failed to run migration %q", migration.name)
 		}
 
-		if log.V(1) {
-			log.Infof(ctx, "trying to persist record of completing migration %s", migration.name)
-		}
+		log.VEventf(ctx, 1, "persisting record of completing migration %s", migration.name)
 		if err := m.db.Put(ctx, key, startTime); err != nil {
 			return errors.Wrapf(err, "failed to persist record of completing migration %q",
 				migration.name)
@@ -487,24 +577,52 @@ func createSystemTable(ctx context.Context, r runner, desc sqlbase.TableDescript
 	// the reserved ID space. (The SQL layer doesn't allow this.)
 	err := r.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
 		b := txn.NewBatch()
-		b.CPut(sqlbase.MakeNameMetadataKey(desc.GetParentID(), desc.GetName()), desc.GetID(), nil)
+		b.CPut(sqlbase.NewTableKey(desc.GetParentID(), desc.GetName()).Key(), desc.GetID(), nil)
 		b.CPut(sqlbase.MakeDescMetadataKey(desc.GetID()), sqlbase.WrapDescriptor(&desc), nil)
 		if err := txn.SetSystemConfigTrigger(); err != nil {
 			return err
 		}
 		return txn.Run(ctx, b)
 	})
-	if err != nil {
-		// CPuts only provide idempotent inserts if we ignore the errors that arise
-		// when the condition isn't met.
-		if _, ok := err.(*roachpb.ConditionFailedError); ok {
-			return nil
-		}
+	// CPuts only provide idempotent inserts if we ignore the errors that arise
+	// when the condition isn't met.
+	if _, ok := err.(*roachpb.ConditionFailedError); ok {
+		return nil
 	}
 	return err
 }
 
-var reportingOptOut = envutil.EnvOrDefaultBool("COCKROACH_SKIP_ENABLING_DIAGNOSTIC_REPORTING", false)
+func createCommentTable(ctx context.Context, r runner) error {
+	return createSystemTable(ctx, r, sqlbase.CommentsTable)
+}
+
+func createReplicationConstraintStatsTable(ctx context.Context, r runner) error {
+	if err := createSystemTable(ctx, r, sqlbase.ReplicationConstraintStatsTable); err != nil {
+		return err
+	}
+	_, err := r.sqlExecutor.Exec(ctx, "add-constraints-ttl", nil, /* txn */
+		fmt.Sprintf("ALTER TABLE %s CONFIGURE ZONE USING gc.ttlseconds = %d",
+			sqlbase.ReplicationConstraintStatsTable.Name, int(sqlbase.ReplicationConstraintStatsTableTTL.Seconds())))
+	return errors.Wrapf(err, "failed to set TTL on %s", sqlbase.ReplicationConstraintStatsTable.Name)
+}
+
+func createReplicationCriticalLocalitiesTable(ctx context.Context, r runner) error {
+	return createSystemTable(ctx, r, sqlbase.ReplicationCriticalLocalitiesTable)
+}
+
+func createReplicationStatsTable(ctx context.Context, r runner) error {
+	if err := createSystemTable(ctx, r, sqlbase.ReplicationStatsTable); err != nil {
+		return err
+	}
+	_, err := r.sqlExecutor.Exec(ctx, "add-replication-status-ttl", nil, /* txn */
+		fmt.Sprintf("ALTER TABLE %s CONFIGURE ZONE USING gc.ttlseconds = %d",
+			sqlbase.ReplicationStatsTable.Name, int(sqlbase.ReplicationStatsTableTTL.Seconds())))
+	return errors.Wrapf(err, "failed to set TTL on %s", sqlbase.ReplicationStatsTable.Name)
+}
+
+func createReportsMetaTable(ctx context.Context, r runner) error {
+	return createSystemTable(ctx, r, sqlbase.ReportsMetaTable)
+}
 
 func runStmtAsRootWithRetry(
 	ctx context.Context, r runner, opName string, stmt string, qargs ...interface{},
@@ -528,22 +646,16 @@ func runStmtAsRootWithRetry(
 // from what was defined in code.
 var SettingsDefaultOverrides = map[string]string{
 	"diagnostics.reporting.enabled": "true",
-	"trace.debug.enable":            "false",
 	"cluster.secret":                "<random>",
 }
 
 func optInToDiagnosticsStatReporting(ctx context.Context, r runner) error {
 	// We're opting-out of the automatic opt-in. See discussion in updates.go.
-	if reportingOptOut {
+	if cluster.TelemetryOptOut() {
 		return nil
 	}
 	return runStmtAsRootWithRetry(
 		ctx, r, "optInToDiagnosticsStatReporting", `SET CLUSTER SETTING diagnostics.reporting.enabled = true`)
-}
-
-func disableNetTrace(ctx context.Context, r runner) error {
-	return runStmtAsRootWithRetry(
-		ctx, r, "disableNetTrace", `SET CLUSTER SETTING trace.debug.enable = false`)
 }
 
 func initializeClusterSecret(ctx context.Context, r runner) error {
@@ -561,15 +673,12 @@ func populateVersionSetting(ctx context.Context, r runner) error {
 		return err
 	}
 	if v == (roachpb.Version{}) {
-		// The cluster was bootstrapped at v1.0 (or even earlier), so make that
-		// the version.
-		v = cluster.VersionByKey(cluster.VersionBase)
+		// The cluster was bootstrapped at v1.0 (or even earlier), so just use
+		// the MinSupportedVersion of the binary.
+		v = cluster.BinaryMinimumSupportedVersion
 	}
 
-	b, err := protoutil.Marshal(&cluster.ClusterVersion{
-		MinimumVersion: v,
-		UseVersion:     v,
-	})
+	b, err := protoutil.Marshal(&cluster.ClusterVersion{Version: v})
 	if err != nil {
 		return errors.Wrap(err, "while marshaling version")
 	}
@@ -583,7 +692,7 @@ func populateVersionSetting(ctx context.Context, r runner) error {
 		ctx,
 		"insert-setting",
 		nil, /* txn */
-		fmt.Sprintf(`INSERT INTO system.settings (name, value, "lastUpdated", "valueType") VALUES ('version', x'%x', NOW(), 'm') ON CONFLICT(name) DO NOTHING`, b),
+		fmt.Sprintf(`INSERT INTO system.settings (name, value, "lastUpdated", "valueType") VALUES ('version', x'%x', now(), 'm') ON CONFLICT(name) DO NOTHING`, b),
 	); err != nil {
 		return err
 	}
@@ -619,115 +728,6 @@ func addRootToAdminRole(ctx context.Context, r runner) error {
           `
 	return runStmtAsRootWithRetry(
 		ctx, r, "addRootToAdminRole", upsertAdminStmt, sqlbase.AdminRole, security.RootUser)
-}
-
-// ensureMaxPrivileges ensures that all descriptors have privileges
-// for the admin role, and that root and user privileges do not exceed
-// the allowed privileges.
-//
-// TODO(mberhault): Remove this migration in v2.1.
-func ensureMaxPrivileges(ctx context.Context, r runner) error {
-	tableDescFn := func(desc *sqlbase.TableDescriptor) (bool, error) {
-		return desc.Privileges.MaybeFixPrivileges(desc.ID), nil
-	}
-	databaseDescFn := func(desc *sqlbase.DatabaseDescriptor) (bool, error) {
-		return desc.Privileges.MaybeFixPrivileges(desc.ID), nil
-	}
-	return upgradeDescsWithFn(ctx, r, tableDescFn, databaseDescFn)
-}
-
-var upgradeDescBatchSize int64 = 50
-
-// upgradeTableDescsWithFn runs the provided upgrade functions on each table
-// and database descriptor, persisting any upgrades if the function indicates that the
-// descriptor was changed.
-// Upgrade functions may be nil to perform nothing for the corresponding descriptor type.
-func upgradeDescsWithFn(
-	ctx context.Context,
-	r runner,
-	upgradeTableDescFn func(desc *sqlbase.TableDescriptor) (upgraded bool, err error),
-	upgradeDatabaseDescFn func(desc *sqlbase.DatabaseDescriptor) (upgraded bool, err error),
-) error {
-	startKey := sqlbase.MakeAllDescsMetadataKey()
-	endKey := startKey.PrefixEnd()
-	for done := false; !done; {
-		// It's safe to use multiple transactions here. Any table descriptor that's
-		// created while this migration is in progress will use the desired
-		// InterleavedFormatVersion, as all possible binary versions in the cluster
-		// (the current release and the previous release) create new table
-		// descriptors using InterleavedFormatVersion. We need only upgrade the
-		// ancient table descriptors written by versions before beta-20161013.
-		if err := r.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
-			kvs, err := txn.Scan(ctx, startKey, endKey, upgradeDescBatchSize)
-			if err != nil {
-				return err
-			}
-			if len(kvs) == 0 {
-				done = true
-				return nil
-			}
-			startKey = kvs[len(kvs)-1].Key.Next()
-
-			b := txn.NewBatch()
-			for _, kv := range kvs {
-				var sqlDesc sqlbase.Descriptor
-				if err := kv.ValueProto(&sqlDesc); err != nil {
-					return err
-				}
-				switch t := sqlDesc.Union.(type) {
-				case *sqlbase.Descriptor_Table:
-					if table := sqlDesc.GetTable(); table != nil && upgradeTableDescFn != nil {
-						if upgraded, err := upgradeTableDescFn(table); err != nil {
-							return err
-						} else if upgraded {
-							// Though SetUpVersion typically bails out if the table is being
-							// dropped, it's safe to ignore the DROP state here and
-							// unconditionally set UpVersion. For proof, see
-							// TestDropTableWhileUpgradingFormat.
-							//
-							// In fact, it's of the utmost importance that this migration
-							// upgrades every last old-format table descriptor, including those
-							// that are dropping. Otherwise, the user could upgrade to a version
-							// without support for reading the old format before the drop
-							// completes, leaving a broken table descriptor and the table's
-							// remaining data around forever. This isn't just a theoretical
-							// concern: consider that dropping a large table can take several
-							// days, while upgrading to a new version can take as little as a
-							// few minutes.
-							table.UpVersion = true
-							if err := table.Validate(ctx, txn, nil); err != nil {
-								return err
-							}
-
-							b.Put(kv.Key, sqlbase.WrapDescriptor(table))
-						}
-					}
-				case *sqlbase.Descriptor_Database:
-					if database := sqlDesc.GetDatabase(); database != nil && upgradeDatabaseDescFn != nil {
-						if upgraded, err := upgradeDatabaseDescFn(database); err != nil {
-							return err
-						} else if upgraded {
-							if err := database.Validate(); err != nil {
-								return err
-							}
-
-							b.Put(kv.Key, sqlbase.WrapDescriptor(database))
-						}
-					}
-
-				default:
-					return errors.Errorf("Descriptor.Union has unexpected type %T", t)
-				}
-			}
-			if err := txn.SetSystemConfigTrigger(); err != nil {
-				return err
-			}
-			return txn.Run(ctx, b)
-		}); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func disallowPublicUserOrRole(ctx context.Context, r runner) error {
@@ -786,4 +786,98 @@ func createDefaultDbs(ctx context.Context, r runner) error {
 		}
 	}
 	return err
+}
+
+func addJobsProgress(ctx context.Context, r runner) error {
+	// Ideally to add a column progress, we'd just run a query like:
+	//  ALTER TABLE system.jobs ADD COLUMN progress BYTES CREATE FAMLIY progress;
+	// However SQL-managed schema changes use jobs tracking internally, which will
+	// fail if the jobs table's schema has not been migrated. Rather than add very
+	// significant complexity to the jobs code to try to handle pre- and post-
+	// migration schemas, we can dodge the chicken-and-egg problem by doing our
+	// schema change manually.
+	return r.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+		if err := txn.SetSystemConfigTrigger(); err != nil {
+			return err
+		}
+		desc, err := sqlbase.GetMutableTableDescFromID(ctx, txn, keys.JobsTableID)
+		if err != nil {
+			return err
+		}
+		if _, err := desc.FindActiveColumnByName("progress"); err == nil {
+			return nil
+		}
+		desc.AddColumn(&sqlbase.ColumnDescriptor{
+			Name:     "progress",
+			Type:     *types.Bytes,
+			Nullable: true,
+		})
+		if err := desc.AddColumnToFamilyMaybeCreate("progress", "progress", true, false); err != nil {
+			return err
+		}
+		if err := desc.AllocateIDs(); err != nil {
+			return err
+		}
+		return txn.Put(ctx, sqlbase.MakeDescMetadataKey(desc.ID), sqlbase.WrapDescriptor(desc))
+	})
+}
+
+func retireOldTsPurgeIntervalSettings(ctx context.Context, r runner) error {
+	// We are going to deprecate `timeseries.storage.10s_resolution_ttl`
+	// into `timeseries.storage.resolution_10s.ttl` if the latter is not
+	// defined.
+	//
+	// Ditto for the `30m` resolution.
+
+	// Copy 'timeseries.storage.10s_resolution_ttl' into
+	// 'timeseries.storage.resolution_10s.ttl' if the former is defined
+	// and the latter is not defined yet.
+	//
+	// We rely on the SELECT returning no row if the original setting
+	// was not defined, and INSERT ON CONFLICT DO NOTHING to ignore the
+	// insert if the new name was already set.
+	if _, err := r.sqlExecutor.Exec(ctx, "copy-setting", nil /* txn */, `
+INSERT INTO system.settings (name, value, "lastUpdated", "valueType")
+   SELECT 'timeseries.storage.resolution_10s.ttl', value, "lastUpdated", "valueType"
+     FROM system.settings WHERE name = 'timeseries.storage.10s_resolution_ttl'
+ON CONFLICT (name) DO NOTHING`,
+	); err != nil {
+		return err
+	}
+
+	// Ditto 30m.
+	if _, err := r.sqlExecutor.Exec(ctx, "copy-setting", nil /* txn */, `
+INSERT INTO system.settings (name, value, "lastUpdated", "valueType")
+   SELECT 'timeseries.storage.resolution_30m.ttl', value, "lastUpdated", "valueType"
+     FROM system.settings WHERE name = 'timeseries.storage.30m_resolution_ttl'
+ON CONFLICT (name) DO NOTHING`,
+	); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func updateSystemLocationData(ctx context.Context, r runner) error {
+	// See if the system.locations table already has data in it.
+	// If so, we don't want to do anything.
+	row, err := r.sqlExecutor.QueryRow(ctx, "update-system-locations",
+		nil, `SELECT count(*) FROM system.locations`)
+	if err != nil {
+		return err
+	}
+	count := int(tree.MustBeDInt(row[0]))
+	if count != 0 {
+		return nil
+	}
+
+	for _, loc := range roachpb.DefaultLocationInformation {
+		stmt := `UPSERT INTO system.locations VALUES ($1, $2, $3, $4)`
+		tier := loc.Locality.Tiers[0]
+		if _, err := r.sqlExecutor.Exec(ctx, "update-system-locations", nil,
+			stmt, tier.Key, tier.Value, loc.Latitude, loc.Longitude); err != nil {
+			return err
+		}
+	}
+	return nil
 }

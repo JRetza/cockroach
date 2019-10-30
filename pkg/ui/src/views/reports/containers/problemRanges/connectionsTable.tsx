@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import _ from "lodash";
 import classNames from "classnames";
 import React from "react";
@@ -9,7 +19,7 @@ import { CachedDataReducerState } from "src/redux/cachedDataReducer";
 interface ConnectionTableColumn {
   title: string;
   extract: (
-    p: protos.cockroach.server.serverpb.ProblemRangesResponse.NodeProblems$Properties,
+    p: protos.cockroach.server.serverpb.ProblemRangesResponse.INodeProblems,
     id?: number,
   ) => React.ReactNode;
 }
@@ -39,13 +49,28 @@ const connectionTableColumns: ConnectionTableColumn[] = [
     extract: (problem) => problem.underreplicated_range_ids.length,
   },
   {
+    title: "Overreplicated",
+    extract: (problem) => problem.overreplicated_range_ids.length,
+  },
+  {
+    title: "Quiescent equals ticking",
+    extract: (problem) => problem.quiescent_equals_ticking_range_ids.length,
+  },
+  {
+    title: "Raft log too large",
+    extract: (problem) => problem.raft_log_too_large_range_ids.length,
+  },
+  {
     title: "Total",
     extract: (problem) => {
       return problem.unavailable_range_ids.length +
         problem.no_raft_leader_range_ids.length +
         problem.no_lease_range_ids.length +
         problem.raft_leader_not_lease_holder_range_ids.length +
-        problem.underreplicated_range_ids.length;
+        problem.underreplicated_range_ids.length +
+        problem.overreplicated_range_ids.length +
+        problem.quiescent_equals_ticking_range_ids.length +
+        problem.raft_log_too_large_range_ids.length;
     },
   },
   { title: "Error", extract: (problem) => problem.error_message },

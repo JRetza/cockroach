@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import React from "react";
 import _ from "lodash";
 
@@ -39,7 +49,8 @@ export default function (props: GraphDashboardProps) {
     <LineGraph
       title="Log Commit Latency: 99th Percentile"
       sources={storeSources}
-      tooltip={`The 99th %ile latency for commits to the Raft Log.`}
+      tooltip={`The 99th %ile latency for commits to the Raft Log.
+        This measures essentially an fdatasync to the storage engine's write-ahead log.`}
     >
       <Axis units={AxisUnits.Duration} label="latency">
         {
@@ -56,9 +67,31 @@ export default function (props: GraphDashboardProps) {
     </LineGraph>,
 
     <LineGraph
+      title="Log Commit Latency: 50th Percentile"
+      sources={storeSources}
+      tooltip={`The 50th %ile latency for commits to the Raft Log.
+        This measures essentially an fdatasync to the storage engine's write-ahead log.`}
+    >
+      <Axis units={AxisUnits.Duration} label="latency">
+        {
+          _.map(nodeIDs, (nid) => (
+            <Metric
+              key={nid}
+              name="cr.store.raft.process.logcommit.latency-p50"
+              title={nodeDisplayName(nodesSummary, nid)}
+              sources={storeIDsForNode(nodesSummary, nid)}
+            />
+          ))
+        }
+      </Axis>
+    </LineGraph>,
+
+    <LineGraph
       title="Command Commit Latency: 99th Percentile"
       sources={storeSources}
-      tooltip={`The 99th %ile latency for commits of Raft commands.`}
+      tooltip={`The 99th %ile latency for commits of Raft commands.
+        This measures applying a batch to the storage engine
+        (including writes to the write-ahead log), but no fsync.`}
     >
       <Axis units={AxisUnits.Duration} label="latency">
         {
@@ -66,6 +99,27 @@ export default function (props: GraphDashboardProps) {
             <Metric
               key={nid}
               name="cr.store.raft.process.commandcommit.latency-p99"
+              title={nodeDisplayName(nodesSummary, nid)}
+              sources={storeIDsForNode(nodesSummary, nid)}
+            />
+          ))
+        }
+      </Axis>
+    </LineGraph>,
+
+    <LineGraph
+      title="Command Commit Latency: 50th Percentile"
+      sources={storeSources}
+      tooltip={`The 50th %ile latency for commits of Raft commands.
+        This measures applying a batch to the storage engine
+        (including writes to the write-ahead log), but no fsync.`}
+    >
+      <Axis units={AxisUnits.Duration} label="latency">
+        {
+          _.map(nodeIDs, (nid) => (
+            <Metric
+              key={nid}
+              name="cr.store.raft.process.commandcommit.latency-p50"
               title={nodeDisplayName(nodesSummary, nid)}
               sources={storeIDsForNode(nodesSummary, nid)}
             />

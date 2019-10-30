@@ -1,9 +1,19 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import * as protobuf from "protobufjs/minimal";
 
 import * as protos from "src/js/protos";
 import * as eventTypes from "src/util/eventTypes";
 
-type Event$Properties = protos.cockroach.server.serverpb.EventsResponse.Event$Properties;
+type Event$Properties = protos.cockroach.server.serverpb.EventsResponse.IEvent;
 
 /**
  * getEventDescription returns a short summary of an event.
@@ -62,9 +72,11 @@ export function getEventDescription(e: Event$Properties): string {
       }
       return `Cluster Setting Changed: User ${info.User} changed ${info.SettingName}`;
     case eventTypes.SET_ZONE_CONFIG:
-    return `Zone Config Changed: User ${info.User} set the zone config for ${info.Target} to ${info.Config}`;
+      return `Zone Config Changed: User ${info.User} set the zone config for ${info.Target} to ${info.Config}`;
     case eventTypes.REMOVE_ZONE_CONFIG:
       return `Zone Config Removed: User ${info.User} removed the zone config for ${info.Target}`;
+    case eventTypes.CREATE_STATISTICS:
+      return `Table statistics refreshed for ${info.TableName}`;
     default:
       return `Unknown Event Type: ${e.event_type}, content: ${JSON.stringify(info, null, 2)}`;
   }
@@ -84,6 +96,7 @@ export interface EventInfo {
   Value?: string;
   Target?: string;
   Config?: string;
+  Statement?: string;
   // The following are three names for the same key (it was renamed twice).
   // All ar included for backwards compatibility.
   DroppedTables?: string[];

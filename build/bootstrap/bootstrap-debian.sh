@@ -12,7 +12,7 @@ curl -fsSL https://dl.yarnpkg.com/debian/pubkey.gpg | sudo apt-key add -
 echo "deb https://dl.yarnpkg.com/debian/ stable main" | sudo tee /etc/apt/sources.list.d/yarn.list
 
 sudo apt-get update
-sudo apt-get dist-upgrade -y
+sudo DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
 sudo apt-get install -y --no-install-recommends \
   mosh \
   autoconf \
@@ -20,25 +20,32 @@ sudo apt-get install -y --no-install-recommends \
   ccache \
   docker.io \
   libncurses-dev \
+  make \
+  gcc \
+  g++ \
   git \
   nodejs \
-  yarn
+  yarn \
+  bison
 
 sudo adduser "${USER}" docker
 
-# Configure environment variables
-echo 'export PATH="/usr/lib/ccache:${PATH}"' >> ~/.bashrc_bootstrap
-echo 'export COCKROACH_BUILDER_CCACHE=1"' >> ~/.bashrc_bootstrap
-# NB: GOPATH defaults to ${HOME}/go (but maybe having it set for the remainder
-# of the script is enough reason to keep it here).
-echo 'export GOPATH=${HOME}/go' >> ~/.bashrc_bootstrap
+# Configure environment variables.
+echo 'export PATH="/usr/lib/ccache:${PATH}:/usr/local/go/bin"' >> ~/.bashrc_bootstrap
+echo 'export COCKROACH_BUILDER_CCACHE=1' >> ~/.bashrc_bootstrap
 echo '. ~/.bashrc_bootstrap' >> ~/.bashrc
-
 . ~/.bashrc_bootstrap
 
-mkdir -p "$GOPATH/src/github.com/cockroachdb"
+# Install Go.
+trap 'rm -f /tmp/go.tgz' EXIT
+curl https://dl.google.com/go/go1.12.12.linux-amd64.tar.gz > /tmp/go.tgz
+sha256sum -c - <<EOF
+4cf11ac6a8fa42d26ab85e27a5d916ee171900a87745d9f7d4a29a21587d78fc  /tmp/go.tgz
+EOF
+sudo tar -C /usr/local -zxf /tmp/go.tgz
 
-git clone https://github.com/cockroachdb/cockroach.git "$GOPATH/src/github.com/cockroachdb/cockroach"
+# Clone CockroachDB.
+git clone https://github.com/cockroachdb/cockroach "$(go env GOPATH)/src/github.com/cockroachdb/cockroach"
 
-. bootstrap/bootstrap-go.sh
+# Install the Unison file-syncer.
 . bootstrap/bootstrap-unison.sh

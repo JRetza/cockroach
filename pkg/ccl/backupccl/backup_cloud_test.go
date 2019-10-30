@@ -10,15 +10,13 @@ package backupccl_test
 
 import (
 	"fmt"
-	"net/http"
 	"net/url"
 	"os"
 	"testing"
 
 	"github.com/aws/aws-sdk-go/aws/credentials"
-
-	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -46,12 +44,6 @@ func TestCloudBackupRestoreS3(t *testing.T) {
 		t.Skip("AWS_S3_BUCKET env var must be set")
 	}
 
-	// TODO(dt): this prevents leaking an http conn goroutine.
-	defer func(disableKeepAlives bool) {
-		http.DefaultTransport.(*http.Transport).DisableKeepAlives = disableKeepAlives
-	}(http.DefaultTransport.(*http.Transport).DisableKeepAlives)
-	http.DefaultTransport.(*http.Transport).DisableKeepAlives = true
-
 	// TODO(dan): Actually invalidate the descriptor cache and delete this line.
 	defer sql.TestDisableTableLeases()()
 	const numAccounts = 1000
@@ -61,11 +53,11 @@ func TestCloudBackupRestoreS3(t *testing.T) {
 	prefix := fmt.Sprintf("TestBackupRestoreS3-%d", timeutil.Now().UnixNano())
 	uri := url.URL{Scheme: "s3", Host: bucket, Path: prefix}
 	values := uri.Query()
-	values.Add(storageccl.S3AccessKeyParam, creds.AccessKeyID)
-	values.Add(storageccl.S3SecretParam, creds.SecretAccessKey)
+	values.Add(cloud.S3AccessKeyParam, creds.AccessKeyID)
+	values.Add(cloud.S3SecretParam, creds.SecretAccessKey)
 	uri.RawQuery = values.Encode()
 
-	backupAndRestore(ctx, t, tc, uri.String(), numAccounts)
+	backupAndRestore(ctx, t, tc, []string{uri.String()}, []string{uri.String()}, numAccounts)
 }
 
 // TestBackupRestoreGoogleCloudStorage hits the real GCS and so could
@@ -81,19 +73,11 @@ func TestCloudBackupRestoreGoogleCloudStorage(t *testing.T) {
 	defer sql.TestDisableTableLeases()()
 	const numAccounts = 1000
 
-	// TODO(dt): this prevents leaking an http conn goroutine -- presumably the
-	// conn is held open for reuse until the idle timeout. Ideally we'd test with
-	// conn reuse enabled though, to match expected production behavior.
-	defer func(disableKeepAlives bool) {
-		http.DefaultTransport.(*http.Transport).DisableKeepAlives = disableKeepAlives
-	}(http.DefaultTransport.(*http.Transport).DisableKeepAlives)
-	http.DefaultTransport.(*http.Transport).DisableKeepAlives = true
-
 	ctx, tc, _, _, cleanupFn := backupRestoreTestSetup(t, 1, numAccounts, initNone)
 	defer cleanupFn()
 	prefix := fmt.Sprintf("TestBackupRestoreGoogleCloudStorage-%d", timeutil.Now().UnixNano())
 	uri := url.URL{Scheme: "gs", Host: bucket, Path: prefix}
-	backupAndRestore(ctx, t, tc, uri.String(), numAccounts)
+	backupAndRestore(ctx, t, tc, []string{uri.String()}, []string{uri.String()}, numAccounts)
 }
 
 // TestBackupRestoreAzure hits the real Azure Blob Storage and so could
@@ -115,20 +99,14 @@ func TestCloudBackupRestoreAzure(t *testing.T) {
 	defer sql.TestDisableTableLeases()()
 	const numAccounts = 1000
 
-	// TODO(dt): this prevents leaking an http conn goroutine.
-	defer func(disableKeepAlives bool) {
-		http.DefaultTransport.(*http.Transport).DisableKeepAlives = disableKeepAlives
-	}(http.DefaultTransport.(*http.Transport).DisableKeepAlives)
-	http.DefaultTransport.(*http.Transport).DisableKeepAlives = true
-
 	ctx, tc, _, _, cleanupFn := backupRestoreTestSetup(t, 1, numAccounts, initNone)
 	defer cleanupFn()
 	prefix := fmt.Sprintf("TestBackupRestoreAzure-%d", timeutil.Now().UnixNano())
 	uri := url.URL{Scheme: "azure", Host: bucket, Path: prefix}
 	values := uri.Query()
-	values.Add(storageccl.AzureAccountNameParam, accountName)
-	values.Add(storageccl.AzureAccountKeyParam, accountKey)
+	values.Add(cloud.AzureAccountNameParam, accountName)
+	values.Add(cloud.AzureAccountKeyParam, accountKey)
 	uri.RawQuery = values.Encode()
 
-	backupAndRestore(ctx, t, tc, uri.String(), numAccounts)
+	backupAndRestore(ctx, t, tc, []string{uri.String()}, []string{uri.String()}, numAccounts)
 }

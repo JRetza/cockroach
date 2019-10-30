@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 #include "batch.h"
 #include "comparator.h"
@@ -86,6 +82,11 @@ DBStatus ProcessDeltaKey(Getter* base, rocksdb::WBWIIterator* delta, rocksdb::Sl
       }
       break;
     }
+    case rocksdb::kSingleDeleteRecord:
+      // Treating a SingleDelete operation as a standard Delete doesn't
+      // quite mirror SingleDelete's expected implementation, but it
+      // doesn't violate the operation's contract:
+      // https://github.com/facebook/rocksdb/wiki/Single-Delete.
     case rocksdb::kDeleteRecord:
       if (value->data != NULL) {
         free(value->data);
@@ -110,16 +111,20 @@ DBStatus ProcessDeltaKey(Getter* base, rocksdb::WBWIIterator* delta, rocksdb::Sl
 // records. A BaseDeltaIterator is an iterator which provides a merged
 // view of a base iterator and a delta where the delta iterator is
 // from a WriteBatchWithIndex.
+//
+// The prefix_same_as_start and upper_bound settings must also be applied to
+// base_iterator for correct operation.
 class BaseDeltaIterator : public rocksdb::Iterator {
  public:
   BaseDeltaIterator(rocksdb::Iterator* base_iterator, rocksdb::WBWIIterator* delta_iterator,
-                    bool prefix_same_as_start)
+                    bool prefix_same_as_start, const rocksdb::Slice* upper_bound)
       : current_at_base_(true),
         equal_keys_(false),
         status_(rocksdb::Status::OK()),
         base_iterator_(base_iterator),
         delta_iterator_(delta_iterator),
-        prefix_same_as_start_(prefix_same_as_start) {
+        prefix_same_as_start_(prefix_same_as_start),
+        upper_bound_(upper_bound) {
     merged_.data = NULL;
   }
 
@@ -316,6 +321,15 @@ class BaseDeltaIterator : public rocksdb::Iterator {
           current_at_base_ = true;
           return;
         }
+        if (upper_bound_ != nullptr &&
+            kComparator.Compare(delta_iterator_->Entry().key, *upper_bound_) >= 0) {
+          // The delta iterator key is not less than the upper bound. As above,
+          // we set current_at_base_ to true which will cause the iterator
+          // overall to be considered not valid (since base currently isn't
+          // valid).
+          current_at_base_ = true;
+          return;
+        }
         if (!ProcessDelta()) {
           current_at_base_ = false;
           return;
@@ -336,14 +350,17 @@ class BaseDeltaIterator : public rocksdb::Iterator {
 
       const int compare = Compare();
       if (compare > 0) {
-        // Delta is greater than base (use base).
+        // Delta is greater than base (use base). The base iterator enforces
+        // its own upper bound.
         current_at_base_ = true;
         return;
       }
       // Delta is less than or equal to base. If check_prefix is true,
       // for base to be valid it has to contain the prefix we were
       // searching for. It follows that delta contains the prefix
-      // we're searching for.
+      // we're searching for. Similarly, if upper_bound is set, for
+      // base to be valid it has to be less than the upper bound.
+      // It follows that delta is less than upper_bound.
       if (compare == 0) {
         // Delta is equal to base.
         equal_keys_ = true;
@@ -394,26 +411,45 @@ class BaseDeltaIterator : public rocksdb::Iterator {
   // prefix_same_as_start_ is true.
   std::string prefix_start_buf_;
   rocksdb::Slice prefix_start_key_;
+  const rocksdb::Slice* upper_bound_;
 };
 
 class DBBatchInserter : public rocksdb::WriteBatch::Handler {
  public:
   DBBatchInserter(rocksdb::WriteBatchBase* batch) : batch_(batch) {}
 
-  virtual void Put(const rocksdb::Slice& key, const rocksdb::Slice& value) {
-    batch_->Put(key, value);
+  virtual rocksdb::Status PutCF(uint32_t column_family_id, const rocksdb::Slice& key,
+                                const rocksdb::Slice& value) {
+    if (column_family_id != 0) {
+      return rocksdb::Status::InvalidArgument("DBBatchInserter: column families not supported");
+    }
+    return batch_->Put(key, value);
   }
-  virtual void Delete(const rocksdb::Slice& key) { batch_->Delete(key); }
-  virtual void Merge(const rocksdb::Slice& key, const rocksdb::Slice& value) {
-    batch_->Merge(key, value);
+  virtual rocksdb::Status DeleteCF(uint32_t column_family_id, const rocksdb::Slice& key) {
+    if (column_family_id != 0) {
+      return rocksdb::Status::InvalidArgument("DBBatchInserter: column families not supported");
+    }
+    return batch_->Delete(key);
+  }
+  virtual rocksdb::Status SingleDeleteCF(uint32_t column_family_id, const rocksdb::Slice& key) {
+    if (column_family_id != 0) {
+      return rocksdb::Status::InvalidArgument("DBBatchInserter: column families not supported");
+    }
+    return batch_->SingleDelete(key);
+  }
+  virtual rocksdb::Status MergeCF(uint32_t column_family_id, const rocksdb::Slice& key,
+                                  const rocksdb::Slice& value) {
+    if (column_family_id != 0) {
+      return rocksdb::Status::InvalidArgument("DBBatchInserter: column families not supported");
+    }
+    return batch_->Merge(key, value);
   }
   virtual rocksdb::Status DeleteRangeCF(uint32_t column_family_id, const rocksdb::Slice& begin_key,
                                         const rocksdb::Slice& end_key) {
-    if (column_family_id == 0) {
-      batch_->DeleteRange(begin_key, end_key);
-      return rocksdb::Status::OK();
+    if (column_family_id != 0) {
+      return rocksdb::Status::InvalidArgument("DBBatchInserter: column families not supported");
     }
-    return rocksdb::Status::InvalidArgument("DeleteRangeCF not implemented");
+    return batch_->DeleteRange(begin_key, end_key);
   }
   virtual void LogData(const rocksdb::Slice& blob) { batch_->PutLogData(blob); }
 
@@ -462,6 +498,12 @@ DBStatus DBBatch::Delete(DBKey key) {
   return kSuccess;
 }
 
+DBStatus DBBatch::SingleDelete(DBKey key) {
+  ++updates;
+  batch.SingleDelete(EncodeKey(key));
+  return kSuccess;
+}
+
 DBStatus DBBatch::DeleteRange(DBKey start, DBKey end) {
   ++updates;
   has_delete_range = true;
@@ -496,24 +538,32 @@ DBStatus DBBatch::ApplyBatchRepr(DBSlice repr, bool sync) {
 
 DBSlice DBBatch::BatchRepr() { return ToDBSlice(batch.GetWriteBatch()->Data()); }
 
-DBIterator* DBBatch::NewIter(rocksdb::ReadOptions* read_opts) {
-  DBIterator* iter = new DBIterator(iters);
+DBIterator* DBBatch::NewIter(DBIterOptions iter_options) {
   if (has_delete_range) {
     // TODO(peter): We don't support iterators when the batch contains
     // delete range entries.
     return NULL;
   }
-  rocksdb::Iterator* base = rep->NewIterator(*read_opts);
+  DBIterator* iter = new DBIterator(iters, iter_options);
+  rocksdb::Iterator* base = rep->NewIterator(iter->read_opts);
   rocksdb::WBWIIterator* delta = batch.NewIterator();
-  iter->rep.reset(new BaseDeltaIterator(base, delta, read_opts->prefix_same_as_start));
+  iter->rep.reset(new BaseDeltaIterator(base, delta, iter_options.prefix, &iter->upper_bound));
   return iter;
 }
 
 DBStatus DBBatch::GetStats(DBStatsResult* stats) { return FmtStatus("unsupported"); }
 
+DBStatus DBBatch::GetTickersAndHistograms(DBTickersAndHistogramsResult* stats) {
+  return FmtStatus("unsupported");
+}
+
 DBString DBBatch::GetCompactionStats() { return ToDBString("unsupported"); }
 
 DBStatus DBBatch::GetEnvStats(DBEnvStatsResult* stats) { return FmtStatus("unsupported"); }
+
+DBStatus DBBatch::GetEncryptionRegistries(DBEncryptionRegistries* result) {
+  return FmtStatus("unsupported");
+}
 
 DBStatus DBBatch::EnvWriteFile(DBSlice path, DBSlice contents) { return FmtStatus("unsupported"); }
 
@@ -521,9 +571,7 @@ DBStatus DBBatch::EnvOpenFile(DBSlice path, rocksdb::WritableFile** file) {
   return FmtStatus("unsupported");
 }
 
-DBStatus DBBatch::EnvReadFile(DBSlice path, DBSlice* contents) {
-  return FmtStatus("unsupported");
-}
+DBStatus DBBatch::EnvReadFile(DBSlice path, DBSlice* contents) { return FmtStatus("unsupported"); }
 
 DBStatus DBBatch::EnvCloseFile(rocksdb::WritableFile* file) { return FmtStatus("unsupported"); }
 
@@ -533,9 +581,11 @@ DBStatus DBBatch::EnvAppendFile(rocksdb::WritableFile* file, DBSlice contents) {
   return FmtStatus("unsupported");
 }
 
-DBStatus DBBatch::EnvDeleteFile(DBSlice path) {
-  return FmtStatus("unsupported");
-}
+DBStatus DBBatch::EnvDeleteFile(DBSlice path) { return FmtStatus("unsupported"); }
+
+DBStatus DBBatch::EnvDeleteDirAndFiles(DBSlice dir) { return FmtStatus("unsupported"); }
+
+DBStatus DBBatch::EnvLinkFile(DBSlice oldname, DBSlice newname) { return FmtStatus("unsupported"); }
 
 DBWriteOnlyBatch::DBWriteOnlyBatch(DBEngine* db) : DBEngine(db->rep, db->iters), updates(0) {}
 
@@ -558,6 +608,12 @@ DBStatus DBWriteOnlyBatch::Get(DBKey key, DBString* value) { return FmtStatus("u
 DBStatus DBWriteOnlyBatch::Delete(DBKey key) {
   ++updates;
   batch.Delete(EncodeKey(key));
+  return kSuccess;
+}
+
+DBStatus DBWriteOnlyBatch::SingleDelete(DBKey key) {
+  ++updates;
+  batch.SingleDelete(EncodeKey(key));
   return kSuccess;
 }
 
@@ -594,13 +650,21 @@ DBStatus DBWriteOnlyBatch::ApplyBatchRepr(DBSlice repr, bool sync) {
 
 DBSlice DBWriteOnlyBatch::BatchRepr() { return ToDBSlice(batch.GetWriteBatch()->Data()); }
 
-DBIterator* DBWriteOnlyBatch::NewIter(rocksdb::ReadOptions* read_opts) { return NULL; }
+DBIterator* DBWriteOnlyBatch::NewIter(DBIterOptions) { return NULL; }
 
 DBStatus DBWriteOnlyBatch::GetStats(DBStatsResult* stats) { return FmtStatus("unsupported"); }
+
+DBStatus DBWriteOnlyBatch::GetTickersAndHistograms(DBTickersAndHistogramsResult* stats) {
+  return FmtStatus("unsupported");
+}
 
 DBString DBWriteOnlyBatch::GetCompactionStats() { return ToDBString("unsupported"); }
 
 DBStatus DBWriteOnlyBatch::GetEnvStats(DBEnvStatsResult* stats) { return FmtStatus("unsupported"); }
+
+DBStatus DBWriteOnlyBatch::GetEncryptionRegistries(DBEncryptionRegistries* result) {
+  return FmtStatus("unsupported");
+}
 
 DBStatus DBWriteOnlyBatch::EnvWriteFile(DBSlice path, DBSlice contents) {
   return FmtStatus("unsupported");
@@ -626,7 +690,11 @@ DBStatus DBWriteOnlyBatch::EnvAppendFile(rocksdb::WritableFile* file, DBSlice co
   return FmtStatus("unsupported");
 }
 
-DBStatus DBWriteOnlyBatch::EnvDeleteFile(DBSlice path) {
+DBStatus DBWriteOnlyBatch::EnvDeleteFile(DBSlice path) { return FmtStatus("unsupported"); }
+
+DBStatus DBWriteOnlyBatch::EnvDeleteDirAndFiles(DBSlice dir) { return FmtStatus("unsupported"); }
+
+DBStatus DBWriteOnlyBatch::EnvLinkFile(DBSlice oldname, DBSlice newname) {
   return FmtStatus("unsupported");
 }
 

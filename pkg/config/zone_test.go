@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package config
 
@@ -20,6 +16,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -35,65 +32,69 @@ func TestZoneConfigValidate(t *testing.T) {
 		expected string
 	}{
 		{
-			ZoneConfig{},
-			"at least one replica is required",
-		},
-		{
 			ZoneConfig{
-				NumReplicas: -1,
+				NumReplicas: proto.Int32(0),
 			},
 			"at least one replica is required",
 		},
 		{
 			ZoneConfig{
-				NumReplicas: 2,
+				NumReplicas: proto.Int32(-1),
+			},
+			"at least one replica is required",
+		},
+		{
+			ZoneConfig{
+				NumReplicas: proto.Int32(2),
 			},
 			"at least 3 replicas are required for multi-replica configurations",
 		},
 		{
 			ZoneConfig{
-				NumReplicas: 1,
+				NumReplicas:   proto.Int32(1),
+				RangeMaxBytes: proto.Int64(0),
 			},
 			"RangeMaxBytes 0 less than minimum allowed",
 		},
 		{
 			ZoneConfig{
-				NumReplicas:   1,
+				NumReplicas:   proto.Int32(1),
 				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
+				GC:            &GCPolicy{TTLSeconds: 0},
 			},
 			"GC.TTLSeconds 0 less than minimum allowed",
 		},
 		{
 			ZoneConfig{
-				NumReplicas:   1,
+				NumReplicas:   proto.Int32(1),
 				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
-				GC:            GCPolicy{TTLSeconds: 1},
+				GC:            &GCPolicy{TTLSeconds: 1},
 			},
 			"",
 		},
 		{
 			ZoneConfig{
-				NumReplicas:   1,
-				RangeMinBytes: -1,
+				NumReplicas:   proto.Int32(1),
+				RangeMinBytes: proto.Int64(-1),
 				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
-				GC:            GCPolicy{TTLSeconds: 1},
+				GC:            &GCPolicy{TTLSeconds: 1},
 			},
 			"RangeMinBytes -1 less than minimum allowed",
 		},
 		{
 			ZoneConfig{
-				NumReplicas:   1,
+				NumReplicas:   proto.Int32(1),
 				RangeMinBytes: DefaultZoneConfig().RangeMaxBytes,
 				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
-				GC:            GCPolicy{TTLSeconds: 1},
+				GC:            &GCPolicy{TTLSeconds: 1},
 			},
 			"is greater than or equal to RangeMaxBytes",
 		},
 		{
 			ZoneConfig{
-				NumReplicas:   1,
+				NumReplicas:   proto.Int32(1),
 				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
-				GC:            GCPolicy{TTLSeconds: 1},
+				GC:            &GCPolicy{TTLSeconds: 1},
 				Constraints: []Constraints{
 					{Constraints: []Constraint{{Value: "a", Type: Constraint_DEPRECATED_POSITIVE}}},
 				},
@@ -102,9 +103,9 @@ func TestZoneConfigValidate(t *testing.T) {
 		},
 		{
 			ZoneConfig{
-				NumReplicas:   1,
+				NumReplicas:   proto.Int32(1),
 				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
-				GC:            GCPolicy{TTLSeconds: 1},
+				GC:            &GCPolicy{TTLSeconds: 1},
 				Constraints: []Constraints{
 					{Constraints: []Constraint{{Value: "a", Type: Constraint_PROHIBITED}}},
 				},
@@ -113,9 +114,9 @@ func TestZoneConfigValidate(t *testing.T) {
 		},
 		{
 			ZoneConfig{
-				NumReplicas:   1,
+				NumReplicas:   proto.Int32(1),
 				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
-				GC:            GCPolicy{TTLSeconds: 1},
+				GC:            &GCPolicy{TTLSeconds: 1},
 				Constraints: []Constraints{
 					{
 						Constraints: []Constraint{{Value: "a", Type: Constraint_PROHIBITED}},
@@ -127,9 +128,9 @@ func TestZoneConfigValidate(t *testing.T) {
 		},
 		{
 			ZoneConfig{
-				NumReplicas:   1,
+				NumReplicas:   proto.Int32(1),
 				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
-				GC:            GCPolicy{TTLSeconds: 1},
+				GC:            &GCPolicy{TTLSeconds: 1},
 				Constraints: []Constraints{
 					{
 						Constraints: []Constraint{{Value: "a", Type: Constraint_REQUIRED}},
@@ -141,9 +142,9 @@ func TestZoneConfigValidate(t *testing.T) {
 		},
 		{
 			ZoneConfig{
-				NumReplicas:   3,
+				NumReplicas:   proto.Int32(3),
 				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
-				GC:            GCPolicy{TTLSeconds: 1},
+				GC:            &GCPolicy{TTLSeconds: 1},
 				Constraints: []Constraints{
 					{
 						Constraints: []Constraint{{Value: "a", Type: Constraint_REQUIRED}},
@@ -155,9 +156,9 @@ func TestZoneConfigValidate(t *testing.T) {
 		},
 		{
 			ZoneConfig{
-				NumReplicas:   1,
+				NumReplicas:   proto.Int32(1),
 				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
-				GC:            GCPolicy{TTLSeconds: 1},
+				GC:            &GCPolicy{TTLSeconds: 1},
 				Constraints: []Constraints{
 					{
 						Constraints: []Constraint{{Value: "a", Type: Constraint_REQUIRED}},
@@ -173,9 +174,9 @@ func TestZoneConfigValidate(t *testing.T) {
 		},
 		{
 			ZoneConfig{
-				NumReplicas:   3,
+				NumReplicas:   proto.Int32(3),
 				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
-				GC:            GCPolicy{TTLSeconds: 1},
+				GC:            &GCPolicy{TTLSeconds: 1},
 				Constraints: []Constraints{
 					{
 						Constraints: []Constraint{{Value: "a", Type: Constraint_REQUIRED}},
@@ -191,9 +192,9 @@ func TestZoneConfigValidate(t *testing.T) {
 		},
 		{
 			ZoneConfig{
-				NumReplicas:   1,
+				NumReplicas:   proto.Int32(1),
 				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
-				GC:            GCPolicy{TTLSeconds: 1},
+				GC:            &GCPolicy{TTLSeconds: 1},
 				LeasePreferences: []LeasePreference{
 					{
 						Constraints: []Constraint{},
@@ -204,9 +205,9 @@ func TestZoneConfigValidate(t *testing.T) {
 		},
 		{
 			ZoneConfig{
-				NumReplicas:   1,
+				NumReplicas:   proto.Int32(1),
 				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
-				GC:            GCPolicy{TTLSeconds: 1},
+				GC:            &GCPolicy{TTLSeconds: 1},
 				LeasePreferences: []LeasePreference{
 					{
 						Constraints: []Constraint{{Value: "a", Type: Constraint_DEPRECATED_POSITIVE}},
@@ -217,9 +218,9 @@ func TestZoneConfigValidate(t *testing.T) {
 		},
 		{
 			ZoneConfig{
-				NumReplicas:   1,
+				NumReplicas:   proto.Int32(1),
 				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
-				GC:            GCPolicy{TTLSeconds: 1},
+				GC:            &GCPolicy{TTLSeconds: 1},
 				LeasePreferences: []LeasePreference{
 					{
 						Constraints: []Constraint{{Value: "a", Type: Constraint_REQUIRED}},
@@ -241,13 +242,65 @@ func TestZoneConfigValidate(t *testing.T) {
 	}
 }
 
+func TestZoneConfigValidateTandemFields(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	testCases := []struct {
+		cfg      ZoneConfig
+		expected string
+	}{
+		{
+			ZoneConfig{
+				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
+			},
+			"range_min_bytes and range_max_bytes must be set together",
+		},
+		{
+			ZoneConfig{
+				RangeMinBytes: DefaultZoneConfig().RangeMinBytes,
+			},
+			"range_min_bytes and range_max_bytes must be set together",
+		},
+		{
+			ZoneConfig{
+				Constraints: []Constraints{
+					{
+						Constraints: []Constraint{{Value: "a", Type: Constraint_REQUIRED}},
+						NumReplicas: 2,
+					},
+				},
+			},
+			"when per-replica constraints are set, num_replicas must be set as well",
+		},
+		{
+			ZoneConfig{
+				InheritedConstraints:      true,
+				InheritedLeasePreferences: false,
+				LeasePreferences: []LeasePreference{
+					{
+						Constraints: []Constraint{},
+					},
+				},
+			},
+			"lease preferences can not be set unless the constraints are explicitly set as well",
+		},
+	}
+
+	for i, c := range testCases {
+		err := c.cfg.ValidateTandemFields()
+		if !testutils.IsError(err, c.expected) {
+			t.Errorf("%d: expected %q, got %v", i, c.expected, err)
+		}
+	}
+}
+
 func TestZoneConfigSubzones(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	zone := DefaultZoneConfig()
-	subzoneAInvalid := Subzone{IndexID: 1, PartitionName: "a", Config: ZoneConfig{}}
-	subzoneA := Subzone{IndexID: 1, PartitionName: "a", Config: DefaultZoneConfig()}
-	subzoneB := Subzone{IndexID: 1, PartitionName: "b", Config: DefaultZoneConfig()}
+	subzoneAInvalid := Subzone{IndexID: 1, PartitionName: "a", Config: ZoneConfig{NumReplicas: proto.Int32(-1)}}
+	subzoneA := Subzone{IndexID: 1, PartitionName: "a", Config: zone}
+	subzoneB := Subzone{IndexID: 1, PartitionName: "b", Config: zone}
 
 	if zone.IsSubzonePlaceholder() {
 		t.Errorf("default zone config should not be considered a subzone placeholder")
@@ -281,7 +334,8 @@ func TestZoneConfigSubzones(t *testing.T) {
 
 	zone.DeleteTableConfig()
 	if e := (ZoneConfig{
-		Subzones: []Subzone{subzoneA, subzoneB},
+		NumReplicas: proto.Int32(0),
+		Subzones:    []Subzone{subzoneA, subzoneB},
 	}); !e.Equal(zone) {
 		t.Errorf("expected zone after clearing to equal %+v, but got %+v", e, zone)
 	}
@@ -333,12 +387,12 @@ func TestZoneConfigMarshalYAML(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	original := ZoneConfig{
-		RangeMinBytes: 1,
-		RangeMaxBytes: 1,
-		GC: GCPolicy{
+		RangeMinBytes: proto.Int64(1),
+		RangeMaxBytes: proto.Int64(1),
+		GC: &GCPolicy{
 			TTLSeconds: 1,
 		},
-		NumReplicas: 1,
+		NumReplicas: proto.Int32(1),
 	}
 
 	testCases := []struct {
@@ -353,6 +407,7 @@ gc:
   ttlseconds: 1
 num_replicas: 1
 constraints: []
+lease_preferences: []
 `,
 		},
 		{
@@ -373,6 +428,7 @@ gc:
   ttlseconds: 1
 num_replicas: 1
 constraints: [+duck=foo]
+lease_preferences: []
 `,
 		},
 		{
@@ -402,6 +458,7 @@ gc:
   ttlseconds: 1
 num_replicas: 1
 constraints: [foo, +duck=foo, -duck=foo]
+lease_preferences: []
 `,
 		},
 		{
@@ -423,6 +480,7 @@ gc:
   ttlseconds: 1
 num_replicas: 1
 constraints: {+duck=foo: 3}
+lease_preferences: []
 `,
 		},
 		{
@@ -453,6 +511,7 @@ gc:
   ttlseconds: 1
 num_replicas: 1
 constraints: {'foo,+duck=foo,-duck=foo': 3}
+lease_preferences: []
 `,
 		},
 		{
@@ -489,6 +548,7 @@ gc:
   ttlseconds: 1
 num_replicas: 1
 constraints: {'+duck=bar1,+duck=bar2': 1, +duck=foo: 2}
+lease_preferences: []
 `,
 		},
 		{
@@ -499,6 +559,7 @@ gc:
   ttlseconds: 1
 num_replicas: 1
 constraints: []
+lease_preferences: []
 `,
 		},
 		{
@@ -519,7 +580,7 @@ gc:
   ttlseconds: 1
 num_replicas: 1
 constraints: []
-experimental_lease_preferences: [[+duck=foo]]
+lease_preferences: [[+duck=foo]]
 `,
 		},
 		{
@@ -565,7 +626,7 @@ gc:
   ttlseconds: 1
 num_replicas: 1
 constraints: [+duck=foo]
-experimental_lease_preferences: [[+duck=bar1, +duck=bar2], [-duck=foo]]
+lease_preferences: [[+duck=bar1, +duck=bar2], [-duck=foo]]
 `,
 		},
 	}
@@ -593,6 +654,86 @@ experimental_lease_preferences: [[+duck=bar1, +duck=bar2], [-duck=foo]]
 	}
 }
 
+// TestExperimentalLeasePreferencesYAML makes sure that we accept the
+// lease_preferences YAML field both with and without the "experimental_"
+// prefix.
+func TestExperimentalLeasePreferencesYAML(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	originalPrefs := []LeasePreference{
+		{Constraints: []Constraint{{Value: "original", Type: Constraint_REQUIRED}}},
+	}
+	originalZone := ZoneConfig{
+		LeasePreferences: originalPrefs,
+	}
+
+	testCases := []struct {
+		input    string
+		expected []LeasePreference
+	}{
+		{
+			input:    "",
+			expected: originalPrefs,
+		},
+		{
+			input:    "lease_preferences: []",
+			expected: []LeasePreference{},
+		},
+		{
+			input:    "experimental_lease_preferences: []",
+			expected: []LeasePreference{},
+		},
+		{
+			input: "lease_preferences: [[+a=b]]",
+			expected: []LeasePreference{
+				{Constraints: []Constraint{{Key: "a", Value: "b", Type: Constraint_REQUIRED}}},
+			},
+		},
+		{
+			input: "experimental_lease_preferences: [[+a=b]]",
+			expected: []LeasePreference{
+				{Constraints: []Constraint{{Key: "a", Value: "b", Type: Constraint_REQUIRED}}},
+			},
+		},
+		{
+			input: "lease_preferences: [[+a=b],[-c=d]]",
+			expected: []LeasePreference{
+				{Constraints: []Constraint{{Key: "a", Value: "b", Type: Constraint_REQUIRED}}},
+				{Constraints: []Constraint{{Key: "c", Value: "d", Type: Constraint_PROHIBITED}}},
+			},
+		},
+		{
+			input: "experimental_lease_preferences: [[+a=b],[-c=d]]",
+			expected: []LeasePreference{
+				{Constraints: []Constraint{{Key: "a", Value: "b", Type: Constraint_REQUIRED}}},
+				{Constraints: []Constraint{{Key: "c", Value: "d", Type: Constraint_PROHIBITED}}},
+			},
+		},
+		{
+			input: "lease_preferences: [[+c=d]]\nexperimental_lease_preferences: [[+a=b]]",
+			expected: []LeasePreference{
+				{Constraints: []Constraint{{Key: "a", Value: "b", Type: Constraint_REQUIRED}}},
+			},
+		},
+		{
+			input: "experimental_lease_preferences: [[+a=b]]\nlease_preferences: [[+c=d]]",
+			expected: []LeasePreference{
+				{Constraints: []Constraint{{Key: "a", Value: "b", Type: Constraint_REQUIRED}}},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		zone := originalZone
+		if err := yaml.UnmarshalStrict([]byte(tc.input), &zone); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(zone.LeasePreferences, tc.expected) {
+			t.Errorf("unmarshaling %q got %+v; want %+v", tc.input, zone.LeasePreferences, tc.expected)
+		}
+	}
+}
+
 func TestConstraintsListYAML(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -611,6 +752,9 @@ func TestConstraintsListYAML(t *testing.T) {
 		{input: "{+a: 1, '+a=1,+b,+c=d': b}", expectErr: true},
 		{input: "[+a: 1]", expectErr: true},
 		{input: "[+a: 1, '+a=1,+b,+c=d': 2]", expectErr: true},
+		{input: "{\"+a=1,+b=2\": 1}"},    // this will work in SQL: constraints='{"+a=1,+b=2": 1}'
+		{input: "{\"+a=1,+b=2,+c\": 1}"}, // won't work in SQL: constraints='{"+a=1,+b=2,+c": 1}'
+		{input: "{'+a=1,+b=2,+c': 1}"},   // this will work in SQL: constraints=e'{\'+a=1,+b=2,+c\': 1}'
 	}
 
 	for _, tc := range testCases {
@@ -633,7 +777,7 @@ func TestMarshalableZoneConfigRoundTrip(t *testing.T) {
 	original := NewPopulatedZoneConfig(
 		rand.New(rand.NewSource(timeutil.Now().UnixNano())), false /* easy */)
 	marshalable := zoneConfigToMarshalable(*original)
-	roundTripped := zoneConfigFromMarshalable(marshalable)
+	roundTripped := zoneConfigFromMarshalable(marshalable, *original)
 
 	if !reflect.DeepEqual(roundTripped, *original) {
 		t.Errorf("round-tripping a ZoneConfig through a marshalableZoneConfig failed:\noriginal:\n%+v\nmarshable:\n%+v\ngot:\n%+v", original, marshalable, roundTripped)
@@ -658,8 +802,7 @@ func TestZoneSpecifiers(t *testing.T) {
 	}
 
 	// Simulate the following schema:
-	//   CREATE DATABASE db;   CREATE TABLE db.table ...
-	//   CREATE DATABASE ".";  CREATE TABLE ".".".table." ...
+	//   CREATE DATABASE db;   CREATE TABLE db.tbl ...
 	//   CREATE DATABASE carl; CREATE TABLE carl.toys ...
 	type namespaceEntry struct {
 		parentID uint32
@@ -668,9 +811,6 @@ func TestZoneSpecifiers(t *testing.T) {
 	namespace := map[namespaceEntry]uint32{
 		{0, "db"}:               50,
 		{50, "tbl"}:             51,
-		{0, "user"}:             52,
-		{0, "."}:                53,
-		{53, ".table."}:         54,
 		{0, "carl"}:             55,
 		{55, "toys"}:            56,
 		{9000, "broken_parent"}: 57,
@@ -692,51 +832,33 @@ func TestZoneSpecifiers(t *testing.T) {
 	}
 
 	for _, tc := range []struct {
-		cliSpecifier string
-		id           int
-		err          string
+		specifier tree.ZoneSpecifier
+		id        int
+		err       string
 	}{
-		{".default", 0, ""},
-		{".carl", 42, ""},
-		{".foo", -1, `"foo" is not a built-in zone`},
-		{"db", 50, ""},
-		{".db", -1, `"db" is not a built-in zone`},
-		{"db.tbl", 51, ""},
-		{"db.tbl.prt", 51, ""},
-		{`db.tbl@idx`, 51, ""},
-		{`db.tbl.prt@idx`, -1, "index and partition cannot be specified simultaneously"},
-		{"db.tbl.too.many.dots", 0, `malformed name: "db.tbl.too.many.dots"`},
-		{`db.tbl@primary`, 51, ""},
-		{"tbl", -1, `"tbl" not found`},
-		{"table", -1, `malformed name: "table"`}, // SQL keyword; requires quotes
-		{`"table"`, -1, `"table" not found`},
-		{"user", -1, "malformed name: \"user\""}, // SQL keyword; requires quotes
-		{`"user"`, 52, ""},
-		{`"."`, 53, ""},
-		{`.`, -1, `missing zone name`},
-		{`".table."`, -1, `".table." not found`},
-		{`".".".table."`, 54, ""},
-		{`.table.`, -1, `"table." is not a built-in zone`},
-		{"carl", 55, ""},
-		{"carl.toys", 56, ""},
-		{"carl.love", -1, `"love" not found`},
-		{"; DROP DATABASE system", -1, `malformed name`},
+		{tree.ZoneSpecifier{NamedZone: "default"}, 0, ""},
+		{tree.ZoneSpecifier{NamedZone: "carl"}, 42, ""},
+		{tree.ZoneSpecifier{NamedZone: "foo"}, -1, `"foo" is not a built-in zone`},
+		{tree.ZoneSpecifier{Database: "db"}, 50, ""},
+		{tree.ZoneSpecifier{NamedZone: "db"}, -1, `"db" is not a built-in zone`},
+		{tableSpecifier("db", "tbl", "", ""), 51, ""},
+		{tableSpecifier("db", "tbl", "", "prt"), 51, ""},
+		{tableSpecifier("db", "tbl", "primary", ""), 51, ""},
+		{tableSpecifier("db", "tbl", "idx", ""), 51, ""},
+		{tableSpecifier("db", "tbl", "idx", "prt"), 51, ""},
+		{tree.ZoneSpecifier{Database: "tbl"}, -1, `"tbl" not found`},
+		{tree.ZoneSpecifier{Database: "carl"}, 55, ""},
+		{tableSpecifier("carl", "toys", "", ""), 56, ""},
+		{tableSpecifier("carl", "love", "", ""), -1, `"love" not found`},
 	} {
-		t.Run(fmt.Sprintf("parse-cli=%s", tc.cliSpecifier), func(t *testing.T) {
+		t.Run(fmt.Sprintf("resolve-specifier=%s", tc.specifier.String()), func(t *testing.T) {
 			err := func() error {
-				zs, err := ParseCLIZoneSpecifier(tc.cliSpecifier)
-				if err != nil {
-					return err
-				}
-				id, err := ResolveZoneSpecifier(&zs, resolveName)
+				id, err := ResolveZoneSpecifier(&tc.specifier, resolveName)
 				if err != nil {
 					return err
 				}
 				if e, a := tc.id, int(id); a != e {
 					t.Errorf("path %d did not match expected path %d", a, e)
-				}
-				if e, a := tc.cliSpecifier, CLIZoneSpecifier(&zs); e != a {
-					t.Errorf("expected %q to roundtrip, but got %q", e, a)
 				}
 				return nil
 			}()
@@ -747,20 +869,17 @@ func TestZoneSpecifiers(t *testing.T) {
 	}
 
 	for _, tc := range []struct {
-		id           uint32
-		cliSpecifier string
-		err          string
+		id     uint32
+		target string
+		err    string
 	}{
-		{0, ".default", ""},
+		{0, "RANGE default", ""},
 		{41, "", "41 not found"},
-		{42, ".carl", ""},
-		{50, "db", ""},
-		{51, "db.tbl", ""},
-		{52, `"user"`, ""},
-		{53, `"."`, ""},
-		{54, `".".".table."`, ""},
-		{55, "carl", ""},
-		{56, "carl.toys", ""},
+		{42, "RANGE carl", ""},
+		{50, "DATABASE db", ""},
+		{51, "TABLE db.public.tbl", ""},
+		{55, "DATABASE carl", ""},
+		{56, "TABLE carl.public.toys", ""},
 		{57, "", "9000 not found"},
 		{58, "", "58 not found"},
 	} {
@@ -772,9 +891,21 @@ func TestZoneSpecifiers(t *testing.T) {
 			if tc.err != "" {
 				return
 			}
-			if e, a := tc.cliSpecifier, CLIZoneSpecifier(&zs); e != a {
-				t.Errorf("expected %q specifier for ID %d, but got %q", e, tc.id, a)
+			if e, a := tc.target, zs.String(); e != a {
+				t.Errorf("expected %q zone name for ID %d, but got %q", e, tc.id, a)
 			}
 		})
+	}
+}
+
+func tableSpecifier(
+	db tree.Name, tbl tree.Name, idx tree.UnrestrictedName, partition tree.Name,
+) tree.ZoneSpecifier {
+	return tree.ZoneSpecifier{
+		TableOrIndex: tree.TableIndexName{
+			Table: tree.MakeTableName(db, tbl),
+			Index: idx,
+		},
+		Partition: partition,
 	}
 }

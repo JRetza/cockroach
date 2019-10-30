@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -24,22 +20,14 @@ import (
 
 type alterSequenceNode struct {
 	n       *tree.AlterSequence
-	seqDesc *sqlbase.TableDescriptor
+	seqDesc *sqlbase.MutableTableDescriptor
 }
 
 // AlterSequence transforms a tree.AlterSequence into a plan node.
 func (p *planner) AlterSequence(ctx context.Context, n *tree.AlterSequence) (planNode, error) {
-	tn, err := n.Name.Normalize()
-	if err != nil {
-		return nil, err
-	}
-
-	var seqDesc *TableDescriptor
-	// DDL statements avoid the cache to avoid leases, and can view non-public descriptors.
-	// TODO(vivek): check if the cache can be used.
-	p.runWithOptions(resolveFlags{skipCache: true}, func() {
-		seqDesc, err = ResolveExistingObject(ctx, p, tn, !n.IfExists, requireSequenceDesc)
-	})
+	seqDesc, err := p.ResolveMutableTableDescriptorEx(
+		ctx, n.Name, !n.IfExists, ResolveRequireSequenceDesc,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -62,14 +50,14 @@ func (n *alterSequenceNode) startExec(params runParams) error {
 		return err
 	}
 
-	if err := params.p.writeTableDesc(params.ctx, n.seqDesc); err != nil {
+	if err := params.p.writeSchemaChange(params.ctx, n.seqDesc, sqlbase.InvalidMutationID); err != nil {
 		return err
 	}
 
 	// Record this sequence alteration in the event log. This is an auditable log
 	// event and is recorded in the same transaction as the table descriptor
 	// update.
-	if err := MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
+	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
 		params.ctx,
 		params.p.txn,
 		EventLogAlterSequence,
@@ -79,14 +67,8 @@ func (n *alterSequenceNode) startExec(params runParams) error {
 			SequenceName string
 			Statement    string
 			User         string
-		}{n.n.Name.TableName().FQString(), n.n.String(), params.SessionData().User},
-	); err != nil {
-		return err
-	}
-
-	params.p.notifySchemaChange(n.seqDesc, sqlbase.InvalidMutationID)
-
-	return nil
+		}{params.p.ResolvedName(n.n.Name).FQString(), n.n.String(), params.SessionData().User},
+	)
 }
 
 func (n *alterSequenceNode) Next(runParams) (bool, error) { return false, nil }

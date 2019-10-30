@@ -1,21 +1,16 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package roachpb
 
 import (
-	"encoding/hex"
 	"reflect"
 	"testing"
 )
@@ -100,7 +95,7 @@ func TestMustSetInner(t *testing.T) {
 	req := RequestUnion{}
 	res := ResponseUnion{}
 
-	// GetRequest is checked first in the generated code for SetValue.
+	// GetRequest is checked first in the generated code for SetInner.
 	req.MustSetInner(&GetRequest{})
 	res.MustSetInner(&GetResponse{})
 	req.MustSetInner(&EndTransactionRequest{})
@@ -109,38 +104,7 @@ func TestMustSetInner(t *testing.T) {
 	if m := req.GetInner().Method(); m != EndTransaction {
 		t.Fatalf("unexpected request: %s in %+v", m, req)
 	}
-	if _, isET := res.GetValue().(*EndTransactionResponse); !isET {
+	if _, isET := res.GetInner().(*EndTransactionResponse); !isET {
 		t.Fatalf("unexpected response union: %+v", res)
-	}
-}
-
-func TestDeprecatedVerifyChecksumRequest(t *testing.T) {
-	// hexData was generated using the following code snippet. The batch contains
-	// a VerifyChecksumRequest which is no longer part of RequestUnion.
-	//
-	// var ba BatchRequest
-	// ba.Add(&VerifyChecksumRequest{})
-	// var v Value
-	// if err := v.SetProto(&ba); err != nil {
-	// 	t.Fatal(err)
-	// }
-	// fmt.Printf("%s\n", hex.EncodeToString(v.RawBytes))
-
-	hexData := `00000000030a1f0a0408001000120608001000180018002100000000000000003000400048001219ba01160a0010001a1000000000000000000000000000000000`
-	data, err := hex.DecodeString(hexData)
-	if err != nil {
-		t.Fatal(err)
-	}
-	v := Value{RawBytes: data}
-	var ba BatchRequest
-	if err := v.GetProto(&ba); err != nil {
-		t.Fatal(err)
-	}
-	// This previously failed with a nil-pointer conversion error in
-	// BatchRequest.GetArg() because of the removal of
-	// RequestUnion.VerifyChecksum. We've now re-added that member as
-	// RequestUnion.DeprecatedVerifyChecksum.
-	if ba.IsLeaseRequest() {
-		t.Fatal("unexpected success")
 	}
 }

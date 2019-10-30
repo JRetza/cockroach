@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 // NOTE: This file is kept in sync manually with sql/event_log.go
 
 import _ from "lodash";
@@ -55,6 +65,8 @@ export const SET_CLUSTER_SETTING = "set_cluster_setting";
 export const SET_ZONE_CONFIG = "set_zone_config";
 // Recorded when a zone config is removed.
 export const REMOVE_ZONE_CONFIG = "remove_zone_config";
+// Recorded when statistics are collected for a table.
+export const CREATE_STATISTICS = "create_statistics";
 
 // Node Event Types
 export const nodeEvents = [NODE_JOIN, NODE_RESTART, NODE_DECOMMISSIONED, NODE_RECOMMISSIONED];

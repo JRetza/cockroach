@@ -1,0 +1,1217 @@
+exec-ddl
+CREATE TABLE x(a INT, b INT)
+----
+
+exec-ddl
+CREATE TABLE y(a INT)
+----
+
+build
+WITH t AS (SELECT a FROM y WHERE a < 3)
+  SELECT * FROM x NATURAL JOIN t
+----
+with &1 (t)
+ ├── columns: a:3(int!null) b:4(int)
+ ├── project
+ │    ├── columns: y.a:1(int!null)
+ │    └── select
+ │         ├── columns: y.a:1(int!null) y.rowid:2(int!null)
+ │         ├── scan y
+ │         │    └── columns: y.a:1(int) y.rowid:2(int!null)
+ │         └── filters
+ │              └── lt [type=bool]
+ │                   ├── variable: y.a [type=int]
+ │                   └── const: 3 [type=int]
+ └── project
+      ├── columns: x.a:3(int!null) b:4(int)
+      └── inner-join (hash)
+           ├── columns: x.a:3(int!null) b:4(int) x.rowid:5(int!null) a:6(int!null)
+           ├── scan x
+           │    └── columns: x.a:3(int) b:4(int) x.rowid:5(int!null)
+           ├── with-scan &1 (t)
+           │    ├── columns: a:6(int!null)
+           │    └── mapping:
+           │         └──  y.a:1(int) => a:6(int)
+           └── filters
+                └── eq [type=bool]
+                     ├── variable: x.a [type=int]
+                     └── variable: a [type=int]
+
+build
+WITH t AS (SELECT a FROM y WHERE a < 3)
+  SELECT * FROM t
+----
+with &1 (t)
+ ├── columns: a:3(int!null)
+ ├── project
+ │    ├── columns: y.a:1(int!null)
+ │    └── select
+ │         ├── columns: y.a:1(int!null) rowid:2(int!null)
+ │         ├── scan y
+ │         │    └── columns: y.a:1(int) rowid:2(int!null)
+ │         └── filters
+ │              └── lt [type=bool]
+ │                   ├── variable: y.a [type=int]
+ │                   └── const: 3 [type=int]
+ └── with-scan &1 (t)
+      ├── columns: a:3(int!null)
+      └── mapping:
+           └──  y.a:1(int) => a:3(int)
+
+# Chaining multiple CTEs.
+build
+WITH
+    t1 AS (SELECT a FROM y WHERE a < 3),
+    t2 AS (SELECT * FROM t1 WHERE a > 1)
+SELECT * FROM t2
+----
+with &1 (t1)
+ ├── columns: a:4(int!null)
+ ├── project
+ │    ├── columns: y.a:1(int!null)
+ │    └── select
+ │         ├── columns: y.a:1(int!null) rowid:2(int!null)
+ │         ├── scan y
+ │         │    └── columns: y.a:1(int) rowid:2(int!null)
+ │         └── filters
+ │              └── lt [type=bool]
+ │                   ├── variable: y.a [type=int]
+ │                   └── const: 3 [type=int]
+ └── with &2 (t2)
+      ├── columns: a:4(int!null)
+      ├── select
+      │    ├── columns: a:3(int!null)
+      │    ├── with-scan &1 (t1)
+      │    │    ├── columns: a:3(int!null)
+      │    │    └── mapping:
+      │    │         └──  y.a:1(int) => a:3(int)
+      │    └── filters
+      │         └── gt [type=bool]
+      │              ├── variable: a [type=int]
+      │              └── const: 1 [type=int]
+      └── with-scan &2 (t2)
+           ├── columns: a:4(int!null)
+           └── mapping:
+                └──  a:3(int) => a:4(int)
+
+build
+WITH
+    t1 AS (SELECT a FROM y WHERE a < 3),
+    t2 AS (SELECT * FROM t1 WHERE a > 1),
+    t3 AS (SELECT * FROM t2 WHERE a = 2)
+SELECT * FROM t3
+----
+with &1 (t1)
+ ├── columns: a:5(int!null)
+ ├── project
+ │    ├── columns: y.a:1(int!null)
+ │    └── select
+ │         ├── columns: y.a:1(int!null) rowid:2(int!null)
+ │         ├── scan y
+ │         │    └── columns: y.a:1(int) rowid:2(int!null)
+ │         └── filters
+ │              └── lt [type=bool]
+ │                   ├── variable: y.a [type=int]
+ │                   └── const: 3 [type=int]
+ └── with &2 (t2)
+      ├── columns: a:5(int!null)
+      ├── select
+      │    ├── columns: a:3(int!null)
+      │    ├── with-scan &1 (t1)
+      │    │    ├── columns: a:3(int!null)
+      │    │    └── mapping:
+      │    │         └──  y.a:1(int) => a:3(int)
+      │    └── filters
+      │         └── gt [type=bool]
+      │              ├── variable: a [type=int]
+      │              └── const: 1 [type=int]
+      └── with &3 (t3)
+           ├── columns: a:5(int!null)
+           ├── select
+           │    ├── columns: a:4(int!null)
+           │    ├── with-scan &2 (t2)
+           │    │    ├── columns: a:4(int!null)
+           │    │    └── mapping:
+           │    │         └──  a:3(int) => a:4(int)
+           │    └── filters
+           │         └── eq [type=bool]
+           │              ├── variable: a [type=int]
+           │              └── const: 2 [type=int]
+           └── with-scan &3 (t3)
+                ├── columns: a:5(int!null)
+                └── mapping:
+                     └──  a:4(int) => a:5(int)
+
+build
+WITH
+    t1 AS (SELECT * FROM y WHERE a < 3),
+    t2 AS (SELECT * FROM y WHERE a > 1),
+    t3 AS (SELECT * FROM t1 WHERE a < 4),
+    t4 AS (SELECT * FROM t2 WHERE a > 3)
+SELECT * FROM t3 NATURAL JOIN t4
+----
+with &1 (t1)
+ ├── columns: a:7(int!null)
+ ├── project
+ │    ├── columns: y.a:1(int!null)
+ │    └── select
+ │         ├── columns: y.a:1(int!null) rowid:2(int!null)
+ │         ├── scan y
+ │         │    └── columns: y.a:1(int) rowid:2(int!null)
+ │         └── filters
+ │              └── lt [type=bool]
+ │                   ├── variable: y.a [type=int]
+ │                   └── const: 3 [type=int]
+ └── with &2 (t2)
+      ├── columns: a:7(int!null)
+      ├── project
+      │    ├── columns: y.a:3(int!null)
+      │    └── select
+      │         ├── columns: y.a:3(int!null) rowid:4(int!null)
+      │         ├── scan y
+      │         │    └── columns: y.a:3(int) rowid:4(int!null)
+      │         └── filters
+      │              └── gt [type=bool]
+      │                   ├── variable: y.a [type=int]
+      │                   └── const: 1 [type=int]
+      └── with &3 (t3)
+           ├── columns: a:7(int!null)
+           ├── select
+           │    ├── columns: a:5(int!null)
+           │    ├── with-scan &1 (t1)
+           │    │    ├── columns: a:5(int!null)
+           │    │    └── mapping:
+           │    │         └──  y.a:1(int) => a:5(int)
+           │    └── filters
+           │         └── lt [type=bool]
+           │              ├── variable: a [type=int]
+           │              └── const: 4 [type=int]
+           └── with &4 (t4)
+                ├── columns: a:7(int!null)
+                ├── select
+                │    ├── columns: a:6(int!null)
+                │    ├── with-scan &2 (t2)
+                │    │    ├── columns: a:6(int!null)
+                │    │    └── mapping:
+                │    │         └──  y.a:3(int) => a:6(int)
+                │    └── filters
+                │         └── gt [type=bool]
+                │              ├── variable: a [type=int]
+                │              └── const: 3 [type=int]
+                └── project
+                     ├── columns: a:7(int!null)
+                     └── inner-join (hash)
+                          ├── columns: a:7(int!null) a:8(int!null)
+                          ├── with-scan &3 (t3)
+                          │    ├── columns: a:7(int!null)
+                          │    └── mapping:
+                          │         └──  a:5(int) => a:7(int)
+                          ├── with-scan &4 (t4)
+                          │    ├── columns: a:8(int!null)
+                          │    └── mapping:
+                          │         └──  a:6(int) => a:8(int)
+                          └── filters
+                               └── eq [type=bool]
+                                    ├── variable: a [type=int]
+                                    └── variable: a [type=int]
+
+# Make sure they scope properly.
+build
+WITH t AS (SELECT true) SELECT * FROM (WITH t AS (SELECT false) SELECT * FROM t)
+----
+with &1 (t)
+ ├── columns: bool:3(bool!null)
+ ├── project
+ │    ├── columns: bool:1(bool!null)
+ │    ├── values
+ │    │    └── tuple [type=tuple]
+ │    └── projections
+ │         └── true [type=bool]
+ └── with &2 (t)
+      ├── columns: bool:3(bool!null)
+      ├── project
+      │    ├── columns: bool:2(bool!null)
+      │    ├── values
+      │    │    └── tuple [type=tuple]
+      │    └── projections
+      │         └── false [type=bool]
+      └── with-scan &2 (t)
+           ├── columns: bool:3(bool!null)
+           └── mapping:
+                └──  bool:2(bool) => bool:3(bool)
+
+build
+WITH
+    t AS (SELECT true),
+    t AS (SELECT false)
+SELECT * FROM t
+----
+error (42712): WITH query name t specified more than once
+
+# Using a CTE once in another CTE and once otherwise.
+build
+WITH
+    t1 AS (SELECT true),
+    t2 AS (SELECT * FROM t1)
+SELECT * FROM t1 NATURAL JOIN t2
+----
+with &1 (t1)
+ ├── columns: bool:3(bool!null)
+ ├── project
+ │    ├── columns: bool:1(bool!null)
+ │    ├── values
+ │    │    └── tuple [type=tuple]
+ │    └── projections
+ │         └── true [type=bool]
+ └── with &2 (t2)
+      ├── columns: bool:3(bool!null)
+      ├── with-scan &1 (t1)
+      │    ├── columns: bool:2(bool!null)
+      │    └── mapping:
+      │         └──  bool:1(bool) => bool:2(bool)
+      └── project
+           ├── columns: bool:3(bool!null)
+           └── inner-join (hash)
+                ├── columns: bool:3(bool!null) bool:4(bool!null)
+                ├── with-scan &1 (t1)
+                │    ├── columns: bool:3(bool!null)
+                │    └── mapping:
+                │         └──  bool:1(bool) => bool:3(bool)
+                ├── with-scan &2 (t2)
+                │    ├── columns: bool:4(bool!null)
+                │    └── mapping:
+                │         └──  bool:2(bool) => bool:4(bool)
+                └── filters
+                     └── eq [type=bool]
+                          ├── variable: bool [type=bool]
+                          └── variable: bool [type=bool]
+
+build
+WITH
+    t1 AS (SELECT * FROM x),
+    t2 AS (SELECT * FROM x NATURAL JOIN t1)
+SELECT * FROM t2 NATURAL JOIN x
+----
+with &1 (t1)
+ ├── columns: a:9(int!null) b:10(int!null)
+ ├── project
+ │    ├── columns: x.a:1(int) x.b:2(int)
+ │    └── scan x
+ │         └── columns: x.a:1(int) x.b:2(int) rowid:3(int!null)
+ └── with &2 (t2)
+      ├── columns: a:9(int!null) b:10(int!null)
+      ├── project
+      │    ├── columns: x.a:4(int!null) x.b:5(int!null)
+      │    └── inner-join (hash)
+      │         ├── columns: x.a:4(int!null) x.b:5(int!null) rowid:6(int!null) a:7(int!null) b:8(int!null)
+      │         ├── scan x
+      │         │    └── columns: x.a:4(int) x.b:5(int) rowid:6(int!null)
+      │         ├── with-scan &1 (t1)
+      │         │    ├── columns: a:7(int) b:8(int)
+      │         │    └── mapping:
+      │         │         ├──  x.a:1(int) => a:7(int)
+      │         │         └──  x.b:2(int) => b:8(int)
+      │         └── filters
+      │              ├── eq [type=bool]
+      │              │    ├── variable: x.a [type=int]
+      │              │    └── variable: a [type=int]
+      │              └── eq [type=bool]
+      │                   ├── variable: x.b [type=int]
+      │                   └── variable: b [type=int]
+      └── project
+           ├── columns: a:9(int!null) b:10(int!null)
+           └── inner-join (hash)
+                ├── columns: a:9(int!null) b:10(int!null) x.a:11(int!null) x.b:12(int!null) rowid:13(int!null)
+                ├── with-scan &2 (t2)
+                │    ├── columns: a:9(int!null) b:10(int!null)
+                │    └── mapping:
+                │         ├──  x.a:4(int) => a:9(int)
+                │         └──  x.b:5(int) => b:10(int)
+                ├── scan x
+                │    └── columns: x.a:11(int) x.b:12(int) rowid:13(int!null)
+                └── filters
+                     ├── eq [type=bool]
+                     │    ├── variable: a [type=int]
+                     │    └── variable: x.a [type=int]
+                     └── eq [type=bool]
+                          ├── variable: b [type=int]
+                          └── variable: x.b [type=int]
+
+build
+WITH t AS (SELECT a FROM y WHERE a < 3)
+  SELECT * FROM t NATURAL JOIN t
+----
+error (42712): source name "t" specified more than once (missing AS clause)
+
+build
+WITH t(x) AS (SELECT a FROM x)
+  SELECT x FROM (SELECT x FROM t)
+----
+with &1 (t)
+ ├── columns: x:4(int)
+ ├── project
+ │    ├── columns: a:1(int)
+ │    └── scan x
+ │         └── columns: a:1(int) b:2(int) rowid:3(int!null)
+ └── with-scan &1 (t)
+      ├── columns: x:4(int)
+      └── mapping:
+           └──  a:1(int) => x:4(int)
+
+build
+WITH t(a, b) AS (SELECT true a, false b)
+  SELECT a, b FROM t
+----
+with &1 (t)
+ ├── columns: a:3(bool!null) b:4(bool!null)
+ ├── project
+ │    ├── columns: a:1(bool!null) b:2(bool!null)
+ │    ├── values
+ │    │    └── tuple [type=tuple]
+ │    └── projections
+ │         ├── true [type=bool]
+ │         └── false [type=bool]
+ └── with-scan &1 (t)
+      ├── columns: a:3(bool!null) b:4(bool!null)
+      └── mapping:
+           ├──  a:1(bool) => a:3(bool)
+           └──  b:2(bool) => b:4(bool)
+
+build
+WITH t(b, a) AS (SELECT true a, false b)
+  SELECT a, b FROM t
+----
+with &1 (t)
+ ├── columns: a:4(bool!null) b:3(bool!null)
+ ├── project
+ │    ├── columns: a:1(bool!null) b:2(bool!null)
+ │    ├── values
+ │    │    └── tuple [type=tuple]
+ │    └── projections
+ │         ├── true [type=bool]
+ │         └── false [type=bool]
+ └── with-scan &1 (t)
+      ├── columns: b:3(bool!null) a:4(bool!null)
+      └── mapping:
+           ├──  a:1(bool) => b:3(bool)
+           └──  b:2(bool) => a:4(bool)
+
+build
+WITH t AS (SELECT a FROM x)
+    SELECT * FROM y WHERE a IN (SELECT * FROM t)
+----
+with &1 (t)
+ ├── columns: a:4(int)
+ ├── project
+ │    ├── columns: x.a:1(int)
+ │    └── scan x
+ │         └── columns: x.a:1(int) b:2(int) x.rowid:3(int!null)
+ └── project
+      ├── columns: y.a:4(int)
+      └── select
+           ├── columns: y.a:4(int) y.rowid:5(int!null)
+           ├── scan y
+           │    └── columns: y.a:4(int) y.rowid:5(int!null)
+           └── filters
+                └── any: eq [type=bool]
+                     ├── with-scan &1 (t)
+                     │    ├── columns: a:6(int)
+                     │    └── mapping:
+                     │         └──  x.a:1(int) => a:6(int)
+                     └── variable: y.a [type=int]
+
+build
+WITH t(x) AS (SELECT a FROM x)
+    SELECT * FROM y WHERE a IN (SELECT x FROM t)
+----
+with &1 (t)
+ ├── columns: a:4(int)
+ ├── project
+ │    ├── columns: x.a:1(int)
+ │    └── scan x
+ │         └── columns: x.a:1(int) b:2(int) x.rowid:3(int!null)
+ └── project
+      ├── columns: y.a:4(int)
+      └── select
+           ├── columns: y.a:4(int) y.rowid:5(int!null)
+           ├── scan y
+           │    └── columns: y.a:4(int) y.rowid:5(int!null)
+           └── filters
+                └── any: eq [type=bool]
+                     ├── with-scan &1 (t)
+                     │    ├── columns: x:6(int)
+                     │    └── mapping:
+                     │         └──  x.a:1(int) => x:6(int)
+                     └── variable: y.a [type=int]
+
+# Using a subquery inside a CTE
+build
+SELECT * FROM x WHERE a IN
+  (WITH t AS (SELECT * FROM y WHERE a < 3) SELECT * FROM t)
+----
+project
+ ├── columns: a:1(int) b:2(int)
+ └── select
+      ├── columns: x.a:1(int) b:2(int) x.rowid:3(int!null)
+      ├── scan x
+      │    └── columns: x.a:1(int) b:2(int) x.rowid:3(int!null)
+      └── filters
+           └── any: eq [type=bool]
+                ├── with &1 (t)
+                │    ├── columns: a:6(int!null)
+                │    ├── project
+                │    │    ├── columns: y.a:4(int!null)
+                │    │    └── select
+                │    │         ├── columns: y.a:4(int!null) y.rowid:5(int!null)
+                │    │         ├── scan y
+                │    │         │    └── columns: y.a:4(int) y.rowid:5(int!null)
+                │    │         └── filters
+                │    │              └── lt [type=bool]
+                │    │                   ├── variable: y.a [type=int]
+                │    │                   └── const: 3 [type=int]
+                │    └── with-scan &1 (t)
+                │         ├── columns: a:6(int!null)
+                │         └── mapping:
+                │              └──  y.a:4(int) => a:6(int)
+                └── variable: x.a [type=int]
+
+# Using a correlated subquery inside a CTE
+build
+SELECT (WITH t AS (SELECT * FROM y WHERE x.a = y.a) SELECT * FROM t LIMIT 1) FROM x
+----
+error (0A000): CTEs may not be correlated
+
+# Rename columns
+build
+WITH t(b) AS (SELECT a FROM x) SELECT b, t.b FROM t
+----
+with &1 (t)
+ ├── columns: b:4(int) b:4(int)
+ ├── project
+ │    ├── columns: a:1(int)
+ │    └── scan x
+ │         └── columns: a:1(int) x.b:2(int) rowid:3(int!null)
+ └── with-scan &1 (t)
+      ├── columns: b:4(int)
+      └── mapping:
+           └──  a:1(int) => b:4(int)
+
+build
+WITH t(b, c) AS (SELECT a FROM x) SELECT b, t.b FROM t
+----
+error (42P10): source "t" has 1 columns available but 2 columns specified
+
+# Ensure you can't reference the original table name
+build
+WITH t AS (SELECT a FROM x) SELECT a, x.t FROM t
+----
+error (42P01): no data source matches prefix: x
+
+# Nested WITH, name shadowing
+build
+WITH t(x) AS (WITH t(x) AS (SELECT 1) SELECT x * 10 FROM t) SELECT x + 2 FROM t
+----
+with &2 (t)
+ ├── columns: "?column?":5(int)
+ ├── with &1 (t)
+ │    ├── columns: "?column?":3(int)
+ │    ├── project
+ │    │    ├── columns: "?column?":1(int!null)
+ │    │    ├── values
+ │    │    │    └── tuple [type=tuple]
+ │    │    └── projections
+ │    │         └── const: 1 [type=int]
+ │    └── project
+ │         ├── columns: "?column?":3(int)
+ │         ├── with-scan &1 (t)
+ │         │    ├── columns: x:2(int!null)
+ │         │    └── mapping:
+ │         │         └──  "?column?":1(int) => x:2(int)
+ │         └── projections
+ │              └── mult [type=int]
+ │                   ├── variable: x [type=int]
+ │                   └── const: 10 [type=int]
+ └── project
+      ├── columns: "?column?":5(int)
+      ├── with-scan &2 (t)
+      │    ├── columns: x:4(int)
+      │    └── mapping:
+      │         └──  "?column?":3(int) => x:4(int)
+      └── projections
+           └── plus [type=int]
+                ├── variable: x [type=int]
+                └── const: 2 [type=int]
+
+build
+WITH one AS (SELECT a AS u FROM x),
+     two AS (SELECT a AS v FROM (SELECT a FROM y UNION ALL SELECT u FROM one))
+  SELECT * FROM one JOIN two ON u = v
+----
+with &1 (one)
+ ├── columns: u:8(int!null) v:9(int!null)
+ ├── project
+ │    ├── columns: x.a:1(int)
+ │    └── scan x
+ │         └── columns: x.a:1(int) b:2(int) x.rowid:3(int!null)
+ └── with &2 (two)
+      ├── columns: u:8(int!null) v:9(int!null)
+      ├── union-all
+      │    ├── columns: a:7(int)
+      │    ├── left columns: y.a:4(int)
+      │    ├── right columns: u:6(int)
+      │    ├── project
+      │    │    ├── columns: y.a:4(int)
+      │    │    └── scan y
+      │    │         └── columns: y.a:4(int) y.rowid:5(int!null)
+      │    └── with-scan &1 (one)
+      │         ├── columns: u:6(int)
+      │         └── mapping:
+      │              └──  x.a:1(int) => u:6(int)
+      └── inner-join (hash)
+           ├── columns: u:8(int!null) v:9(int!null)
+           ├── with-scan &1 (one)
+           │    ├── columns: u:8(int)
+           │    └── mapping:
+           │         └──  x.a:1(int) => u:8(int)
+           ├── with-scan &2 (two)
+           │    ├── columns: v:9(int)
+           │    └── mapping:
+           │         └──  a:7(int) => v:9(int)
+           └── filters
+                └── eq [type=bool]
+                     ├── variable: u [type=int]
+                     └── variable: v [type=int]
+
+build
+WITH foo AS (SELECT x.a FROM x ORDER by x.a) SELECT * FROM foo
+----
+with &1 (foo)
+ ├── columns: a:4(int)
+ ├── project
+ │    ├── columns: x.a:1(int)
+ │    └── scan x
+ │         └── columns: x.a:1(int) b:2(int) rowid:3(int!null)
+ └── with-scan &1 (foo)
+      ├── columns: a:4(int)
+      └── mapping:
+           └──  x.a:1(int) => a:4(int)
+
+# Mutations.
+build
+WITH t AS (SELECT a FROM x) INSERT INTO x SELECT a + 20 FROM t RETURNING *
+----
+with &1 (t)
+ ├── columns: a:4(int) b:5(int)
+ ├── project
+ │    ├── columns: x.a:1(int)
+ │    └── scan x
+ │         └── columns: x.a:1(int) b:2(int) rowid:3(int!null)
+ └── project
+      ├── columns: x.a:4(int) b:5(int)
+      └── insert x
+           ├── columns: x.a:4(int) b:5(int) rowid:6(int!null)
+           ├── insert-mapping:
+           │    ├──  "?column?":8 => x.a:4
+           │    ├──  column9:9 => b:5
+           │    └──  column10:10 => rowid:6
+           └── project
+                ├── columns: column9:9(int) column10:10(int) "?column?":8(int)
+                ├── project
+                │    ├── columns: "?column?":8(int)
+                │    ├── with-scan &1 (t)
+                │    │    ├── columns: a:7(int)
+                │    │    └── mapping:
+                │    │         └──  x.a:1(int) => a:7(int)
+                │    └── projections
+                │         └── plus [type=int]
+                │              ├── variable: a [type=int]
+                │              └── const: 20 [type=int]
+                └── projections
+                     ├── cast: INT8 [type=int]
+                     │    └── null [type=unknown]
+                     └── function: unique_rowid [type=int]
+
+build
+WITH t AS (SELECT a FROM x) UPDATE x SET a = (SELECT * FROM t) RETURNING *
+----
+with &1 (t)
+ ├── columns: a:4(int) b:5(int)
+ ├── project
+ │    ├── columns: x.a:1(int)
+ │    └── scan x
+ │         └── columns: x.a:1(int) b:2(int) rowid:3(int!null)
+ └── project
+      ├── columns: x.a:4(int) b:5(int)
+      └── update x
+           ├── columns: x.a:4(int) b:5(int) rowid:6(int!null)
+           ├── fetch columns: x.a:7(int) b:8(int) rowid:9(int)
+           ├── update-mapping:
+           │    └──  column11:11 => x.a:4
+           └── project
+                ├── columns: column11:11(int) x.a:7(int) b:8(int) rowid:9(int!null)
+                ├── scan x
+                │    └── columns: x.a:7(int) b:8(int) rowid:9(int!null)
+                └── projections
+                     └── subquery [type=int]
+                          └── max1-row
+                               ├── columns: a:10(int)
+                               └── with-scan &1 (t)
+                                    ├── columns: a:10(int)
+                                    └── mapping:
+                                         └──  x.a:1(int) => a:10(int)
+
+build
+WITH t AS (SELECT a FROM x) DELETE FROM x WHERE a = (SELECT * FROM t) RETURNING *
+----
+with &1 (t)
+ ├── columns: a:4(int!null) b:5(int)
+ ├── project
+ │    ├── columns: x.a:1(int)
+ │    └── scan x
+ │         └── columns: x.a:1(int) b:2(int) rowid:3(int!null)
+ └── project
+      ├── columns: x.a:4(int!null) b:5(int)
+      └── delete x
+           ├── columns: x.a:4(int!null) b:5(int) rowid:6(int!null)
+           ├── fetch columns: x.a:7(int) b:8(int) rowid:9(int)
+           └── select
+                ├── columns: x.a:7(int!null) b:8(int) rowid:9(int!null)
+                ├── scan x
+                │    └── columns: x.a:7(int) b:8(int) rowid:9(int!null)
+                └── filters
+                     └── eq [type=bool]
+                          ├── variable: x.a [type=int]
+                          └── subquery [type=int]
+                               └── max1-row
+                                    ├── columns: a:10(int)
+                                    └── with-scan &1 (t)
+                                         ├── columns: a:10(int)
+                                         └── mapping:
+                                              └──  x.a:1(int) => a:10(int)
+
+# Correlated WITH is not allowed.
+
+build
+SELECT (WITH foo AS (SELECT x.a FROM x WHERE x.a = y.a) SELECT a FROM foo) FROM y
+----
+error (0A000): CTEs may not be correlated
+
+build
+SELECT (WITH foo AS (SELECT (SELECT y.a) FROM x) SELECT a FROM foo) FROM y
+----
+error (0A000): CTEs may not be correlated
+
+# Regression test for #40407.
+exec-ddl
+CREATE TABLE xy (x INT, y INT, z TIMESTAMP);
+----
+
+exec-ddl
+CREATE TABLE uv (u INT, v INT);
+----
+
+build
+WITH
+    t AS (SELECT xy.x FROM xy INNER JOIN uv ON xy.x = uv.u ORDER BY uv.v DESC LIMIT 5)
+DELETE FROM
+    xy
+WHERE
+    x = ANY (SELECT * FROM t);
+----
+with &1 (t)
+ ├── project
+ │    ├── columns: xy.x:1(int!null)
+ │    └── limit
+ │         ├── columns: xy.x:1(int!null) v:6(int)
+ │         ├── internal-ordering: -6
+ │         ├── sort
+ │         │    ├── columns: xy.x:1(int!null) v:6(int)
+ │         │    ├── ordering: -6
+ │         │    └── project
+ │         │         ├── columns: xy.x:1(int!null) v:6(int)
+ │         │         └── inner-join (hash)
+ │         │              ├── columns: xy.x:1(int!null) y:2(int) z:3(timestamp) xy.rowid:4(int!null) u:5(int!null) v:6(int) uv.rowid:7(int!null)
+ │         │              ├── scan xy
+ │         │              │    └── columns: xy.x:1(int) y:2(int) z:3(timestamp) xy.rowid:4(int!null)
+ │         │              ├── scan uv
+ │         │              │    └── columns: u:5(int) v:6(int) uv.rowid:7(int!null)
+ │         │              └── filters
+ │         │                   └── eq [type=bool]
+ │         │                        ├── variable: xy.x [type=int]
+ │         │                        └── variable: u [type=int]
+ │         └── const: 5 [type=int]
+ └── delete xy
+      ├── columns: <none>
+      ├── fetch columns: xy.x:12(int) y:13(int) z:14(timestamp) xy.rowid:15(int)
+      └── select
+           ├── columns: xy.x:12(int) y:13(int) z:14(timestamp) xy.rowid:15(int!null)
+           ├── scan xy
+           │    └── columns: xy.x:12(int) y:13(int) z:14(timestamp) xy.rowid:15(int!null)
+           └── filters
+                └── any: eq [type=bool]
+                     ├── with-scan &1 (t)
+                     │    ├── columns: x:16(int!null)
+                     │    └── mapping:
+                     │         └──  xy.x:1(int) => x:16(int)
+                     └── variable: xy.x [type=int]
+
+# Check hidden column handling: level, node_type should not be output.
+build
+WITH cte AS (EXPLAIN (VERBOSE) SELECT 1) SELECT * FROM cte
+----
+with &1 (cte)
+ ├── columns: tree:9(string) field:10(string) description:11(string) columns:12(string) ordering:13(string)
+ ├── project
+ │    ├── columns: tree:2(string) field:5(string) description:6(string) columns:7(string) ordering:8(string)
+ │    └── explain
+ │         ├── columns: tree:2(string) level:3(int) node_type:4(string) field:5(string) description:6(string) columns:7(string) ordering:8(string)
+ │         ├── mode: verbose
+ │         └── project
+ │              ├── columns: "?column?":1(int!null)
+ │              ├── values
+ │              │    └── tuple [type=tuple]
+ │              └── projections
+ │                   └── const: 1 [type=int]
+ └── with-scan &1 (cte)
+      ├── columns: tree:9(string) field:10(string) description:11(string) columns:12(string) ordering:13(string)
+      └── mapping:
+           ├──  tree:2(string) => tree:9(string)
+           ├──  field:5(string) => field:10(string)
+           ├──  description:6(string) => description:11(string)
+           ├──  columns:7(string) => columns:12(string)
+           └──  ordering:8(string) => ordering:13(string)
+
+# WITH RECURSIVE examples from postgres docs.
+
+build
+WITH RECURSIVE t(n) AS (
+    VALUES (1)
+  UNION ALL
+    SELECT n+1 FROM t WHERE n < 100
+)
+SELECT sum(n) FROM t
+----
+with &2 (t)
+ ├── columns: sum:6(decimal)
+ ├── recursive-c-t-e
+ │    ├── columns: n:2(int)
+ │    ├── working table binding: &1
+ │    ├── initial columns: column1:1(int)
+ │    ├── recursive columns: "?column?":4(int)
+ │    ├── values
+ │    │    ├── columns: column1:1(int!null)
+ │    │    └── tuple [type=tuple{int}]
+ │    │         └── const: 1 [type=int]
+ │    └── project
+ │         ├── columns: "?column?":4(int)
+ │         ├── select
+ │         │    ├── columns: n:3(int!null)
+ │         │    ├── with-scan &1 (t)
+ │         │    │    ├── columns: n:3(int)
+ │         │    │    └── mapping:
+ │         │    │         └──  n:2(int) => n:3(int)
+ │         │    └── filters
+ │         │         └── lt [type=bool]
+ │         │              ├── variable: n [type=int]
+ │         │              └── const: 100 [type=int]
+ │         └── projections
+ │              └── plus [type=int]
+ │                   ├── variable: n [type=int]
+ │                   └── const: 1 [type=int]
+ └── scalar-group-by
+      ├── columns: sum:6(decimal)
+      ├── with-scan &2 (t)
+      │    ├── columns: n:5(int)
+      │    └── mapping:
+      │         └──  n:2(int) => n:5(int)
+      └── aggregations
+           └── sum [type=decimal]
+                └── variable: n [type=int]
+
+exec-ddl
+CREATE TABLE parts (part STRING, sub_part STRING, quantity INT)
+----
+
+build
+WITH RECURSIVE included_parts(sub_part, part, quantity) AS (
+    SELECT sub_part, part, quantity FROM parts WHERE part = 'our_product'
+  UNION ALL
+    SELECT p.sub_part, p.part, p.quantity
+    FROM included_parts AS pr, parts AS p
+    WHERE p.part = pr.sub_part
+)
+SELECT sub_part, sum(quantity) as total_quantity
+FROM included_parts
+GROUP BY sub_part
+----
+with &2 (included_parts)
+ ├── columns: sub_part:15(string) total_quantity:18(decimal)
+ ├── recursive-c-t-e
+ │    ├── columns: sub_part:5(string) part:6(string) quantity:7(int)
+ │    ├── working table binding: &1
+ │    ├── initial columns: parts.sub_part:2(string) parts.part:1(string) parts.quantity:3(int)
+ │    ├── recursive columns: p.sub_part:12(string) p.part:11(string) p.quantity:13(int)
+ │    ├── project
+ │    │    ├── columns: parts.part:1(string!null) parts.sub_part:2(string) parts.quantity:3(int)
+ │    │    └── select
+ │    │         ├── columns: parts.part:1(string!null) parts.sub_part:2(string) parts.quantity:3(int) parts.rowid:4(int!null)
+ │    │         ├── scan parts
+ │    │         │    └── columns: parts.part:1(string) parts.sub_part:2(string) parts.quantity:3(int) parts.rowid:4(int!null)
+ │    │         └── filters
+ │    │              └── eq [type=bool]
+ │    │                   ├── variable: parts.part [type=string]
+ │    │                   └── const: 'our_product' [type=string]
+ │    └── project
+ │         ├── columns: p.part:11(string!null) p.sub_part:12(string) p.quantity:13(int)
+ │         └── select
+ │              ├── columns: sub_part:8(string!null) part:9(string) quantity:10(int) p.part:11(string!null) p.sub_part:12(string) p.quantity:13(int) p.rowid:14(int!null)
+ │              ├── inner-join (hash)
+ │              │    ├── columns: sub_part:8(string) part:9(string) quantity:10(int) p.part:11(string) p.sub_part:12(string) p.quantity:13(int) p.rowid:14(int!null)
+ │              │    ├── with-scan &1 (included_parts)
+ │              │    │    ├── columns: sub_part:8(string) part:9(string) quantity:10(int)
+ │              │    │    └── mapping:
+ │              │    │         ├──  sub_part:5(string) => sub_part:8(string)
+ │              │    │         ├──  part:6(string) => part:9(string)
+ │              │    │         └──  quantity:7(int) => quantity:10(int)
+ │              │    ├── scan p
+ │              │    │    └── columns: p.part:11(string) p.sub_part:12(string) p.quantity:13(int) p.rowid:14(int!null)
+ │              │    └── filters (true)
+ │              └── filters
+ │                   └── eq [type=bool]
+ │                        ├── variable: p.part [type=string]
+ │                        └── variable: sub_part [type=string]
+ └── group-by
+      ├── columns: sub_part:15(string) sum:18(decimal)
+      ├── grouping columns: sub_part:15(string)
+      ├── project
+      │    ├── columns: sub_part:15(string) quantity:17(int)
+      │    └── with-scan &2 (included_parts)
+      │         ├── columns: sub_part:15(string) part:16(string) quantity:17(int)
+      │         └── mapping:
+      │              ├──  sub_part:5(string) => sub_part:15(string)
+      │              ├──  part:6(string) => part:16(string)
+      │              └──  quantity:7(int) => quantity:17(int)
+      └── aggregations
+           └── sum [type=decimal]
+                └── variable: quantity [type=int]
+
+
+exec-ddl
+CREATE TABLE graph (id INT PRIMARY KEY, link INT, data STRING)
+----
+
+build
+WITH RECURSIVE search_graph(id, link, data, depth, path, cycle) AS (
+    SELECT g.id, g.link, g.data, 1,
+      ARRAY[g.id],
+      false
+    FROM graph g
+  UNION ALL
+    SELECT g.id, g.link, g.data, sg.depth + 1,
+      path || g.id,
+      g.id = ANY(path)
+    FROM graph g, search_graph sg
+    WHERE g.id = sg.link AND NOT cycle
+)
+SELECT * FROM search_graph
+----
+with &2 (search_graph)
+ ├── columns: id:25(int) link:26(int) data:27(string) depth:28(int) path:29(int[]) cycle:30(bool)
+ ├── recursive-c-t-e
+ │    ├── columns: id:7(int) link:8(int) data:9(string) depth:10(int) path:11(int[]) cycle:12(bool)
+ │    ├── working table binding: &1
+ │    ├── initial columns: g.id:1(int) g.link:2(int) g.data:3(string) "?column?":4(int) array:5(int[]) bool:6(bool)
+ │    ├── recursive columns: g.id:13(int) g.link:14(int) g.data:15(string) "?column?":22(int) "?column?":23(int[]) "?column?":24(bool)
+ │    ├── project
+ │    │    ├── columns: "?column?":4(int!null) array:5(int[]) bool:6(bool!null) g.id:1(int!null) g.link:2(int) g.data:3(string)
+ │    │    ├── scan g
+ │    │    │    └── columns: g.id:1(int!null) g.link:2(int) g.data:3(string)
+ │    │    └── projections
+ │    │         ├── const: 1 [type=int]
+ │    │         ├── array: [type=int[]]
+ │    │         │    └── variable: g.id [type=int]
+ │    │         └── false [type=bool]
+ │    └── project
+ │         ├── columns: "?column?":22(int) "?column?":23(int[]) "?column?":24(bool) g.id:13(int!null) g.link:14(int) g.data:15(string)
+ │         ├── select
+ │         │    ├── columns: g.id:13(int!null) g.link:14(int) g.data:15(string) id:16(int) link:17(int!null) data:18(string) depth:19(int) path:20(int[]) cycle:21(bool!null)
+ │         │    ├── inner-join (hash)
+ │         │    │    ├── columns: g.id:13(int!null) g.link:14(int) g.data:15(string) id:16(int) link:17(int) data:18(string) depth:19(int) path:20(int[]) cycle:21(bool)
+ │         │    │    ├── scan g
+ │         │    │    │    └── columns: g.id:13(int!null) g.link:14(int) g.data:15(string)
+ │         │    │    ├── with-scan &1 (search_graph)
+ │         │    │    │    ├── columns: id:16(int) link:17(int) data:18(string) depth:19(int) path:20(int[]) cycle:21(bool)
+ │         │    │    │    └── mapping:
+ │         │    │    │         ├──  id:7(int) => id:16(int)
+ │         │    │    │         ├──  link:8(int) => link:17(int)
+ │         │    │    │         ├──  data:9(string) => data:18(string)
+ │         │    │    │         ├──  depth:10(int) => depth:19(int)
+ │         │    │    │         ├──  path:11(int[]) => path:20(int[])
+ │         │    │    │         └──  cycle:12(bool) => cycle:21(bool)
+ │         │    │    └── filters (true)
+ │         │    └── filters
+ │         │         └── and [type=bool]
+ │         │              ├── eq [type=bool]
+ │         │              │    ├── variable: g.id [type=int]
+ │         │              │    └── variable: link [type=int]
+ │         │              └── not [type=bool]
+ │         │                   └── variable: cycle [type=bool]
+ │         └── projections
+ │              ├── plus [type=int]
+ │              │    ├── variable: depth [type=int]
+ │              │    └── const: 1 [type=int]
+ │              ├── concat [type=int[]]
+ │              │    ├── variable: path [type=int[]]
+ │              │    └── variable: g.id [type=int]
+ │              └── any-scalar: eq [type=bool]
+ │                   ├── variable: g.id [type=int]
+ │                   └── variable: path [type=int[]]
+ └── with-scan &2 (search_graph)
+      ├── columns: id:25(int) link:26(int) data:27(string) depth:28(int) path:29(int[]) cycle:30(bool)
+      └── mapping:
+           ├──  id:7(int) => id:25(int)
+           ├──  link:8(int) => link:26(int)
+           ├──  data:9(string) => data:27(string)
+           ├──  depth:10(int) => depth:28(int)
+           ├──  path:11(int[]) => path:29(int[])
+           └──  cycle:12(bool) => cycle:30(bool)
+
+# Test where initial query has duplicate columns.
+build
+WITH RECURSIVE cte(a, b) AS (
+    SELECT 0, 0
+  UNION ALL
+    SELECT a+1, b+10 FROM cte WHERE a < 5
+) SELECT * FROM cte;
+----
+with &2 (cte)
+ ├── columns: a:8(int) b:9(int)
+ ├── recursive-c-t-e
+ │    ├── columns: a:2(int) b:3(int)
+ │    ├── working table binding: &1
+ │    ├── initial columns: "?column?":1(int) "?column?":1(int)
+ │    ├── recursive columns: "?column?":6(int) "?column?":7(int)
+ │    ├── project
+ │    │    ├── columns: "?column?":1(int!null)
+ │    │    ├── values
+ │    │    │    └── tuple [type=tuple]
+ │    │    └── projections
+ │    │         └── const: 0 [type=int]
+ │    └── project
+ │         ├── columns: "?column?":6(int) "?column?":7(int)
+ │         ├── select
+ │         │    ├── columns: a:4(int!null) b:5(int)
+ │         │    ├── with-scan &1 (cte)
+ │         │    │    ├── columns: a:4(int) b:5(int)
+ │         │    │    └── mapping:
+ │         │    │         ├──  a:2(int) => a:4(int)
+ │         │    │         └──  b:3(int) => b:5(int)
+ │         │    └── filters
+ │         │         └── lt [type=bool]
+ │         │              ├── variable: a [type=int]
+ │         │              └── const: 5 [type=int]
+ │         └── projections
+ │              ├── plus [type=int]
+ │              │    ├── variable: a [type=int]
+ │              │    └── const: 1 [type=int]
+ │              └── plus [type=int]
+ │                   ├── variable: b [type=int]
+ │                   └── const: 10 [type=int]
+ └── with-scan &2 (cte)
+      ├── columns: a:8(int) b:9(int)
+      └── mapping:
+           ├──  a:2(int) => a:8(int)
+           └──  b:3(int) => b:9(int)
+
+# Test where recursive query has duplicate columns.
+build
+WITH RECURSIVE cte(a, b) AS (
+    SELECT 0, 1
+  UNION ALL
+    SELECT a+1, a+1 FROM cte WHERE a < 5
+) SELECT * FROM cte;
+----
+with &2 (cte)
+ ├── columns: a:8(int) b:9(int)
+ ├── recursive-c-t-e
+ │    ├── columns: a:3(int) b:4(int)
+ │    ├── working table binding: &1
+ │    ├── initial columns: "?column?":1(int) "?column?":2(int)
+ │    ├── recursive columns: "?column?":7(int) "?column?":7(int)
+ │    ├── project
+ │    │    ├── columns: "?column?":1(int!null) "?column?":2(int!null)
+ │    │    ├── values
+ │    │    │    └── tuple [type=tuple]
+ │    │    └── projections
+ │    │         ├── const: 0 [type=int]
+ │    │         └── const: 1 [type=int]
+ │    └── project
+ │         ├── columns: "?column?":7(int)
+ │         ├── select
+ │         │    ├── columns: a:5(int!null) b:6(int)
+ │         │    ├── with-scan &1 (cte)
+ │         │    │    ├── columns: a:5(int) b:6(int)
+ │         │    │    └── mapping:
+ │         │    │         ├──  a:3(int) => a:5(int)
+ │         │    │         └──  b:4(int) => b:6(int)
+ │         │    └── filters
+ │         │         └── lt [type=bool]
+ │         │              ├── variable: a [type=int]
+ │         │              └── const: 5 [type=int]
+ │         └── projections
+ │              └── plus [type=int]
+ │                   ├── variable: a [type=int]
+ │                   └── const: 1 [type=int]
+ └── with-scan &2 (cte)
+      ├── columns: a:8(int) b:9(int)
+      └── mapping:
+           ├──  a:3(int) => a:8(int)
+           └──  b:4(int) => b:9(int)
+
+# Allow non-recursive CTE when RECURSIVE is used.
+build
+WITH RECURSIVE cte(a, b) AS (
+  SELECT 1, 2
+) SELECT * FROM cte;
+----
+with &2 (cte)
+ ├── columns: a:3(int!null) b:4(int!null)
+ ├── project
+ │    ├── columns: "?column?":1(int!null) "?column?":2(int!null)
+ │    ├── values
+ │    │    └── tuple [type=tuple]
+ │    └── projections
+ │         ├── const: 1 [type=int]
+ │         └── const: 2 [type=int]
+ └── with-scan &2 (cte)
+      ├── columns: a:3(int!null) b:4(int!null)
+      └── mapping:
+           ├──  "?column?":1(int) => a:3(int)
+           └──  "?column?":2(int) => b:4(int)
+
+# Allow non-recursive CTE even when it has UNION ALL.
+build
+WITH RECURSIVE cte(a, b) AS (
+    SELECT 1, 2
+  UNION ALL
+    SELECT 3, 4
+) SELECT * FROM cte;
+----
+with &2 (cte)
+ ├── columns: a:9(int!null) b:10(int!null)
+ ├── union
+ │    ├── columns: "?column?":7(int!null) "?column?":8(int!null)
+ │    ├── left columns: "?column?":1(int) "?column?":2(int)
+ │    ├── right columns: "?column?":5(int) "?column?":6(int)
+ │    ├── project
+ │    │    ├── columns: "?column?":1(int!null) "?column?":2(int!null)
+ │    │    ├── values
+ │    │    │    └── tuple [type=tuple]
+ │    │    └── projections
+ │    │         ├── const: 1 [type=int]
+ │    │         └── const: 2 [type=int]
+ │    └── project
+ │         ├── columns: "?column?":5(int!null) "?column?":6(int!null)
+ │         ├── values
+ │         │    └── tuple [type=tuple]
+ │         └── projections
+ │              ├── const: 3 [type=int]
+ │              └── const: 4 [type=int]
+ └── with-scan &2 (cte)
+      ├── columns: a:9(int!null) b:10(int!null)
+      └── mapping:
+           ├──  "?column?":7(int) => a:9(int)
+           └──  "?column?":8(int) => b:10(int)
+
+# Error cases.
+build
+WITH RECURSIVE cte(a, b) AS (
+  SELECT 1+a, 1+b FROM cte
+) SELECT * FROM cte;
+----
+error (42601): recursive query "cte" does not have the form non-recursive-term UNION ALL recursive-term
+
+build
+WITH RECURSIVE cte(a, b) AS (
+    SELECT 1, 2
+  UNION
+    SELECT 1+a, 1+b FROM cte
+) SELECT * FROM cte;
+----
+error (42601): recursive query "cte" does not have the form non-recursive-term UNION ALL recursive-term
+
+build
+WITH RECURSIVE cte(a, b) AS (
+    SELECT 1+a, 1+b FROM cte
+  UNION ALL
+    SELECT 3, 4
+) SELECT * FROM cte;
+----
+error (42601): recursive reference to query "cte" must not appear within its non-recursive term
+
+build
+WITH RECURSIVE cte(a, b) AS (
+    SELECT 1, 2
+  UNION ALL
+    SELECT c1.a+c2.a, c1.b+c2.b FROM cte AS c1, cte AS c2
+) SELECT * FROM cte;
+----
+error (42601): recursive reference to query "cte" must not appear more than once
+
+# If we really need to reference the working table multiple times, we can use
+# an inner WITH.
+build
+WITH RECURSIVE cte(a, b) AS (
+    SELECT 1, 2
+  UNION ALL
+    (WITH foo AS (SELECT * FROM cte) SELECT c1.a+c2.a, c1.b+c2.b FROM foo AS c1, foo AS c2)
+) SELECT * FROM cte;
+----
+with &3 (cte)
+ ├── columns: a:13(int) b:14(int)
+ ├── recursive-c-t-e
+ │    ├── columns: a:3(int) b:4(int)
+ │    ├── working table binding: &1
+ │    ├── initial columns: "?column?":1(int) "?column?":2(int)
+ │    ├── recursive columns: "?column?":11(int) "?column?":12(int)
+ │    ├── project
+ │    │    ├── columns: "?column?":1(int!null) "?column?":2(int!null)
+ │    │    ├── values
+ │    │    │    └── tuple [type=tuple]
+ │    │    └── projections
+ │    │         ├── const: 1 [type=int]
+ │    │         └── const: 2 [type=int]
+ │    └── with &2 (foo)
+ │         ├── columns: "?column?":11(int) "?column?":12(int)
+ │         ├── with-scan &1 (cte)
+ │         │    ├── columns: a:5(int) b:6(int)
+ │         │    └── mapping:
+ │         │         ├──  a:3(int) => a:5(int)
+ │         │         └──  b:4(int) => b:6(int)
+ │         └── project
+ │              ├── columns: "?column?":11(int) "?column?":12(int)
+ │              ├── inner-join (hash)
+ │              │    ├── columns: a:7(int) b:8(int) a:9(int) b:10(int)
+ │              │    ├── with-scan &2 (foo)
+ │              │    │    ├── columns: a:7(int) b:8(int)
+ │              │    │    └── mapping:
+ │              │    │         ├──  a:5(int) => a:7(int)
+ │              │    │         └──  b:6(int) => b:8(int)
+ │              │    ├── with-scan &2 (foo)
+ │              │    │    ├── columns: a:9(int) b:10(int)
+ │              │    │    └── mapping:
+ │              │    │         ├──  a:5(int) => a:9(int)
+ │              │    │         └──  b:6(int) => b:10(int)
+ │              │    └── filters (true)
+ │              └── projections
+ │                   ├── plus [type=int]
+ │                   │    ├── variable: a [type=int]
+ │                   │    └── variable: a [type=int]
+ │                   └── plus [type=int]
+ │                        ├── variable: b [type=int]
+ │                        └── variable: b [type=int]
+ └── with-scan &3 (cte)
+      ├── columns: a:13(int) b:14(int)
+      └── mapping:
+           ├──  a:3(int) => a:13(int)
+           └──  b:4(int) => b:14(int)

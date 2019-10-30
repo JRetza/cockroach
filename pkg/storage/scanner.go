@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -38,9 +34,13 @@ type replicaQueue interface {
 	// MaybeAdd adds the replica to the queue if the replica meets
 	// the queue's inclusion criteria and the queue is not already
 	// too full, etc.
-	MaybeAdd(*Replica, hlc.Timestamp)
+	MaybeAddAsync(context.Context, replicaInQueue, hlc.Timestamp)
 	// MaybeRemove removes the replica from the queue if it is present.
 	MaybeRemove(roachpb.RangeID)
+	// Name returns the name of the queue.
+	Name() string
+	// NeedsLease returns whether the queue requires a replica to be leaseholder.
+	NeedsLease() bool
 }
 
 // A replicaSet provides access to a sequence of replicas to consider
@@ -65,8 +65,9 @@ type replicaScanner struct {
 	clock *hlc.Clock
 
 	targetInterval time.Duration  // Target duration interval for scan loop
+	minIdleTime    time.Duration  // Min idle time for scan loop
 	maxIdleTime    time.Duration  // Max idle time for scan loop
-	waitTimer      timeutil.Timer // Shared timer to avoid allocations.
+	waitTimer      timeutil.Timer // Shared timer to avoid allocations
 	replicas       replicaSet     // Replicas to be scanned
 	queues         []replicaQueue // Replica queues managed by this scanner
 	removed        chan *Replica  // Replicas to remove from queues
@@ -90,7 +91,7 @@ type replicaScanner struct {
 func newReplicaScanner(
 	ambient log.AmbientContext,
 	clock *hlc.Clock,
-	targetInterval, maxIdleTime time.Duration,
+	targetInterval, minIdleTime, maxIdleTime time.Duration,
 	replicas replicaSet,
 ) *replicaScanner {
 	if targetInterval < 0 {
@@ -100,6 +101,7 @@ func newReplicaScanner(
 		AmbientContext: ambient,
 		clock:          clock,
 		targetInterval: targetInterval,
+		minIdleTime:    minIdleTime,
 		maxIdleTime:    maxIdleTime,
 		replicas:       replicas,
 		removed:        make(chan *Replica, 10),
@@ -190,6 +192,9 @@ func (rs *replicaScanner) paceInterval(start, now time.Time) time.Duration {
 		count = 1
 	}
 	interval := time.Duration(remainingNanos / int64(count))
+	if rs.minIdleTime > 0 && interval < rs.minIdleTime {
+		interval = rs.minIdleTime
+	}
 	if rs.maxIdleTime > 0 && interval > rs.maxIdleTime {
 		interval = rs.maxIdleTime
 	}
@@ -223,7 +228,7 @@ func (rs *replicaScanner) waitAndProcess(
 				log.Infof(ctx, "replica scanner processing %s", repl)
 			}
 			for _, q := range rs.queues {
-				q.MaybeAdd(repl, rs.clock.Now())
+				q.MaybeAddAsync(ctx, repl, rs.clock.Now())
 			}
 			return false
 
@@ -279,24 +284,25 @@ func (rs *replicaScanner) scanLoop(stopper *stop.Stopper) {
 				shouldStop = rs.waitAndProcess(ctx, stopper, start, nil)
 			}
 
-			shouldStop = shouldStop || nil != stopper.RunTask(
-				ctx, "storage.replicaScanner: scan loop",
-				func(ctx context.Context) {
-					// Increment iteration count.
-					rs.mu.Lock()
-					defer rs.mu.Unlock()
-					rs.mu.scanCount++
-					rs.mu.total += timeutil.Since(start)
-					if log.V(6) {
-						log.Infof(ctx, "reset replica scan iteration")
-					}
-
-					// Reset iteration and start time.
-					start = timeutil.Now()
-				})
+			// waitAndProcess returns true when the system is stopping. Note that this
+			// means we don't have to check the stopper as well.
 			if shouldStop {
 				return
 			}
+
+			// Increment iteration count.
+			func() {
+				rs.mu.Lock()
+				defer rs.mu.Unlock()
+				rs.mu.scanCount++
+				rs.mu.total += timeutil.Since(start)
+			}()
+			if log.V(6) {
+				log.Infof(ctx, "reset replica scan iteration")
+			}
+
+			// Reset iteration and start time.
+			start = timeutil.Now()
 		}
 	})
 }

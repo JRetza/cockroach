@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package rpc
 
@@ -24,7 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -80,6 +75,7 @@ type ManualHeartbeatService struct {
 	clock              *hlc.Clock
 	remoteClockMonitor *RemoteClockMonitor
 	version            *cluster.ExposedClusterVersion
+	nodeID             *base.NodeIDContainer
 	// Heartbeats are processed when a value is sent here.
 	ready   chan error
 	stopper *stop.Stopper
@@ -103,6 +99,7 @@ func (mhs *ManualHeartbeatService) Ping(
 		remoteClockMonitor: mhs.remoteClockMonitor,
 		clusterID:          &base.ClusterIDContainer{},
 		version:            mhs.version,
+		nodeID:             mhs.nodeID,
 	}
 	return hs.Ping(ctx, args)
 }
@@ -162,17 +159,22 @@ func TestClockOffsetMismatch(t *testing.T) {
 		}
 	}()
 
+	ctx := context.Background()
+
 	clock := hlc.NewClock(hlc.UnixNano, 250*time.Millisecond)
 	hs := &HeartbeatService{
 		clock:              clock,
 		remoteClockMonitor: newRemoteClockMonitor(clock, time.Hour, 0),
+		clusterID:          &base.ClusterIDContainer{},
 		version:            &cluster.MakeTestingClusterSettings().Version,
 	}
+	hs.clusterID.Set(ctx, uuid.Nil)
 
 	request := &PingRequest{
 		Ping:           "testManual",
 		Addr:           "test",
 		MaxOffsetNanos: (500 * time.Millisecond).Nanoseconds(),
+		ServerVersion:  hs.version.Version().Version,
 	}
 	response, err := hs.Ping(context.Background(), request)
 	t.Fatalf("should not have reached but got response=%v err=%v", response, err)
@@ -223,67 +225,43 @@ func TestClusterIDCompare(t *testing.T) {
 	}
 }
 
-// Test version compatibility check in Ping handler. Note that version
-// compatibility is also checked on the ping request side. This is tested in
-// context_test.TestVersionCheckBidirectional.
-func TestVersionCheck(t *testing.T) {
+func TestNodeIDCompare(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-
-	empty := roachpb.Version{}
-
-	// Version before the version check was implemented
-	v0 := cluster.VersionByKey(cluster.VersionRPCNetworkStats)
-
-	// Version where the check was implemented
-	v1 := cluster.VersionByKey(cluster.VersionRPCVersionCheck)
-
-	// Next version after
-	v2 := cluster.VersionByKey(cluster.VersionRPCVersionCheck)
-	v2.Unstable++
-
 	testData := []struct {
-		name           string
-		clusterVersion roachpb.Version
-		clientVersion  roachpb.Version
-		expectError    bool
+		name         string
+		serverNodeID roachpb.NodeID
+		clientNodeID roachpb.NodeID
+		expectError  bool
 	}{
-		{"clientVersion == clusterVersion", v1, v1, false},
-		{"clientVersion > clusterVersion", v1, v2, false},
-		{"clientVersion < clusterVersion", v2, v1, true},
-		{"clusterVersion missing success", v0, empty, false},
-		{"clientVersion missing fail", v1, empty, true},
+		{"node IDs match", 1, 1, false},
+		{"their node ID missing", 1, 0, false},
+		{"our node ID missing", 0, 1, true},
+		{"both node IDs missing", 0, 0, false},
+		{"node ID mismatch", 1, 2, true},
 	}
 
 	manual := hlc.NewManualClock(5)
 	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
+	version := &cluster.MakeTestingClusterSettings().Version
 	heartbeat := &HeartbeatService{
 		clock:              clock,
 		remoteClockMonitor: newRemoteClockMonitor(clock, time.Hour, 0),
 		clusterID:          &base.ClusterIDContainer{},
+		nodeID:             &base.NodeIDContainer{},
+		version:            version,
 	}
 
 	for _, td := range testData {
 		t.Run(td.name, func(t *testing.T) {
-			settings := cluster.MakeClusterSettings(td.clusterVersion, td.clusterVersion)
-			cv := cluster.ClusterVersion{
-				MinimumVersion: td.clusterVersion,
-				UseVersion:     td.clusterVersion,
-			}
-			if err := settings.InitializeVersion(cv); err != nil {
-				t.Fatal(err)
-			}
-			heartbeat.version = &settings.Version
-
+			heartbeat.nodeID.Reset(td.serverNodeID)
 			request := &PingRequest{
 				Ping:          "testPing",
-				ServerVersion: td.clientVersion,
+				NodeID:        td.clientNodeID,
+				ServerVersion: version.ServerVersion,
 			}
 			_, err := heartbeat.Ping(context.Background(), request)
-			if td.expectError {
-				expected := "version compatibility check failed"
-				if !testutils.IsError(err, expected) {
-					t.Errorf("expected %s error, got %v", expected, err)
-				}
+			if td.expectError && err == nil {
+				t.Error("expected node ID mismatch error")
 			}
 			if !td.expectError && err != nil {
 				t.Errorf("unexpected error: %s", err)

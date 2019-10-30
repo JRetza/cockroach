@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -21,7 +17,6 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
@@ -108,10 +103,15 @@ func (q *rangeIDQueue) back() *rangeIDChunk {
 }
 
 type raftProcessor interface {
+	// Process a raft.Ready struct containing entries and messages that are
+	// ready to read, be saved to stable storage, committed, or sent to other
+	// peers.
 	processReady(context.Context, roachpb.RangeID)
-	processRequestQueue(context.Context, roachpb.RangeID)
-	// Process a raft tick for the specified range. Return true if the range
-	// should be queued for ready processing.
+	// Process all queued messages for the specified range.
+	// Return true if the range should be queued for ready processing.
+	processRequestQueue(context.Context, roachpb.RangeID) bool
+	// Process a raft tick for the specified range.
+	// Return true if the range should be queued for ready processing.
 	processTick(context.Context, roachpb.RangeID) bool
 }
 
@@ -140,7 +140,7 @@ type raftScheduler struct {
 }
 
 func newRaftScheduler(
-	ambient log.AmbientContext, metrics *StoreMetrics, processor raftProcessor, numWorkers int,
+	metrics *StoreMetrics, processor raftProcessor, numWorkers int,
 ) *raftScheduler {
 	s := &raftScheduler{
 		processor:  processor,
@@ -204,6 +204,17 @@ func (s *raftScheduler) worker(ctx context.Context) {
 		s.mu.state[id] = stateQueued
 		s.mu.Unlock()
 
+		// Process requests first. This avoids a scenario where a tick and a
+		// "quiesce" message are processed in the same iteration and intervening
+		// raft ready processing unquiesces the replica because the tick triggers
+		// an election.
+		if state&stateRaftRequest != 0 {
+			// processRequestQueue returns true if the range should perform ready
+			// processing. Do not reorder this below the call to processReady.
+			if s.processor.processRequestQueue(ctx, id) {
+				state |= stateRaftReady
+			}
+		}
 		if state&stateRaftTick != 0 {
 			// processRaftTick returns true if the range should perform ready
 			// processing. Do not reorder this below the call to processReady.
@@ -213,17 +224,6 @@ func (s *raftScheduler) worker(ctx context.Context) {
 		}
 		if state&stateRaftReady != 0 {
 			s.processor.processReady(ctx, id)
-		}
-		// Process requests last. This avoids a scenario where a tick and a
-		// "quiesce" message are processed in the same iteration and intervening
-		// raft ready processing unquiesced the replica. Note that request
-		// processing could also occur first, it just shouldn't occur in between
-		// ticking and ready processing. It is possible for a tick to be enqueued
-		// concurrently with the quiescing in which case the replica will
-		// unquiesce when the tick is processed, but we'll wake the leader in
-		// that case.
-		if state&stateRaftRequest != 0 {
-			s.processor.processRequestQueue(ctx, id)
 		}
 
 		s.mu.Lock()

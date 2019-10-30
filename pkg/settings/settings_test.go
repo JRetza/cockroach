@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package settings_test
 
@@ -25,7 +21,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/require"
 )
+
+const maxSettings = 256
 
 type dummy struct {
 	msg1       string
@@ -120,24 +119,24 @@ var changes = struct {
 	mA       int
 }{}
 
-var boolTA = settings.RegisterBoolSetting("bool.t", "", true)
-var boolFA = settings.RegisterBoolSetting("bool.f", "", false)
-var strFooA = settings.RegisterStringSetting("str.foo", "", "")
-var strBarA = settings.RegisterStringSetting("str.bar", "", "bar")
-var i1A = settings.RegisterIntSetting("i.1", "", 0)
-var i2A = settings.RegisterIntSetting("i.2", "", 5)
-var fA = settings.RegisterFloatSetting("f", "", 5.4)
-var dA = settings.RegisterDurationSetting("d", "", time.Second)
-var eA = settings.RegisterEnumSetting("e", "", "foo", map[int64]string{1: "foo", 2: "bar", 3: "baz"})
-var byteSize = settings.RegisterByteSizeSetting("zzz", "", mb)
+var boolTA = settings.RegisterBoolSetting("bool.t", "desc", true)
+var boolFA = settings.RegisterBoolSetting("bool.f", "desc", false)
+var strFooA = settings.RegisterStringSetting("str.foo", "desc", "")
+var strBarA = settings.RegisterStringSetting("str.bar", "desc", "bar")
+var i1A = settings.RegisterIntSetting("i.1", "desc", 0)
+var i2A = settings.RegisterIntSetting("i.2", "desc", 5)
+var fA = settings.RegisterFloatSetting("f", "desc", 5.4)
+var dA = settings.RegisterDurationSetting("d", "desc", time.Second)
+var eA = settings.RegisterEnumSetting("e", "desc", "foo", map[int64]string{1: "foo", 2: "bar", 3: "baz"})
+var byteSize = settings.RegisterByteSizeSetting("zzz", "desc", mb)
 var mA = settings.RegisterStateMachineSetting("statemachine", "foo", dummyTransformer)
 
 func init() {
-	settings.RegisterBoolSetting("sekretz", "", false).Hide()
+	settings.RegisterBoolSetting("sekretz", "desc", false).SetConfidential()
 }
 
 var strVal = settings.RegisterValidatedStringSetting(
-	"str.val", "", "", func(sv *settings.Values, v string) error {
+	"str.val", "desc", "", func(sv *settings.Values, v string) error {
 		for _, c := range v {
 			if !unicode.IsLetter(c) {
 				return errors.Errorf("not all runes of %s are letters: %c", v, c)
@@ -145,17 +144,17 @@ var strVal = settings.RegisterValidatedStringSetting(
 		}
 		return nil
 	})
-var dVal = settings.RegisterNonNegativeDurationSetting("dVal", "", time.Second)
-var fVal = settings.RegisterNonNegativeFloatSetting("fVal", "", 5.4)
+var dVal = settings.RegisterNonNegativeDurationSetting("dVal", "desc", time.Second)
+var fVal = settings.RegisterNonNegativeFloatSetting("fVal", "desc", 5.4)
 var byteSizeVal = settings.RegisterValidatedByteSizeSetting(
-	"byteSize.Val", "", mb, func(v int64) error {
+	"byteSize.Val", "desc", mb, func(v int64) error {
 		if v < 0 {
 			return errors.Errorf("bytesize cannot be negative")
 		}
 		return nil
 	})
 var iVal = settings.RegisterValidatedIntSetting(
-	"i.Val", "", 0, func(v int64) error {
+	"i.Val", "desc", 0, func(v int64) error {
 		if v < 0 {
 			return errors.Errorf("int cannot be negative")
 		}
@@ -615,4 +614,110 @@ func TestHide(t *testing.T) {
 	if _, ok := keys["sekretz"]; ok {
 		t.Errorf("expected 'sekretz' to be hidden")
 	}
+}
+
+func TestOnChangeWithMaxSettings(t *testing.T) {
+	// Register maxSettings settings to ensure that no errors occur.
+	maxName, err := batchRegisterSettings(t, t.Name(), maxSettings-1-len(settings.Keys()))
+	if err != nil {
+		t.Errorf("expected no error to register 128 settings, but get error : %s", err)
+	}
+
+	// Change the max slotIdx setting to ensure that no errors occur.
+	sv := &settings.Values{}
+	sv.Init(settings.TestOpaque)
+	var changes int
+	intSetting, ok := settings.Lookup(maxName)
+	if !ok {
+		t.Errorf("expected lookup of %s to succeed", maxName)
+	}
+	intSetting.SetOnChange(sv, func() { changes++ })
+
+	u := settings.NewUpdater(sv)
+	if err := u.Set(maxName, settings.EncodeInt(9), "i"); err != nil {
+		t.Fatal(err)
+	}
+
+	if changes != 1 {
+		t.Errorf("expected the max slot setting changed")
+	}
+}
+
+func TestMaxSettingsPanics(t *testing.T) {
+	var origRegistry = make(map[string]settings.Setting)
+	for k, v := range settings.Registry {
+		origRegistry[k] = v
+	}
+	defer func() {
+		settings.Registry = origRegistry
+	}()
+
+	// Register too many settings which will cause a panic which is caught and converted to an error.
+	_, err := batchRegisterSettings(t, t.Name(), maxSettings-len(settings.Keys()))
+	expectedErr := "too many settings; increase maxSettings"
+	if err == nil || err.Error() != expectedErr {
+		t.Errorf("expected error %v, but got %v", expectedErr, err)
+	}
+
+}
+
+func batchRegisterSettings(t *testing.T, keyPrefix string, count int) (name string, err error) {
+	defer func() {
+		// Catch panic and convert it to an error.
+		if r := recover(); r != nil {
+			// Check exactly what the panic was and create error.
+			switch x := r.(type) {
+			case string:
+				err = errors.New(x)
+			case error:
+				err = x
+			default:
+				err = errors.Errorf("unknown panic: %v", x)
+			}
+		}
+	}()
+	for i := 0; i < count; i++ {
+		name = fmt.Sprintf("%s_%3d", keyPrefix, i)
+		settings.RegisterValidatedIntSetting(name, "desc", 0, nil)
+	}
+	return name, err
+}
+
+var overrideBool = settings.RegisterBoolSetting("override.bool", "desc", true)
+var overrideInt = settings.RegisterIntSetting("override.int", "desc", 0)
+var overrideDuration = settings.RegisterDurationSetting("override.duration", "desc", time.Second)
+var overrideFloat = settings.RegisterFloatSetting("override.float", "desc", 1.0)
+
+func TestOverride(t *testing.T) {
+	sv := &settings.Values{}
+	sv.Init(settings.TestOpaque)
+
+	// Test override for bool setting.
+	require.Equal(t, true, overrideBool.Get(sv))
+	overrideBool.Override(sv, false)
+	require.Equal(t, false, overrideBool.Get(sv))
+	u := settings.NewUpdater(sv)
+	u.ResetRemaining()
+	require.Equal(t, false, overrideBool.Get(sv))
+
+	// Test override for int setting.
+	require.Equal(t, int64(0), overrideInt.Get(sv))
+	overrideInt.Override(sv, 42)
+	require.Equal(t, int64(42), overrideInt.Get(sv))
+	u.ResetRemaining()
+	require.Equal(t, int64(42), overrideInt.Get(sv))
+
+	// Test override for duration setting.
+	require.Equal(t, time.Second, overrideDuration.Get(sv))
+	overrideDuration.Override(sv, 42*time.Second)
+	require.Equal(t, 42*time.Second, overrideDuration.Get(sv))
+	u.ResetRemaining()
+	require.Equal(t, 42*time.Second, overrideDuration.Get(sv))
+
+	// Test override for float setting.
+	require.Equal(t, 1.0, overrideFloat.Get(sv))
+	overrideFloat.Override(sv, 42.0)
+	require.Equal(t, 42.0, overrideFloat.Get(sv))
+	u.ResetRemaining()
+	require.Equal(t, 42.0, overrideFloat.Get(sv))
 }

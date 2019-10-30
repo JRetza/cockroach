@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -20,28 +16,45 @@ import (
 	"crypto/sha512"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
-
-	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/storage/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/rditer"
 	"github.com/cockroachdb/cockroach/pkg/storage/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
+	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/pkg/errors"
 )
+
+// fatalOnStatsMismatch, if true, turns stats mismatches into fatal errors. A
+// stats mismatch is the event in which
+// - the consistency checker finds that all replicas are consistent
+//   (i.e. byte-by-byte identical)
+// - the (identical) stats tracked in them do not correspond to a recomputation
+//   via the data, i.e. the stats were incorrect
+// - ContainsEstimates==false, i.e. the stats claimed they were correct.
+//
+// Before issuing the fatal error, the cluster bootstrap version is verified.
+// We know that old versions of CockroachDB sometimes violated this invariant,
+// but we want to exclude these violations, focusing only on cases in which we
+// know old CRDB versions (<19.1 at time of writing) were not involved.
+var fatalOnStatsMismatch = envutil.EnvOrDefaultBool("COCKROACH_ENFORCE_CONSISTENT_STATS", false)
 
 const (
 	// collectChecksumTimeout controls how long we'll wait to collect a checksum
@@ -49,76 +62,189 @@ const (
 	// because the checksum might never be computed for a replica if that replica
 	// is caught up via a snapshot and never performs the ComputeChecksum
 	// operation.
-	collectChecksumTimeout = 5 * time.Second
+	collectChecksumTimeout = 15 * time.Second
 )
+
+// ReplicaChecksum contains progress on a replica checksum computation.
+type ReplicaChecksum struct {
+	CollectChecksumResponse
+	// started is true if the checksum computation has started.
+	started bool
+	// If gcTimestamp is nonzero, GC this checksum after gcTimestamp. gcTimestamp
+	// is zero if and only if the checksum computation is in progress.
+	gcTimestamp time.Time
+	// This channel is closed after the checksum is computed, and is used
+	// as a notification.
+	notify chan struct{}
+}
 
 // CheckConsistency runs a consistency check on the range. It first applies a
 // ComputeChecksum through Raft and then issues CollectChecksum commands to the
-// other replicas. When an inconsistency is detected and no diff was requested,
-// the consistency check will be re-run to collect a diff, which is then printed
-// before calling `log.Fatal`.
+// other replicas. These are inspected and a CheckConsistencyResponse is assembled.
+//
+// When args.Mode is CHECK_VIA_QUEUE and an inconsistency is detected and no
+// diff was requested, the consistency check will be re-run to collect a diff,
+// which is then printed before calling `log.Fatal`. This behavior should be
+// lifted to the consistency checker queue in the future.
 func (r *Replica) CheckConsistency(
 	ctx context.Context, args roachpb.CheckConsistencyRequest,
 ) (roachpb.CheckConsistencyResponse, *roachpb.Error) {
-	desc := r.Desc()
-	key := desc.StartKey.AsRawKey()
-	// Keep the request from crossing the local->global boundary.
-	if bytes.Compare(key, keys.LocalMax) < 0 {
-		key = keys.LocalMax
-	}
-	endKey := desc.EndKey.AsRawKey()
-	id := uuid.MakeV4()
+	startKey := r.Desc().StartKey.AsRawKey()
 
 	checkArgs := roachpb.ComputeChecksumRequest{
-		Span: roachpb.Span{
-			Key:    key,
-			EndKey: endKey,
-		},
-		Version:    batcheval.ReplicaChecksumVersion,
-		ChecksumID: id,
-		Snapshot:   args.WithDiff,
+		RequestHeader: roachpb.RequestHeader{Key: startKey},
+		Version:       batcheval.ReplicaChecksumVersion,
+		Snapshot:      args.WithDiff,
+		Mode:          args.Mode,
+		Checkpoint:    args.Checkpoint,
+		Terminate:     args.Terminate,
 	}
+
+	isQueue := args.Mode == roachpb.ChecksumMode_CHECK_VIA_QUEUE
 
 	results, err := r.RunConsistencyCheck(ctx, checkArgs)
 	if err != nil {
 		return roachpb.CheckConsistencyResponse{}, roachpb.NewError(err)
 	}
 
-	var inconsistencyCount int
+	res := roachpb.CheckConsistencyResponse_Result{}
+	res.RangeID = r.RangeID
 
-	for _, result := range results {
-		expResponse := results[0].Response
-		if result.Err != nil || bytes.Equal(expResponse.Checksum, result.Response.Checksum) {
+	shaToIdxs := map[string][]int{}
+	var missing []ConsistencyCheckResult
+	for i, result := range results {
+		if result.Err != nil {
+			missing = append(missing, result)
 			continue
 		}
-		inconsistencyCount++
-		var buf bytes.Buffer
-		_, _ = fmt.Fprintf(&buf, "replica %s is inconsistent: expected checksum %x, got %x",
-			result.Replica, expResponse.Checksum, result.Response.Checksum)
-		if expResponse.Snapshot != nil && result.Response.Snapshot != nil {
-			diff := diffRange(expResponse.Snapshot, result.Response.Snapshot)
-			if report := r.store.cfg.TestingKnobs.BadChecksumReportDiff; report != nil {
-				report(r.store.Ident, diff)
-			}
-			buf.WriteByte('\n')
-			_, _ = diff.WriteTo(&buf)
-		}
-		log.Error(ctx, buf.String())
+		s := string(result.Response.Checksum)
+		shaToIdxs[s] = append(shaToIdxs[s], i)
 	}
 
-	if inconsistencyCount == 0 {
+	// When replicas diverge, anecdotally often the minority (usually of size
+	// one) is in the wrong. If there's more than one smallest minority (for
+	// example, if three replicas all return different hashes) we pick any of
+	// them.
+	var minoritySHA string
+	if len(shaToIdxs) > 1 {
+		for sha, idxs := range shaToIdxs {
+			if minoritySHA == "" || len(shaToIdxs[minoritySHA]) > len(idxs) {
+				minoritySHA = sha
+			}
+		}
+	}
+
+	// There is an inconsistency if and only if there is a minority SHA.
+
+	if minoritySHA != "" {
+		var buf bytes.Buffer
+		for sha, idxs := range shaToIdxs {
+			minority := ""
+			if sha == minoritySHA {
+				minority = " [minority]"
+			}
+			for _, idx := range idxs {
+				_, _ = fmt.Fprintf(&buf, "%s: checksum %x%s\n"+
+					"- stats: %+v\n"+
+					"- stats.Sub(recomputation): %+v\n",
+					&results[idx].Replica,
+					sha,
+					minority,
+					&results[idx].Response.Persisted,
+					&results[idx].Response.Delta,
+				)
+			}
+			minoritySnap := results[shaToIdxs[minoritySHA][0]].Response.Snapshot
+			curSnap := results[shaToIdxs[sha][0]].Response.Snapshot
+			if sha != minoritySHA && minoritySnap != nil && curSnap != nil {
+				diff := diffRange(curSnap, minoritySnap)
+				if report := r.store.cfg.TestingKnobs.ConsistencyTestingKnobs.BadChecksumReportDiff; report != nil {
+					report(*r.store.Ident, diff)
+				}
+				_, _ = fmt.Fprintf(&buf, "====== diff(%x, [minority]) ======\n", sha)
+				_, _ = diff.WriteTo(&buf)
+			}
+		}
+
+		if isQueue {
+			log.Error(ctx, buf.String())
+		}
+		res.Detail += buf.String()
+	} else {
+		res.Detail += fmt.Sprintf("stats: %+v\n", results[0].Response.Persisted)
+	}
+	for _, result := range missing {
+		res.Detail += fmt.Sprintf("%s: error: %v\n", result.Replica, result.Err)
+	}
+
+	delta := enginepb.MVCCStats(results[0].Response.Delta)
+	var haveDelta bool
+	{
+		d2 := delta
+		d2.AgeTo(0)
+		haveDelta = d2 != enginepb.MVCCStats{}
+	}
+
+	res.StartKey = []byte(startKey)
+	res.Status = roachpb.CheckConsistencyResponse_RANGE_CONSISTENT
+	if minoritySHA != "" {
+		res.Status = roachpb.CheckConsistencyResponse_RANGE_INCONSISTENT
+	} else if args.Mode != roachpb.ChecksumMode_CHECK_STATS && haveDelta {
+		if delta.ContainsEstimates {
+			// When ContainsEstimates is set, it's generally expected that we'll get a different
+			// result when we recompute from scratch.
+			res.Status = roachpb.CheckConsistencyResponse_RANGE_CONSISTENT_STATS_ESTIMATED
+		} else {
+			// When ContainsEstimates is set, it's generally expected that we'll get a different
+			// result when we recompute from scratch.
+			res.Status = roachpb.CheckConsistencyResponse_RANGE_CONSISTENT_STATS_INCORRECT
+		}
+		res.Detail += fmt.Sprintf("stats - recomputation: %+v\n", enginepb.MVCCStats(results[0].Response.Delta))
+	} else if len(missing) > 0 {
+		// No inconsistency was detected, but we didn't manage to inspect all replicas.
+		res.Status = roachpb.CheckConsistencyResponse_RANGE_INDETERMINATE
+	}
+	var resp roachpb.CheckConsistencyResponse
+	resp.Result = append(resp.Result, res)
+
+	// Bail out at this point except if the queue is the caller. All of the stuff
+	// below should really happen in the consistency queue to keep CheckConsistency
+	// itself self-contained.
+	if !isQueue {
+		return resp, nil
+	}
+
+	if minoritySHA == "" {
 		// The replicas were in sync. Check that the MVCCStats haven't diverged from
 		// what they should be. This code originated in the realization that there
 		// were many bugs in our stats computations. These are being fixed, but it
 		// is through this mechanism that existing ranges are updated. Hence, the
 		// logging below is relatively timid.
-		delta := enginepb.MVCCStats(results[0].Response.Delta)
-		delta.LastUpdateNanos = 0
-		// If there's no delta (or some nodes in the cluster may not know
-		// RecomputeStats, in which case sending it to them could crash them),
-		// there's nothing else to do.
-		if delta == (enginepb.MVCCStats{}) || !r.ClusterSettings().Version.IsMinSupported(cluster.VersionRecomputeStats) {
-			return roachpb.CheckConsistencyResponse{}, nil
+
+		// If there's no delta, there's nothing else to do.
+		if !haveDelta {
+			return resp, nil
+		}
+
+		if !delta.ContainsEstimates && fatalOnStatsMismatch {
+			// ContainsEstimates is true if the replica's persisted MVCCStats had ContainsEstimates set.
+			// If this was *not* the case, the replica believed it had accurate stats. But we just found
+			// out that this isn't true.
+
+			var v roachpb.Version
+			if err := r.store.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+				return txn.GetProto(ctx, keys.BootstrapVersionKey, &v)
+			}); err != nil {
+				log.Infof(ctx, "while retrieving cluster bootstrap version: %s", err)
+				// Intentionally continue with the assumption that it's the current version.
+				v = r.store.cfg.Settings.Version.Version().Version
+			}
+			// For clusters that ever ran <19.1, we're not so sure that the stats are
+			// consistent. Verify this only for clusters that started out on 19.1 or
+			// higher.
+			if !v.Less(roachpb.Version{Major: 19, Minor: 1}) {
+				log.Fatalf(ctx, "found a delta of %+v", log.Safe(delta))
+			}
 		}
 
 		// We've found that there's something to correct; send an RecomputeStatsRequest. Note that this
@@ -129,42 +255,49 @@ func (r *Replica) CheckConsistency(
 		log.Infof(ctx, "triggering stats recomputation to resolve delta of %+v", results[0].Response.Delta)
 
 		req := roachpb.RecomputeStatsRequest{
-			Span: roachpb.Span{Key: desc.StartKey.AsRawKey()},
+			RequestHeader: roachpb.RequestHeader{Key: startKey},
 		}
 
 		var b client.Batch
 		b.AddRawRequest(&req)
 
 		err := r.store.db.Run(ctx, &b)
-		return roachpb.CheckConsistencyResponse{}, roachpb.NewError(err)
+		return resp, roachpb.NewError(err)
 	}
 
-	logFunc := log.Fatalf
-	if p := r.store.TestingKnobs().BadChecksumPanic; p != nil {
-		if !args.WithDiff {
-			// We'll call this recursively with WithDiff==true; let's let that call
-			// be the one to trigger the handler.
-			p(r.store.Ident)
-		}
-		logFunc = log.Errorf
-	}
-
-	// Diff was printed above, so call logFunc with a short message only.
 	if args.WithDiff {
-		logFunc(ctx, "consistency check failed with %d inconsistent replicas", inconsistencyCount)
-		return roachpb.CheckConsistencyResponse{}, nil
+		// A diff was already printed. Return because all the code below will do
+		// is request another consistency check, with a diff and with
+		// instructions to terminate the minority nodes.
+		log.Errorf(ctx, "consistency check failed")
+		return resp, nil
 	}
 
 	// No diff was printed, so we want to re-run with diff.
-	// Note that this will call Fatal recursively in `CheckConsistency` (in the code above).
-	log.Errorf(ctx, "consistency check failed with %d inconsistent replicas; fetching details",
-		inconsistencyCount)
-	if err := r.store.db.CheckConsistency(ctx, key, endKey, true /* withDiff */); err != nil {
-		logFunc(ctx, "replica inconsistency detected; could not obtain actual diff: %s", err)
+	// Note that this recursive call will be terminated in the `args.WithDiff`
+	// branch above.
+	args.WithDiff = true
+	args.Checkpoint = true
+	for _, idxs := range shaToIdxs[minoritySHA] {
+		args.Terminate = append(args.Terminate, results[idxs].Replica)
+	}
+	log.Errorf(ctx, "consistency check failed; fetching details and shutting down minority %v", args.Terminate)
+
+	// We've noticed in practice that if the snapshot diff is large, the log
+	// file in it is promptly rotated away, so up the limits while the diff
+	// printing occurs.
+	//
+	// See:
+	// https://github.com/cockroachdb/cockroach/issues/36861
+	oldLogLimit := atomic.LoadInt64(&log.LogFilesCombinedMaxSize)
+	atomic.CompareAndSwapInt64(&log.LogFilesCombinedMaxSize, oldLogLimit, math.MaxInt64)
+	defer atomic.CompareAndSwapInt64(&log.LogFilesCombinedMaxSize, math.MaxInt64, oldLogLimit)
+
+	if _, pErr := r.CheckConsistency(ctx, args); pErr != nil {
+		log.Errorf(ctx, "replica inconsistency detected; could not obtain actual diff: %s", pErr)
 	}
 
-	// Not reached except in tests.
-	return roachpb.CheckConsistencyResponse{}, nil
+	return resp, nil
 }
 
 // A ConsistencyCheckResult contains the outcome of a CollectChecksum call.
@@ -177,22 +310,17 @@ type ConsistencyCheckResult struct {
 func (r *Replica) collectChecksumFromReplica(
 	ctx context.Context, replica roachpb.ReplicaDescriptor, id uuid.UUID, checksum []byte,
 ) (CollectChecksumResponse, error) {
-	addr, err := r.store.cfg.Transport.resolver(replica.NodeID)
-	if err != nil {
-		return CollectChecksumResponse{}, errors.Wrapf(err, "could not resolve node ID %d",
-			replica.NodeID)
-	}
-	conn, err := r.store.cfg.Transport.rpcContext.GRPCDial(addr.String()).Connect(ctx)
+	conn, err := r.store.cfg.NodeDialer.Dial(ctx, replica.NodeID, rpc.DefaultClass)
 	if err != nil {
 		return CollectChecksumResponse{},
-			errors.Wrapf(err, "could not dial node ID %d address %s", replica.NodeID, addr)
+			errors.Wrapf(err, "could not dial node ID %d", replica.NodeID)
 	}
-	client := NewConsistencyClient(conn)
+	client := NewPerReplicaClient(conn)
 	req := &CollectChecksumRequest{
-		StoreRequestHeader{NodeID: replica.NodeID, StoreID: replica.StoreID},
-		r.RangeID,
-		id,
-		checksum,
+		StoreRequestHeader: StoreRequestHeader{NodeID: replica.NodeID, StoreID: replica.StoreID},
+		RangeID:            r.RangeID,
+		ChecksumID:         id,
+		Checksum:           checksum,
 	}
 	resp, err := client.CollectChecksum(ctx, req)
 	if err != nil {
@@ -210,14 +338,11 @@ func (r *Replica) RunConsistencyCheck(
 ) ([]ConsistencyCheckResult, error) {
 	// Send a ComputeChecksum which will trigger computation of the checksum on
 	// all replicas.
-	{
-		var b client.Batch
-		b.AddRawRequest(&req)
-
-		if err := r.store.db.Run(ctx, &b); err != nil {
-			return nil, err
-		}
+	res, pErr := client.SendWrapped(ctx, r.store.db.NonTransactionalSender(), &req)
+	if pErr != nil {
+		return nil, pErr.GoError()
 	}
+	ccRes := res.(*roachpb.ComputeChecksumResponse)
 
 	var orderedReplicas []roachpb.ReplicaDescriptor
 	{
@@ -229,7 +354,7 @@ func (r *Replica) RunConsistencyCheck(
 
 		// Move the local replica to the front (which makes it the "master"
 		// we're comparing against).
-		orderedReplicas = append(orderedReplicas, desc.Replicas...)
+		orderedReplicas = append(orderedReplicas, desc.Replicas().All()...)
 
 		sort.Slice(orderedReplicas, func(i, j int) bool {
 			return orderedReplicas[i] == localReplica
@@ -247,14 +372,17 @@ func (r *Replica) RunConsistencyCheck(
 			func(ctx context.Context) {
 				defer wg.Done()
 
-				ctx, cancel := context.WithTimeout(ctx, collectChecksumTimeout)
-				defer cancel()
-
-				var masterChecksum []byte
-				if len(results) > 0 {
-					masterChecksum = results[0].Response.Checksum
-				}
-				resp, err := r.collectChecksumFromReplica(ctx, replica, req.ChecksumID, masterChecksum)
+				var resp CollectChecksumResponse
+				err := contextutil.RunWithTimeout(ctx, "collect checksum", collectChecksumTimeout,
+					func(ctx context.Context) error {
+						var masterChecksum []byte
+						if len(results) > 0 {
+							masterChecksum = results[0].Response.Checksum
+						}
+						var err error
+						resp, err = r.collectChecksumFromReplica(ctx, replica, ccRes.ChecksumID, masterChecksum)
+						return err
+					})
 				resultCh <- ConsistencyCheckResult{
 					Replica:  replica,
 					Response: resp,
@@ -300,6 +428,9 @@ func (r *Replica) getChecksum(ctx context.Context, id uuid.UUID) (ReplicaChecksu
 	r.gcOldChecksumEntriesLocked(now)
 	c, ok := r.mu.checksums[id]
 	if !ok {
+		// TODO(tbg): we need to unconditionally set a gcTimestamp or this
+		// request can simply get stuck forever or cancel anyway and leak an
+		// entry in r.mu.checksums.
 		if d, dOk := ctx.Deadline(); dOk {
 			c.gcTimestamp = d
 		}
@@ -323,12 +454,11 @@ func (r *Replica) getChecksum(ctx context.Context, id uuid.UUID) (ReplicaChecksu
 	r.mu.RLock()
 	c, ok = r.mu.checksums[id]
 	r.mu.RUnlock()
-	if !ok {
-		return ReplicaChecksum{}, errors.Errorf("no map entry for checksum (ID = %s)", id)
-	}
-	if c.Checksum == nil {
-		return ReplicaChecksum{}, errors.Errorf(
-			"checksum is nil, most likely because the async computation could not be run (ID = %s)", id)
+	// If the checksum wasn't found or the checksum could not be computed, error out.
+	// The latter case can occur when there's a version mismatch or, more generally,
+	// when the (async) checksum computation fails.
+	if !ok || c.Checksum == nil {
+		return ReplicaChecksum{}, errors.Errorf("no checksum found (ID = %s)", id)
 	}
 	return c, nil
 }
@@ -347,6 +477,7 @@ func (r *Replica) computeChecksumDone(
 			delta := result.PersistedMS
 			delta.Subtract(result.RecomputedMS)
 			c.Delta = enginepb.MVCCStatsDelta(delta)
+			c.Persisted = result.PersistedMS
 		}
 		c.gcTimestamp = timeutil.Now().Add(batcheval.ReplicaChecksumGCInterval)
 		c.Snapshot = snapshot
@@ -373,27 +504,21 @@ func (r *Replica) sha512(
 	desc roachpb.RangeDescriptor,
 	snap engine.Reader,
 	snapshot *roachpb.RaftSnapshotData,
+	mode roachpb.ChecksumMode,
 ) (*replicaHash, error) {
-	legacyTombstoneKey := engine.MakeMVCCMetadataKey(keys.RaftTombstoneIncorrectLegacyKey(desc.RangeID))
+	statsOnly := mode == roachpb.ChecksumMode_CHECK_STATS
 
 	// Iterate over all the data in the range.
-	iter := snap.NewIterator(engine.IterOptions{})
+	iter := snap.NewIterator(engine.IterOptions{UpperBound: desc.EndKey.AsRawKey()})
 	defer iter.Close()
 
 	var alloc bufalloc.ByteAllocator
+	var intBuf [8]byte
+	var legacyTimestamp hlc.LegacyTimestamp
+	var timestampBuf []byte
 	hasher := sha512.New()
 
-	var legacyTimestamp hlc.LegacyTimestamp
 	visitor := func(unsafeKey engine.MVCCKey, unsafeValue []byte) error {
-		if unsafeKey.Equal(legacyTombstoneKey) {
-			// Skip the tombstone key which is marked as replicated even though it
-			// isn't.
-			//
-			// TODO(peter): Figure out a way to migrate this key to the unreplicated
-			// key space.
-			return nil
-		}
-
 		if snapshot != nil {
 			// Add (a copy of) the kv pair into the debug message.
 			kv := roachpb.RaftSnapshotData_KeyValue{
@@ -405,47 +530,88 @@ func (r *Replica) sha512(
 		}
 
 		// Encode the length of the key and value.
-		if err := binary.Write(hasher, binary.LittleEndian, int64(len(unsafeKey.Key))); err != nil {
+		binary.LittleEndian.PutUint64(intBuf[:], uint64(len(unsafeKey.Key)))
+		if _, err := hasher.Write(intBuf[:]); err != nil {
 			return err
 		}
-		if err := binary.Write(hasher, binary.LittleEndian, int64(len(unsafeValue))); err != nil {
+		binary.LittleEndian.PutUint64(intBuf[:], uint64(len(unsafeValue)))
+		if _, err := hasher.Write(intBuf[:]); err != nil {
 			return err
 		}
 		if _, err := hasher.Write(unsafeKey.Key); err != nil {
 			return err
 		}
 		legacyTimestamp = hlc.LegacyTimestamp(unsafeKey.Timestamp)
-		timestamp, err := protoutil.Marshal(&legacyTimestamp)
-		if err != nil {
+		if size := legacyTimestamp.Size(); size > cap(timestampBuf) {
+			timestampBuf = make([]byte, size)
+		} else {
+			timestampBuf = timestampBuf[:size]
+		}
+		if _, err := protoutil.MarshalToWithoutFuzzing(&legacyTimestamp, timestampBuf); err != nil {
 			return err
 		}
-		if _, err := hasher.Write(timestamp); err != nil {
+		if _, err := hasher.Write(timestampBuf); err != nil {
 			return err
 		}
-		_, err = hasher.Write(unsafeValue)
+		_, err := hasher.Write(unsafeValue)
 		return err
 	}
 
 	var ms enginepb.MVCCStats
-	for _, span := range rditer.MakeReplicatedKeyRanges(&desc) {
-		spanMS, err := engine.ComputeStatsGo(
-			iter, span.Start, span.End, 0 /* nowNanos */, visitor,
-		)
-		if err != nil {
-			return nil, err
+	// In statsOnly mode, we hash only the RangeAppliedState. In regular mode, hash
+	// all of the replicated key space.
+	if !statsOnly {
+		for _, span := range rditer.MakeReplicatedKeyRanges(&desc) {
+			spanMS, err := engine.ComputeStatsGo(
+				iter, span.Start.Key, span.End.Key, 0 /* nowNanos */, visitor,
+			)
+			if err != nil {
+				return nil, err
+			}
+			ms.Add(spanMS)
 		}
-		ms.Add(spanMS)
 	}
 
 	var result replicaHash
 	result.RecomputedMS = ms
-	hasher.Sum(result.SHA512[:0])
 
-	curMS, err := stateloader.Make(r.store.cfg.Settings, desc.RangeID).LoadMVCCStats(ctx, snap)
+	rangeAppliedState, err := stateloader.Make(desc.RangeID).LoadRangeAppliedState(ctx, snap)
 	if err != nil {
 		return nil, err
 	}
-	result.PersistedMS = curMS
+	if rangeAppliedState == nil {
+		// This error is transient: the range applied state is used in v2.1 already
+		// but is migrated into on a per-range basis for clusters bootstrapped before
+		// v2.1. Clusters bootstrapped at v2.1 or higher will never hit this path since
+		// there's always an applied state.
+		return nil, errors.New("no range applied state found")
+	}
+	result.PersistedMS = rangeAppliedState.RangeStats.ToStats()
+
+	if statsOnly {
+		b, err := protoutil.Marshal(rangeAppliedState)
+		if err != nil {
+			return nil, err
+		}
+		if snapshot != nil {
+			// Add LeaseAppliedState to the diff.
+			kv := roachpb.RaftSnapshotData_KeyValue{
+				Timestamp: hlc.Timestamp{},
+			}
+			kv.Key = keys.RangeAppliedStateKey(desc.RangeID)
+			var v roachpb.Value
+			if err := v.SetProto(rangeAppliedState); err != nil {
+				return nil, err
+			}
+			kv.Value = v.RawBytes
+			snapshot.KV = append(snapshot.KV, kv)
+		}
+		if _, err := hasher.Write(b); err != nil {
+			return nil, err
+		}
+	}
+
+	hasher.Sum(result.SHA512[:0])
 
 	// We're not required to do so, but it looks nicer if both stats are aged to
 	// the same timestamp.

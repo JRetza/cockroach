@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -42,9 +38,15 @@ type (
 	// DatabaseDescriptor is provided for convenience and to make the
 	// interface definitions below more intuitive.
 	DatabaseDescriptor = sqlbase.DatabaseDescriptor
-	// ObjectDescriptor is provided for convenience and to make the
+	// UncachedDatabaseDescriptor is provided for convenience and to make the
 	// interface definitions below more intuitive.
-	ObjectDescriptor = sqlbase.TableDescriptor
+	UncachedDatabaseDescriptor = sqlbase.DatabaseDescriptor
+	// MutableTableDescriptor is provided for convenience and to make the
+	// interface definitions below more intuitive.
+	MutableTableDescriptor = sqlbase.MutableTableDescriptor
+	// ImmutableTableDescriptor is provided for convenience and to make the
+	// interface definitions below more intuitive.
+	ImmutableTableDescriptor = sqlbase.ImmutableTableDescriptor
 	// TableDescriptor is provided for convenience and to make the
 	// interface definitions below more intuitive.
 	TableDescriptor = sqlbase.TableDescriptor
@@ -59,12 +61,20 @@ type (
 	TableNames = tree.TableNames
 )
 
+// ObjectDescriptor provides table information for results from a name lookup.
+type ObjectDescriptor interface {
+	tree.NameResolutionResult
+
+	// TableDesc returns the underlying table descriptor.
+	TableDesc() *TableDescriptor
+}
+
 // SchemaAccessor provides access to database descriptors.
 type SchemaAccessor interface {
 	// GetDatabaseDesc looks up a database by name and returns its
 	// descriptor. If the database is not found and required is true,
 	// an error is returned; otherwise a nil reference is returned.
-	GetDatabaseDesc(dbName string, flags DatabaseLookupFlags) (*DatabaseDescriptor, error)
+	GetDatabaseDesc(ctx context.Context, txn *client.Txn, dbName string, flags tree.DatabaseLookupFlags) (*DatabaseDescriptor, error)
 
 	// IsValidSchema returns true if the given schema name is valid for the given database.
 	IsValidSchema(db *DatabaseDescriptor, scName string) bool
@@ -73,43 +83,11 @@ type SchemaAccessor interface {
 	// database and schema.
 	// TODO(whomever): when separate schemas are supported, this
 	// API should be extended to use schema descriptors.
-	GetObjectNames(db *DatabaseDescriptor, scName string, flags DatabaseListFlags) (TableNames, error)
+	GetObjectNames(ctx context.Context, txn *client.Txn, db *DatabaseDescriptor, scName string, flags tree.DatabaseListFlags) (TableNames, error)
 
-	// GetObjectDesc looks up an objcet by name and returns both its
+	// GetObjectDesc looks up an object by name and returns both its
 	// descriptor and that of its parent database. If the object is not
 	// found and flags.required is true, an error is returned, otherwise
 	// a nil reference is returned.
-	//
-	// The 2nd return value (DatabaseDescriptor) is only returned if the
-	// lookup function otherwise needed to load the database descriptor.
-	// It is not guaranteed to be non-nil even if the first return value
-	// is non-nil.  Callers that need a database descriptor can use that
-	// to avoid an extra roundtrip through a DatabaseAccessor.
-	GetObjectDesc(name *ObjectName, flags ObjectLookupFlags) (*ObjectDescriptor, *DatabaseDescriptor, error)
-}
-
-// CommonLookupFlags is the common set of flags for the various accessor interfaces.
-type CommonLookupFlags struct {
-	ctx context.Context
-	txn *client.Txn
-	// if required is set, lookup will return an error if the item is not found.
-	required bool
-	// if avoidCached is set, lookup will avoid the cache (if any).
-	avoidCached bool
-}
-
-// DatabaseLookupFlags is the flag struct suitable for GetDatabaseDesc().
-type DatabaseLookupFlags = CommonLookupFlags
-
-// DatabaseListFlags is the flag struct suitable for GetObjectNames().
-type DatabaseListFlags struct {
-	CommonLookupFlags
-	// explicitPrefix, when set, will cause the returned table names to
-	// have an explicit schema and catalog part.
-	explicitPrefix bool
-}
-
-// ObjectLookupFlags is the flag struct suitable for GetObjectDesc().
-type ObjectLookupFlags struct {
-	CommonLookupFlags
+	GetObjectDesc(ctx context.Context, txn *client.Txn, name *ObjectName, flags tree.ObjectLookupFlags) (ObjectDescriptor, error)
 }

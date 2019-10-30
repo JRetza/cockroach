@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package ts
 
@@ -18,18 +14,18 @@ import (
 	"context"
 	"math"
 
-	"github.com/cockroachdb/cockroach/pkg/util/mon"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-
+	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -43,6 +39,9 @@ const (
 	// time series queries. This is not currently enforced, but is used for
 	// monitoring purposes.
 	queryMemoryMax = int64(64 * 1024 * 1024) // 64MiB
+	// dumpBatchSize is the number of keys processed in each batch by the dump
+	// command.
+	dumpBatchSize = 100
 )
 
 // ClusterNodeCountFn is a function that returns the number of nodes active on
@@ -305,4 +304,62 @@ func (s *Server) Query(
 	}
 
 	return &response, nil
+}
+
+// Dump returns a stream of raw timeseries data that has been stored on the
+// server. Only data from the 10-second resolution is returned; rollup data is
+// not currently returned. Data is returned in the order it is read from disk,
+// and will thus not be totally organized by series.
+func (s *Server) Dump(req *tspb.DumpRequest, stream tspb.TimeSeries_DumpServer) error {
+	ctx := stream.Context()
+	span := &roachpb.Span{
+		Key:    roachpb.Key(firstTSRKey),
+		EndKey: roachpb.Key(lastTSRKey),
+	}
+
+	for span != nil {
+		b := &client.Batch{}
+		b.Header.MaxSpanRequestKeys = dumpBatchSize
+		b.Scan(span.Key, span.EndKey)
+		err := s.db.db.Run(ctx, b)
+		if err != nil {
+			return err
+		}
+		result := b.Results[0]
+		span = result.ResumeSpan
+		for i := range result.Rows {
+			row := &result.Rows[i]
+			name, source, resolution, _, err := DecodeDataKey(row.Key)
+			if err != nil {
+				return err
+			}
+			if resolution != Resolution10s {
+				// Only return the highest resolution data.
+				continue
+			}
+			var idata roachpb.InternalTimeSeriesData
+			if err := row.ValueProto(&idata); err != nil {
+				return err
+			}
+
+			tsdata := &tspb.TimeSeriesData{
+				Name:       name,
+				Source:     source,
+				Datapoints: make([]tspb.TimeSeriesDatapoint, idata.SampleCount()),
+			}
+			for i := 0; i < idata.SampleCount(); i++ {
+				if idata.IsColumnar() {
+					tsdata.Datapoints[i].TimestampNanos = idata.TimestampForOffset(idata.Offset[i])
+					tsdata.Datapoints[i].Value = idata.Last[i]
+				} else {
+					tsdata.Datapoints[i].TimestampNanos = idata.TimestampForOffset(idata.Samples[i].Offset)
+					tsdata.Datapoints[i].Value = idata.Samples[i].Sum
+				}
+			}
+			if err := stream.Send(tsdata); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

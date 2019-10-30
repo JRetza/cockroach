@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package pgwire
 
@@ -20,23 +16,50 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"time"
 
-	"github.com/pkg/errors"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/hba"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/pkg/errors"
+)
+
+// ATTENTION: After changing this value in a unit test, you probably want to
+// open a new connection pool since the connections in the existing one are not
+// affected.
+//
+// The "results_buffer_size" connection parameter can be used to override this
+// default for an individual connection.
+var connResultsBufferSize = settings.RegisterByteSizeSetting(
+	"sql.defaults.results_buffer.size",
+	"default size of the buffer that accumulates results for a statement or a batch "+
+		"of statements before they are sent to the client. This can be overridden on "+
+		"an individual connection with the 'results_buffer_size' parameter. Note that auto-retries "+
+		"generally only happen while no results have been delivered to the client, so "+
+		"reducing this size can increase the number of retriable errors a client "+
+		"receives. On the other hand, increasing the buffer size can increase the "+
+		"delay until the client receives the first result row. "+
+		"Updating the setting only affects new connections. "+
+		"Setting to 0 disables any buffering.",
+	16<<10, // 16 KiB
 )
 
 const (
@@ -44,27 +67,46 @@ const (
 	// secure server in cleartext.
 	ErrSSLRequired = "node is running secure mode, SSL connection required"
 
-	// ErrDraining is returned when a client attempts to connect to a server
+	// ErrDrainingNewConn is returned when a client attempts to connect to a server
 	// which is not accepting client connections.
-	ErrDraining = "server is not accepting clients"
+	ErrDrainingNewConn = "server is not accepting clients"
+	// ErrDrainingExistingConn is returned when a connection is shut down because
+	// the server is draining.
+	ErrDrainingExistingConn = "server is shutting down"
 )
 
 // Fully-qualified names for metrics.
 var (
 	MetaConns = metric.Metadata{
-		Name: "sql.conns",
-		Help: "Number of active sql connections"}
+		Name:        "sql.conns",
+		Help:        "Number of active sql connections",
+		Measurement: "Connections",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaNewConns = metric.Metadata{
+		Name:        "sql.new_conns",
+		Help:        "Counter of the number of sql connections created",
+		Measurement: "Connections",
+		Unit:        metric.Unit_COUNT,
+	}
 	MetaBytesIn = metric.Metadata{
-		Name: "sql.bytesin",
-		Help: "Number of sql bytes received"}
+		Name:        "sql.bytesin",
+		Help:        "Number of sql bytes received",
+		Measurement: "SQL Bytes",
+		Unit:        metric.Unit_BYTES,
+	}
 	MetaBytesOut = metric.Metadata{
-		Name: "sql.bytesout",
-		Help: "Number of sql bytes sent"}
+		Name:        "sql.bytesout",
+		Help:        "Number of sql bytes sent",
+		Measurement: "SQL Bytes",
+		Unit:        metric.Unit_BYTES,
+	}
 )
 
 const (
-	version30  = 196608
-	versionSSL = 80877103
+	version30     = 196608
+	versionSSL    = 80877103
+	versionCancel = 80877102
 )
 
 // cancelMaxWait is the amount of time a draining server gives to sessions to
@@ -107,6 +149,11 @@ type Server struct {
 		draining      bool
 	}
 
+	auth struct {
+		syncutil.RWMutex
+		conf *hba.Conf
+	}
+
 	sqlMemoryPool mon.BytesMonitor
 	connMonitor   mon.BytesMonitor
 
@@ -118,6 +165,7 @@ type ServerMetrics struct {
 	BytesInCount   *metric.Counter
 	BytesOutCount  *metric.Counter
 	Conns          *metric.Gauge
+	NewConns       *metric.Counter
 	ConnMemMetrics sql.MemoryMetrics
 	SQLMemMetrics  sql.MemoryMetrics
 }
@@ -129,6 +177,7 @@ func makeServerMetrics(
 		BytesInCount:   metric.NewCounter(MetaBytesIn),
 		BytesOutCount:  metric.NewCounter(MetaBytesOut),
 		Conns:          metric.NewGauge(MetaConns),
+		NewConns:       metric.NewCounter(MetaNewConns),
 		ConnMemMetrics: sql.MakeMemMetrics("conns", histogramWindow),
 		SQLMemMetrics:  sqlMemMetrics,
 	}
@@ -181,6 +230,30 @@ func MakeServer(
 	server.mu.connCancelMap = make(cancelChanMap)
 	server.mu.Unlock()
 
+	connAuthConf.SetOnChange(&st.SV, func() {
+		val := connAuthConf.Get(&st.SV)
+		server.auth.Lock()
+		defer server.auth.Unlock()
+		if val == "" {
+			server.auth.conf = nil
+			return
+		}
+		conf, err := hba.Parse(val)
+		if err != nil {
+			log.Warningf(ambientCtx.AnnotateCtx(context.Background()), "invalid %s: %v", serverHBAConfSetting, err)
+			conf = nil
+		}
+		// Usernames are normalized during session init. Normalize the HBA usernames
+		// in the same way.
+		for _, entry := range conf.Entries {
+			for iu := range entry.User {
+				user := &entry.User[iu]
+				user.Value = tree.Name(user.Value).Normalize()
+			}
+		}
+		server.auth.conf = conf
+	})
+
 	return server
 }
 
@@ -195,7 +268,7 @@ func Match(rd io.Reader) bool {
 	if err != nil {
 		return false
 	}
-	return version == version30 || version == versionSSL
+	return version == version30 || version == versionSSL || version == versionCancel
 }
 
 // Start makes the Server ready for serving connections.
@@ -212,19 +285,17 @@ func (s *Server) IsDraining() bool {
 	return s.mu.draining
 }
 
-// Metrics returns the metrics struct.
-func (s *Server) Metrics() *ServerMetrics {
-	return &s.metrics
-}
-
-// StatementCounters returns the Server's StatementCounters.
-func (s *Server) StatementCounters() *sql.StatementCounters {
-	return &s.SQLServer.StatementCounters
-}
-
-// EngineMetrics returns the Server's EngineMetrics.
-func (s *Server) EngineMetrics() *sql.EngineMetrics {
-	return &s.SQLServer.EngineMetrics
+// Metrics returns the set of metrics structs.
+func (s *Server) Metrics() (res []interface{}) {
+	return []interface{}{
+		&s.metrics,
+		&s.SQLServer.Metrics.StartedStatementCounters,
+		&s.SQLServer.Metrics.ExecutedStatementCounters,
+		&s.SQLServer.Metrics.EngineMetrics,
+		&s.SQLServer.InternalMetrics.StartedStatementCounters,
+		&s.SQLServer.InternalMetrics.ExecutedStatementCounters,
+		&s.SQLServer.InternalMetrics.EngineMetrics,
+	}
 }
 
 // Drain prevents new connections from being served and waits for drainWait for
@@ -338,6 +409,8 @@ func (s *Server) drainImpl(drainWait time.Duration, cancelWait time.Duration) er
 
 // ServeConn serves a single connection, driving the handshake process and
 // delegating to the appropriate connection type.
+//
+// An error is returned if the initial handshake of the connection fails.
 func (s *Server) ServeConn(ctx context.Context, conn net.Conn) error {
 	s.mu.Lock()
 	draining := s.mu.draining
@@ -361,6 +434,7 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn) error {
 	// DrainClient() waits for that number to drop to zero,
 	// so we don't want it to oscillate unnecessarily.
 	if !draining {
+		s.metrics.NewConns.Inc(1)
 		s.metrics.Conns.Inc(1)
 		defer s.metrics.Conns.Dec(1)
 	}
@@ -411,26 +485,34 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn) error {
 
 	sendErr := func(err error) error {
 		msgBuilder := newWriteBuffer(s.metrics.BytesOutCount)
-		_ /* err */ = writeErr(err, msgBuilder, conn)
+		_ /* err */ = writeErr(ctx, &s.execCfg.Settings.SV, err, msgBuilder, conn)
 		_ = conn.Close()
 		return err
 	}
 
 	if version != version30 {
+		if version == versionCancel {
+			telemetry.Inc(sqltelemetry.CancelRequestCounter)
+			_ = conn.Close()
+			return nil
+		}
 		return sendErr(fmt.Errorf("unknown protocol version %d", version))
 	}
 	if errSSLRequired {
-		return sendErr(pgerror.NewError(pgerror.CodeProtocolViolationError, ErrSSLRequired))
+		return sendErr(pgerror.New(pgcode.ProtocolViolation, ErrSSLRequired))
 	}
 	if draining {
-		return sendErr(newAdminShutdownErr(errors.New(ErrDraining)))
+		return sendErr(newAdminShutdownErr(ErrDrainingNewConn))
 	}
 
 	var sArgs sql.SessionArgs
 	if sArgs, err = parseOptions(ctx, buf.Msg); err != nil {
-		return sendErr(pgerror.NewError(pgerror.CodeProtocolViolationError, err.Error()))
+		return sendErr(err)
 	}
 	sArgs.User = tree.Name(sArgs.User).Normalize()
+	if sArgs.ConnResultsBufferSize == connResultsBufferSizeUnsetSentinel {
+		sArgs.ConnResultsBufferSize = connResultsBufferSize.Get(&s.execCfg.Settings.SV)
+	}
 
 	// Reserve some memory for this connection using the server's monitor. This
 	// reduces pressure on the shared pool because the server monitor allocates in
@@ -441,41 +523,94 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn) error {
 		return errors.Errorf("unable to pre-allocate %d bytes for this connection: %v",
 			baseSQLMemoryBudget, err)
 	}
-	return serveConn(ctx, conn, sArgs, &s.metrics, reserved, s.SQLServer,
-		s.IsDraining, s.execCfg, s.stopper, s.cfg.Insecure)
+
+	s.auth.RLock()
+	auth := s.auth.conf
+	s.auth.RUnlock()
+
+	var authHook func(context.Context) error
+	if k := s.execCfg.PGWireTestingKnobs; k != nil {
+		authHook = k.AuthHook
+	}
+
+	serveConn(
+		ctx, conn, sArgs,
+		&s.metrics, reserved, s.SQLServer,
+		s.IsDraining,
+		authOptions{
+			insecure: s.cfg.Insecure,
+			ie:       s.execCfg.InternalExecutor,
+			auth:     auth,
+			authHook: authHook,
+		},
+		s.stopper)
+	return nil
 }
 
+// -1 for the sentinel in case someone wants to set it to 0.
+const connResultsBufferSizeUnsetSentinel = -1
+
 func parseOptions(ctx context.Context, data []byte) (sql.SessionArgs, error) {
-	args := sql.SessionArgs{}
+	args := sql.SessionArgs{
+		SessionDefaults:       make(map[string]string),
+		ConnResultsBufferSize: connResultsBufferSizeUnsetSentinel,
+	}
 	buf := pgwirebase.ReadBuffer{Msg: data}
 	for {
 		key, err := buf.GetString()
 		if err != nil {
-			return sql.SessionArgs{}, errors.Errorf("error reading option key: %s", err)
+			return sql.SessionArgs{}, pgerror.Newf(pgcode.ProtocolViolation,
+				"error reading option key: %s", err)
 		}
 		if len(key) == 0 {
 			break
 		}
 		value, err := buf.GetString()
 		if err != nil {
-			return sql.SessionArgs{}, errors.Errorf("error reading option value: %s", err)
+			return sql.SessionArgs{}, pgerror.Newf(pgcode.ProtocolViolation,
+				"error reading option value: %s", err)
 		}
+		key = strings.ToLower(key)
 		switch key {
-		case "database":
-			args.Database = value
 		case "user":
 			args.User = value
-		case "application_name":
-			args.ApplicationName = value
+		case "results_buffer_size":
+			if args.ConnResultsBufferSize, err = humanizeutil.ParseBytes(value); err != nil {
+				return sql.SessionArgs{}, pgerror.Newf(pgcode.ProtocolViolation,
+					"error parsing results_buffer_size option value '%s' as bytes", value)
+			}
+			if args.ConnResultsBufferSize < 0 {
+				return sql.SessionArgs{}, pgerror.Newf(pgcode.ProtocolViolation,
+					"results_buffer_size option value '%s' cannot be negative", value)
+			}
 		default:
-			if log.V(1) {
-				log.Warningf(ctx, "unrecognized configuration parameter %q", key)
+			exists, configurable := sql.IsSessionVariableConfigurable(key)
+			if exists && configurable {
+				args.SessionDefaults[key] = value
+			} else {
+				if !exists {
+					if _, ok := sql.UnsupportedVars[key]; ok {
+						counter := sqltelemetry.UnimplementedClientStatusParameterCounter(key)
+						telemetry.Inc(counter)
+					}
+					log.Warningf(ctx, "unknown configuration parameter: %q", key)
+				} else {
+					return sql.SessionArgs{}, pgerror.Newf(pgcode.CantChangeRuntimeParam,
+						"parameter %q cannot be changed", key)
+				}
 			}
 		}
 	}
+
+	if _, ok := args.SessionDefaults["database"]; !ok {
+		// CockroachDB-specific behavior: if no database is specified,
+		// default to "defaultdb". In PostgreSQL this would be "postgres".
+		args.SessionDefaults["database"] = sessiondata.DefaultDatabaseName
+	}
+
 	return args, nil
 }
 
-func newAdminShutdownErr(err error) error {
-	return pgerror.NewErrorf(pgerror.CodeAdminShutdownError, err.Error())
+func newAdminShutdownErr(msg string) error {
+	return pgerror.Newf(pgcode.AdminShutdown, msg)
 }

@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package kv
 
@@ -23,10 +19,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	opentracing "github.com/opentracing/opentracing-go"
 )
@@ -39,11 +35,13 @@ type localTestClusterTransport struct {
 	latency time.Duration
 }
 
-func (l *localTestClusterTransport) SendNext(ctx context.Context, done chan<- BatchCall) {
+func (l *localTestClusterTransport) SendNext(
+	ctx context.Context, ba roachpb.BatchRequest,
+) (*roachpb.BatchResponse, error) {
 	if l.latency > 0 {
 		time.Sleep(l.latency)
 	}
-	l.Transport.SendNext(ctx, done)
+	return l.Transport.SendNext(ctx, ba)
 }
 
 // InitFactoryForLocalTestCluster initializes a TxnCoordSenderFactory
@@ -58,38 +56,52 @@ func InitFactoryForLocalTestCluster(
 	stopper *stop.Stopper,
 	gossip *gossip.Gossip,
 ) client.TxnSenderFactory {
+	return NewTxnCoordSenderFactory(
+		TxnCoordSenderFactoryConfig{
+			AmbientCtx: log.AmbientContext{Tracer: st.Tracer},
+			Settings:   st,
+			Clock:      clock,
+			Stopper:    stopper,
+		},
+		NewDistSenderForLocalTestCluster(st, nodeDesc, tracer, clock, latency, stores, stopper, gossip),
+	)
+}
+
+// NewDistSenderForLocalTestCluster creates a DistSender for a LocalTestCluster.
+func NewDistSenderForLocalTestCluster(
+	st *cluster.Settings,
+	nodeDesc *roachpb.NodeDescriptor,
+	tracer opentracing.Tracer,
+	clock *hlc.Clock,
+	latency time.Duration,
+	stores client.Sender,
+	stopper *stop.Stopper,
+	g *gossip.Gossip,
+) *DistSender {
 	retryOpts := base.DefaultRetryOptions()
 	retryOpts.Closer = stopper.ShouldQuiesce()
+	rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
 	senderTransportFactory := SenderTransportFactory(tracer, stores)
-	distSender := NewDistSender(DistSenderConfig{
+	return NewDistSender(DistSenderConfig{
 		AmbientCtx:      log.AmbientContext{Tracer: st.Tracer},
+		Settings:        st,
 		Clock:           clock,
+		RPCContext:      rpcContext,
 		RPCRetryOptions: &retryOpts,
 		nodeDescriptor:  nodeDesc,
-		TestingKnobs: DistSenderTestingKnobs{
+		NodeDialer:      nodedialer.New(rpcContext, gossip.AddressResolver(g)),
+		TestingKnobs: ClientTestingKnobs{
 			TransportFactory: func(
 				opts SendOptions,
-				rpcContext *rpc.Context,
+				nodeDialer *nodedialer.Dialer,
 				replicas ReplicaSlice,
-				args roachpb.BatchRequest,
 			) (Transport, error) {
-				transport, err := senderTransportFactory(opts, rpcContext, replicas, args)
+				transport, err := senderTransportFactory(opts, nodeDialer, replicas)
 				if err != nil {
 					return nil, err
 				}
 				return &localTestClusterTransport{transport, latency}, nil
 			},
 		},
-	}, gossip)
-
-	ambient := log.AmbientContext{Tracer: tracer}
-	return NewTxnCoordSenderFactory(
-		ambient,
-		st,
-		distSender,
-		clock,
-		false, /* linearizable */
-		stopper,
-		MakeTxnMetrics(metric.TestSampleInterval),
-	)
+	}, g)
 }

@@ -1,25 +1,21 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
 	"context"
-	"fmt"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 )
 
 type createDatabaseNode struct {
@@ -38,7 +34,8 @@ func (p *planner) CreateDatabase(ctx context.Context, n *tree.CreateDatabase) (p
 	if tmpl := n.Template; tmpl != "" {
 		// See https://www.postgresql.org/docs/current/static/manage-ag-templatedbs.html
 		if !strings.EqualFold(tmpl, "template0") {
-			return nil, fmt.Errorf("unsupported template: %s", tmpl)
+			return nil, unimplemented.NewWithIssuef(10151,
+				"unsupported template: %s", tmpl)
 		}
 	}
 
@@ -47,25 +44,28 @@ func (p *planner) CreateDatabase(ctx context.Context, n *tree.CreateDatabase) (p
 		if !(strings.EqualFold(enc, "UTF8") ||
 			strings.EqualFold(enc, "UTF-8") ||
 			strings.EqualFold(enc, "UNICODE")) {
-			return nil, fmt.Errorf("unsupported encoding: %s", enc)
+			return nil, unimplemented.Newf("create.db.encoding",
+				"unsupported encoding: %s", enc)
 		}
 	}
 
 	if col := n.Collate; col != "" {
 		// We only support C and C.UTF-8.
 		if col != "C" && col != "C.UTF-8" {
-			return nil, fmt.Errorf("unsupported collation: %s", col)
+			return nil, unimplemented.Newf("create.db.collation",
+				"unsupported collation: %s", col)
 		}
 	}
 
 	if ctype := n.CType; ctype != "" {
 		// We only support C and C.UTF-8.
 		if ctype != "C" && ctype != "C.UTF-8" {
-			return nil, fmt.Errorf("unsupported character classification: %s", ctype)
+			return nil, unimplemented.Newf("create.db.classification",
+				"unsupported character classification: %s", ctype)
 		}
 	}
 
-	if err := p.RequireSuperUser(ctx, "CREATE DATABASE"); err != nil {
+	if err := p.RequireAdminRole(ctx, "CREATE DATABASE"); err != nil {
 		return nil, err
 	}
 

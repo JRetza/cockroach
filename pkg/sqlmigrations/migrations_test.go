@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sqlmigrations
 
@@ -18,12 +14,12 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -205,7 +201,7 @@ func TestEnsureMigrations(t *testing.T) {
 			}
 			backwardCompatibleMigrations = tc.migrations
 
-			err := mgr.EnsureMigrations(context.Background())
+			err := mgr.EnsureMigrations(context.Background(), AllMigrations)
 			if !testutils.IsError(err, tc.expectedErr) {
 				t.Errorf("expected error %q, got error %v", tc.expectedErr, err)
 			}
@@ -268,7 +264,7 @@ func TestDBErrors(t *testing.T) {
 			db.scanErr = tc.scanErr
 			db.putErr = tc.putErr
 			db.kvs = make(map[string][]byte)
-			err := mgr.EnsureMigrations(context.Background())
+			err := mgr.EnsureMigrations(context.Background(), AllMigrations)
 			if !testutils.IsError(err, tc.expectedErr) {
 				t.Errorf("expected error %q, got error %v", tc.expectedErr, err)
 			}
@@ -306,7 +302,7 @@ func TestLeaseErrors(t *testing.T) {
 	migration := noopMigration1
 	defer func(prev []migrationDescriptor) { backwardCompatibleMigrations = prev }(backwardCompatibleMigrations)
 	backwardCompatibleMigrations = []migrationDescriptor{migration}
-	if err := mgr.EnsureMigrations(context.Background()); err != nil {
+	if err := mgr.EnsureMigrations(context.Background(), AllMigrations); err != nil {
 		t.Error(err)
 	}
 	if _, ok := db.kvs[string(migrationKey(migration))]; !ok {
@@ -335,8 +331,8 @@ func TestLeaseExpiration(t *testing.T) {
 	defer func() { leaseRefreshInterval = oldLeaseRefreshInterval }()
 
 	exitCalled := make(chan bool)
-	log.SetExitFunc(func(int) { exitCalled <- true })
-	defer log.SetExitFunc(os.Exit)
+	log.SetExitFunc(true /* hideStack */, func(int) { exitCalled <- true })
+	defer log.ResetExitFunc()
 	// Disable stack traces to make the test output in teamcity less deceiving.
 	defer log.DisableTracebacks()()
 
@@ -353,7 +349,7 @@ func TestLeaseExpiration(t *testing.T) {
 	}
 	defer func(prev []migrationDescriptor) { backwardCompatibleMigrations = prev }(backwardCompatibleMigrations)
 	backwardCompatibleMigrations = []migrationDescriptor{waitForExitMigration}
-	if err := mgr.EnsureMigrations(context.Background()); err != nil {
+	if err := mgr.EnsureMigrations(context.Background(), AllMigrations); err != nil {
 		t.Error(err)
 	}
 }
@@ -466,7 +462,7 @@ func TestCreateSystemTable(t *testing.T) {
 	sqlbase.SystemAllowedPrivileges[table.ID] = sqlbase.SystemAllowedPrivileges[keys.NamespaceTableID]
 
 	table.Name = "dummy"
-	nameKey := sqlbase.MakeNameMetadataKey(table.ParentID, table.Name)
+	nameKey := sqlbase.NewTableKey(table.ParentID, table.Name).Key()
 	descKey := sqlbase.MakeDescMetadataKey(table.ID)
 	descVal := sqlbase.WrapDescriptor(&table)
 
@@ -606,8 +602,8 @@ func TestExpectedInitialRangeCount(t *testing.T) {
 			return errors.New("last migration has not completed")
 		}
 
-		sysCfg, ok := s.Gossip().GetSystemConfig()
-		if !ok {
+		sysCfg := s.GossipI().(*gossip.Gossip).GetSystemConfig()
+		if sysCfg == nil {
 			return errors.New("gossipped system config not available")
 		}
 
@@ -642,4 +638,33 @@ func TestExpectedInitialRangeCount(t *testing.T) {
 
 		return nil
 	})
+}
+
+func TestUpdateSystemLocationData(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+
+	mt := makeMigrationTest(ctx, t)
+	defer mt.close(ctx)
+
+	migration := mt.pop(t, "update system.locations with default location data")
+	mt.start(t, base.TestServerArgs{})
+
+	// Check that we don't have any data in the system.locations table without the migration.
+	var count int
+	mt.sqlDB.QueryRow(t, `SELECT count(*) FROM system.locations`).Scan(&count)
+	if count != 0 {
+		t.Fatalf("Exected to find 0 rows in system.locations. Found  %d instead", count)
+	}
+
+	// Run the migration to insert locations.
+	if err := mt.runMigration(ctx, migration); err != nil {
+		t.Errorf("expected success, got %q", err)
+	}
+
+	// Check that we have all of the expected locations.
+	mt.sqlDB.QueryRow(t, `SELECT count(*) FROM system.locations`).Scan(&count)
+	if count != len(roachpb.DefaultLocationInformation) {
+		t.Fatalf("Exected to find 0 rows in system.locations. Found  %d instead", count)
+	}
 }

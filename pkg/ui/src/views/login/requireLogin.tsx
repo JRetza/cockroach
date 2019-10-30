@@ -1,10 +1,19 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import React from "react";
 import { withRouter, WithRouterProps } from "react-router";
 import { connect } from "react-redux";
 
 import { AdminUIState } from "src/redux/state";
-import { selectLoginState, LoginState } from "src/redux/login";
-import { LOGIN_PAGE } from "src/routes/login";
+import { selectLoginState, LoginState, getLoginPage } from "src/redux/login";
 
 interface RequireLoginProps {
   loginState: LoginState;
@@ -23,10 +32,7 @@ class RequireLogin extends React.Component<WithRouterProps & RequireLoginProps> 
     const { location, router } = this.props;
 
     if (!this.hasAccess()) {
-        router.push({
-            pathname: LOGIN_PAGE,
-            query: { redirectTo: router.createPath(location.pathname, location.query) },
-        });
+      router.push(getLoginPage(location));
     }
   }
 

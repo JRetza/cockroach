@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -21,15 +17,12 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/pkg/errors"
-
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/pkg/errors"
 )
 
 func TestRangeIDChunk(t *testing.T) {
@@ -149,10 +142,11 @@ func (p *testProcessor) processReady(_ context.Context, rangeID roachpb.RangeID)
 	p.mu.Unlock()
 }
 
-func (p *testProcessor) processRequestQueue(_ context.Context, rangeID roachpb.RangeID) {
+func (p *testProcessor) processRequestQueue(_ context.Context, rangeID roachpb.RangeID) bool {
 	p.mu.Lock()
 	p.mu.raftRequest[rangeID]++
 	p.mu.Unlock()
+	return false
 }
 
 func (p *testProcessor) processTick(_ context.Context, rangeID roachpb.RangeID) bool {
@@ -196,7 +190,7 @@ func TestSchedulerLoop(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	p := newTestProcessor()
-	s := newRaftScheduler(log.AmbientContext{Tracer: tracing.NewTracer()}, nil, p, 1)
+	s := newRaftScheduler(nil, p, 1)
 	stopper := stop.NewStopper()
 	ctx := context.TODO()
 	defer stopper.Stop(ctx)
@@ -218,7 +212,7 @@ func TestSchedulerBuffering(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	p := newTestProcessor()
-	s := newRaftScheduler(log.AmbientContext{Tracer: tracing.NewTracer()}, nil, p, 1)
+	s := newRaftScheduler(nil, p, 1)
 	stopper := stop.NewStopper()
 	ctx := context.TODO()
 	defer stopper.Stop(ctx)

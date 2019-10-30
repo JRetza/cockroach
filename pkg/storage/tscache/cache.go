@@ -1,17 +1,15 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
+// Package tscache provides a timestamp cache structure that records the maximum
+// timestamp that key ranges were read from and written to.
 package tscache
 
 import (
@@ -30,13 +28,13 @@ import (
 // will necessarily have to advance their commit timestamp.
 const MinRetentionWindow = 10 * time.Second
 
-// Cache is a bounded in-memory cache that records key ranges and the
-// timestamps at which they were most recently read and written. The structure
-// serves to protect against violations of Snapshot Isolation, which requires
-// that the outcome of reads must be preserved even in the presence of
-// read-write conflicts (i.e. a write to a key at a lower timestamp than a
-// previous read must not succeed). Cache corresponds to the "status oracle"
-// discussed in Yabandeh's A Critique of Snapshot Isolation.
+// Cache is a bounded in-memory cache that records the maximum timestamp that
+// key ranges were read from and written to. The structure serves to protect
+// against violations of Snapshot Isolation, which requires that the outcome of
+// reads must be preserved even in the presence of read-write conflicts (i.e. a
+// write to a key at a lower timestamp than a previous read must not succeed).
+// Cache corresponds to the "status oracle" discussed in Yabandeh's A Critique
+// of Snapshot Isolation.
 //
 // The cache is updated after the completion of each read operation with the
 // range of all keys that the request was predicated upon. It is then consulted
@@ -75,6 +73,9 @@ type Cache interface {
 	// timestamp which overlaps the interval spanning from start to end.
 	GetMaxWrite(start, end roachpb.Key) (hlc.Timestamp, uuid.UUID)
 
+	// Metrics returns the Cache's metrics struct.
+	Metrics() Metrics
+
 	// The following methods are used for testing within this package:
 	//
 	// clear clears the cache and resets the low-water mark.
@@ -85,11 +86,11 @@ type Cache interface {
 
 // New returns a new timestamp cache with the supplied hybrid clock. If the
 // pageSize is provided, it will override the default page size.
-func New(clock *hlc.Clock, pageSize uint32, metrics Metrics) Cache {
+func New(clock *hlc.Clock, pageSize uint32) Cache {
 	if envutil.EnvOrDefaultBool("COCKROACH_USE_TREE_TSCACHE", false) {
 		return newTreeImpl(clock)
 	}
-	return newSklImpl(clock, pageSize, metrics)
+	return newSklImpl(clock, pageSize)
 }
 
 // cacheValue combines a timestamp with an optional txnID. It is shared between

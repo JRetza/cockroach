@@ -1,4 +1,4 @@
-# LogicTest: opt
+# LogicTest: local
 
 statement ok
 CREATE TABLE xyz (
@@ -8,65 +8,68 @@ CREATE TABLE xyz (
   INDEX foo (z, y)
 )
 
-# TODO(vivek): Use the secondary index. Use distinct in index selection.
 query TTT
 EXPLAIN SELECT DISTINCT y, z FROM xyz
 ----
-group      ·            ·
- │         aggregate 0  y
- │         aggregate 1  z
- │         group by     @1-@2
+·          distributed  false
+·          vectorized   true
+distinct   ·            ·
+ │         distinct on  y, z
+ │         order key    y, z
  └── scan  ·            ·
-·          table        xyz@primary
+·          table        xyz@foo
 ·          spans        ALL
 
 query TTT
 EXPLAIN SELECT DISTINCT y, z FROM xyz ORDER BY z
 ----
-sort            ·            ·
- │              order        +z
- └── group      ·            ·
-      │         aggregate 0  y
-      │         aggregate 1  z
-      │         group by     @1-@2
-      └── scan  ·            ·
-·               table        xyz@primary
-·               spans        ALL
+·          distributed  false
+·          vectorized   true
+distinct   ·            ·
+ │         distinct on  y, z
+ │         order key    y, z
+ └── scan  ·            ·
+·          table        xyz@foo
+·          spans        ALL
 
 query TTT
 EXPLAIN SELECT DISTINCT y, z FROM xyz ORDER BY y
 ----
+·               distributed  false
+·               vectorized   false
 sort            ·            ·
  │              order        +y
- └── group      ·            ·
-      │         aggregate 0  y
-      │         aggregate 1  z
-      │         group by     @1-@2
+ └── distinct   ·            ·
+      │         distinct on  y, z
+      │         order key    y, z
       └── scan  ·            ·
-·               table        xyz@primary
+·               table        xyz@foo
 ·               spans        ALL
 
 query TTT
 EXPLAIN SELECT DISTINCT y, z FROM xyz ORDER BY y, z
 ----
+·               distributed  false
+·               vectorized   false
 sort            ·            ·
  │              order        +y,+z
- └── group      ·            ·
-      │         aggregate 0  y
-      │         aggregate 1  z
-      │         group by     @1-@2
+ └── distinct   ·            ·
+      │         distinct on  y, z
+      │         order key    y, z
       └── scan  ·            ·
-·               table        xyz@primary
+·               table        xyz@foo
 ·               spans        ALL
 
 query TTT
-EXPLAIN SELECT DISTINCT y + z FROM xyz ORDER BY y + z
+EXPLAIN SELECT DISTINCT y + z AS r FROM xyz ORDER BY y + z
 ----
-sort                 ·            ·
- │                   order        +"y + z"
- └── group           ·            ·
-      │              aggregate 0  y + z
-      │              group by     @1
+·                    distributed  false
+·                    vectorized   false
+distinct             ·            ·
+ │                   distinct on  r
+ │                   order key    r
+ └── sort            ·            ·
+      │              order        +r
       └── render     ·            ·
            └── scan  ·            ·
 ·                    table        xyz@primary
@@ -75,24 +78,24 @@ sort                 ·            ·
 query TTT
 EXPLAIN SELECT DISTINCT y AS w, z FROM xyz ORDER BY z
 ----
-sort            ·            ·
- │              order        +z
- └── group      ·            ·
-      │         aggregate 0  y
-      │         aggregate 1  z
-      │         group by     @1-@2
-      └── scan  ·            ·
-·               table        xyz@primary
-·               spans        ALL
+·          distributed  false
+·          vectorized   true
+distinct   ·            ·
+ │         distinct on  w, z
+ │         order key    w, z
+ └── scan  ·            ·
+·          table        xyz@foo
+·          spans        ALL
 
 query TTT
 EXPLAIN SELECT DISTINCT y AS w FROM xyz ORDER BY y
 ----
+·               distributed  false
+·               vectorized   false
 sort            ·            ·
  │              order        +w
- └── group      ·            ·
-      │         aggregate 0  y
-      │         group by     @1
+ └── distinct   ·            ·
+      │         distinct on  w
       └── scan  ·            ·
 ·               table        xyz@primary
 ·               spans        ALL
@@ -100,16 +103,36 @@ sort            ·            ·
 query TTTTT
 EXPLAIN (VERBOSE) SELECT DISTINCT x FROM xyz
 ----
-scan  ·      ·            (x)  ·
-·     table  xyz@primary  ·    ·
-·     spans  ALL          ·    ·
+·     distributed  false        ·    ·
+·     vectorized   true         ·    ·
+scan  ·            ·            (x)  ·
+·     table        xyz@primary  ·    ·
+·     spans        ALL          ·    ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT DISTINCT x, y, z FROM xyz
 ----
-scan  ·      ·            (x, y, z)  ·
-·     table  xyz@primary  ·          ·
-·     spans  ALL          ·          ·
+·     distributed  false        ·          ·
+·     vectorized   true         ·          ·
+scan  ·            ·            (x, y, z)  ·
+·     table        xyz@primary  ·          ·
+·     spans        ALL          ·          ·
+
+# Test the case when the DistinctOn operator is projecting away a column.
+query TTTTT
+EXPLAIN (VERBOSE) SELECT DISTINCT z FROM (SELECT y, z FROM xyz WHERE y > 1)
+----
+·               distributed  false    ·       ·
+·               vectorized   true     ·       ·
+distinct        ·            ·        (z)     ·
+ │              distinct on  z        ·       ·
+ │              order key    z        ·       ·
+ └── render     ·            ·        (z)     +z
+      │         render 0     z        ·       ·
+      └── scan  ·            ·        (y, z)  +z
+·               table        xyz@foo  ·       ·
+·               spans        ALL      ·       ·
+·               filter       y > 1    ·       ·
 
 statement ok
 CREATE TABLE abcd (
@@ -122,40 +145,47 @@ CREATE TABLE abcd (
 )
 
 query TTTTT
-EXPLAIN (VERBOSE) SELECT DISTINCT 1, d, b FROM abcd ORDER BY d, b
+EXPLAIN (VERBOSE) SELECT DISTINCT 1 AS z, d, b FROM abcd ORDER BY d, b
 ----
-render     ·         ·                  ("1", d, b)  ·
- │         render 0  1                  ·            ·
- │         render 1  d                  ·            ·
- │         render 2  b                  ·            ·
- └── scan  ·         ·                  (b, d)       +d,+b
-·          table     abcd@abcd_d_b_key  ·            ·
-·          spans     ALL                ·            ·
+·          distributed  false              ·          ·
+·          vectorized   true               ·          ·
+render     ·            ·                  (z, d, b)  ·
+ │         render 0     1                  ·          ·
+ │         render 1     d                  ·          ·
+ │         render 2     b                  ·          ·
+ └── scan  ·            ·                  (b, d)     +d,+b
+·          table        abcd@abcd_d_b_key  ·          ·
+·          spans        ALL                ·          ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT DISTINCT a, b FROM abcd
 ----
-group      ·            ·             (a, b)  ·
- │         aggregate 0  a             ·       ·
- │         aggregate 1  b             ·       ·
- │         group by     @1-@2         ·       ·
- └── scan  ·            ·             (a, b)  ·
+·          distributed  false         ·       ·
+·          vectorized   true          ·       ·
+distinct   ·            ·             (a, b)  ·
+ │         distinct on  a, b          ·       ·
+ │         order key    a, b          ·       ·
+ └── scan  ·            ·             (a, b)  +a,+b
 ·          table        abcd@primary  ·       ·
 ·          spans        ALL           ·       ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT DISTINCT a, b, c FROM abcd
 ----
-scan  ·      ·             (a, b, c)  ·
-·     table  abcd@primary  ·          ·
-·     spans  ALL           ·          ·
+·     distributed  false         ·          ·
+·     vectorized   true          ·          ·
+scan  ·            ·             (a, b, c)  ·
+·     table        abcd@primary  ·          ·
+·     spans        ALL           ·          ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT DISTINCT a, b, c, d FROM abcd
 ----
-scan  ·      ·             (a, b, c, d)  ·
-·     table  abcd@primary  ·             ·
-·     spans  ALL           ·             ·
+·     distributed  false         ·             ·
+·     vectorized   true          ·             ·
+scan  ·            ·             (a, b, c, d)  ·
+·     table        abcd@primary  ·             ·
+·     spans        ALL           ·             ·
 
 statement ok
 CREATE TABLE kv (k INT PRIMARY KEY, v INT, UNIQUE INDEX idx(v))
@@ -163,48 +193,47 @@ CREATE TABLE kv (k INT PRIMARY KEY, v INT, UNIQUE INDEX idx(v))
 query TTTTT
 EXPLAIN (VERBOSE) SELECT DISTINCT v FROM kv
 ----
-group      ·            ·           (v)  ·
- │         aggregate 0  v           ·    ·
- │         group by     @1          ·    ·
- └── scan  ·            ·           (v)  ·
-·          table        kv@primary  ·    ·
-·          spans        ALL         ·    ·
+·          distributed  false   ·    ·
+·          vectorized   true    ·    ·
+distinct   ·            ·       (v)  ·
+ │         distinct on  v       ·    ·
+ │         order key    v       ·    ·
+ └── scan  ·            ·       (v)  +v
+·          table        kv@idx  ·    ·
+·          spans        ALL     ·    ·
 
 # Verify we don't incorrectly elide the distinct node when we only have a weak key (#19343).
-# TODO(radu) re-enable once we support index hints
-#query TTTTT
-#EXPLAIN (VERBOSE) SELECT DISTINCT v FROM kv@idx
-#----
-#Tree            Field      Description       Columns          Ordering
-#distinct        ·          ·                 (v)              weak-key(v); +v
-# │              order key  v                 ·                ·
-# └── render     ·          ·                 (v)              weak-key(v); +v
-#      │         render 0   test.public.kv.v  ·                ·
-#      └── scan  ·          ·                 (k[omitted], v)  weak-key(v); +v
-#·               table      kv@idx            ·                ·
-#·               spans      ALL               ·                ·
-#
-## Here we can infer that v is not-NULL so eliding the node is correct.
-#query TTTTT
-#EXPLAIN (VERBOSE) SELECT DISTINCT v FROM kv@idx WHERE v > 0
-#----
-#Tree       Field     Description       Columns          Ordering
-#render     ·         ·                 (v)              v!=NULL; key(v)
-# │         render 0  test.public.kv.v  ·                ·
-# └── scan  ·         ·                 (k[omitted], v)  v!=NULL; key(v)
-#·          table     kv@idx            ·                ·
-#·          spans     /1-               ·                ·
-#
-#statement ok
-#CREATE TABLE kv2 (k INT PRIMARY KEY, v INT NOT NULL, UNIQUE INDEX idx(v))
-#
-## In this case it is correct to elide the distinct node.
-#query TTTTT
-#EXPLAIN (VERBOSE) SELECT DISTINCT v FROM kv2@idx
-#----
-#Tree       Field     Description        Columns          Ordering
-#render     ·         ·                  (v)              v!=NULL; key(v)
-# │         render 0  test.public.kv2.v  ·                ·
-# └── scan  ·         ·                  (k[omitted], v)  v!=NULL; key(v)
-#·          table     kv2@idx            ·                ·
-#·          spans     ALL                ·                ·
+query TTTTT
+EXPLAIN (VERBOSE) SELECT DISTINCT v FROM kv@idx
+----
+·          distributed  false   ·    ·
+·          vectorized   true    ·    ·
+distinct   ·            ·       (v)  ·
+ │         distinct on  v       ·    ·
+ │         order key    v       ·    ·
+ └── scan  ·            ·       (v)  +v
+·          table        kv@idx  ·    ·
+·          spans        ALL     ·    ·
+
+# Here we can infer that v is not-NULL so eliding the node is correct.
+query TTTTT
+EXPLAIN (VERBOSE) SELECT DISTINCT v FROM kv@idx WHERE v > 0
+----
+·     distributed  false   ·    ·
+·     vectorized   true    ·    ·
+scan  ·            ·       (v)  ·
+·     table        kv@idx  ·    ·
+·     spans        /1-     ·    ·
+
+statement ok
+CREATE TABLE kv2 (k INT PRIMARY KEY, v INT NOT NULL, UNIQUE INDEX idx(v))
+
+# In this case it is correct to elide the distinct node.
+query TTTTT
+EXPLAIN (VERBOSE) SELECT DISTINCT v FROM kv2@idx
+----
+·     distributed  false    ·    ·
+·     vectorized   true     ·    ·
+scan  ·            ·        (v)  ·
+·     table        kv2@idx  ·    ·
+·     spans        ALL      ·    ·

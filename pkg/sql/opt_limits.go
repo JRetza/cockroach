@@ -1,22 +1,20 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
 	"fmt"
 	"math"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
 // applyLimit tells this node to optimize things under the assumption that
@@ -73,21 +71,9 @@ func (p *planner) applyLimit(plan planNode, numRows int64, soft bool) {
 		p.applyLimit(n.plan, getLimit(count, n.offset), false /* soft */)
 
 	case *sortNode:
-		if n.needSort && numRows != math.MaxInt64 {
-			v := p.newSortValues(n.ordering, planColumns(n.plan), int(numRows))
-			if soft {
-				n.run.sortStrategy = newIterativeSortStrategy(v)
-			} else {
-				n.run.sortStrategy = newSortTopKStrategy(v, numRows)
-			}
-		}
-		if n.needSort {
-			// We can't propagate the limit, because the sort
-			// potentially needs all rows.
-			numRows = math.MaxInt64
-			soft = true
-		}
-		p.applyLimit(n.plan, numRows, soft)
+		// We can't propagate the limit, because the sort potentially needs all
+		// rows.
+		p.setUnlimited(n.plan)
 
 	case *groupNode:
 		if n.needOnlyOneRow {
@@ -101,7 +87,7 @@ func (p *planner) applyLimit(plan planNode, numRows int64, soft bool) {
 	case *indexJoinNode:
 		// If we have a limit in the table node (i.e. post-index-join), the
 		// limit in the index is soft.
-		p.applyLimit(n.index, numRows, soft || !isFilterTrue(n.table.filter))
+		p.applyLimit(n.input, numRows, soft || !isFilterTrue(n.table.filter))
 		p.setUnlimited(n.table)
 
 	case *unionNode:
@@ -124,6 +110,9 @@ func (p *planner) applyLimit(plan planNode, numRows int64, soft bool) {
 	case *windowNode:
 		p.setUnlimited(n.plan)
 
+	case *max1RowNode:
+		p.setUnlimited(n.plan)
+
 	case *joinNode:
 		p.setUnlimited(n.left.plan)
 		p.setUnlimited(n.right.plan)
@@ -141,6 +130,9 @@ func (p *planner) applyLimit(plan planNode, numRows int64, soft bool) {
 		if n.plan != nil {
 			p.applyLimit(n.plan, numRows, soft)
 		}
+
+	case *projectSetNode:
+		p.applyLimit(n.source, numRows, true)
 
 	case *rowCountNode:
 		p.setUnlimited(n.source)
@@ -170,25 +162,24 @@ func (p *planner) applyLimit(plan planNode, numRows int64, soft bool) {
 		if n.sourcePlan != nil {
 			p.applyLimit(n.sourcePlan, numRows, soft)
 		}
-	case *distSQLWrapper:
-		p.applyLimit(n.plan, numRows, soft)
 	case *explainDistSQLNode:
-		p.setUnlimited(n.plan)
-	case *showTraceNode:
-		if n.plan != nil {
+		// EXPLAIN ANALYZE is special: it handles its own limit propagation, since
+		// it fully executes during startExec.
+		if !n.analyze {
 			p.setUnlimited(n.plan)
 		}
 	case *showTraceReplicaNode:
 		p.setUnlimited(n.plan)
 	case *explainPlanNode:
-		if n.expanded {
-			p.setUnlimited(n.plan)
-		}
+		p.setUnlimited(n.plan)
 
 	case *splitNode:
 		p.setUnlimited(n.rows)
 
-	case *testingRelocateNode:
+	case *unsplitNode:
+		p.setUnlimited(n.rows)
+
+	case *relocateNode:
 		p.setUnlimited(n.rows)
 
 	case *cancelQueriesNode:
@@ -200,12 +191,33 @@ func (p *planner) applyLimit(plan planNode, numRows int64, soft bool) {
 	case *controlJobsNode:
 		p.setUnlimited(n.rows)
 
+	case *errorIfRowsNode:
+		p.setUnlimited(n.plan)
+
+	case *bufferNode:
+		p.setUnlimited(n.plan)
+
+	case *exportNode:
+		p.setUnlimited(n.source)
+
 	case *valuesNode:
+	case *virtualTableNode:
 	case *alterIndexNode:
 	case *alterTableNode:
 	case *alterSequenceNode:
 	case *alterUserSetPasswordNode:
+	case *deleteRangeNode:
+	case *renameColumnNode:
+	case *renameDatabaseNode:
+	case *renameIndexNode:
+	case *renameTableNode:
 	case *scrubNode:
+	case *truncateNode:
+	case *changePrivilegesNode:
+	case *commentOnColumnNode:
+	case *commentOnDatabaseNode:
+	case *commentOnIndexNode:
+	case *commentOnTableNode:
 	case *createDatabaseNode:
 	case *createIndexNode:
 	case *CreateUserNode:
@@ -218,18 +230,23 @@ func (p *planner) applyLimit(plan planNode, numRows int64, soft bool) {
 	case *dropViewNode:
 	case *dropSequenceNode:
 	case *DropUserNode:
+	case *explainVecNode:
 	case *zeroNode:
 	case *unaryNode:
 	case *hookFnNode:
-	case *valueGenerator:
 	case *sequenceSelectNode:
 	case *setVarNode:
 	case *setClusterSettingNode:
 	case *setZoneConfigNode:
-	case *showZoneConfigNode:
-	case *showRangesNode:
 	case *showFingerprintsNode:
+	case *showTraceNode:
 	case *scatterNode:
+	case *scanBufferNode:
+	case *recursiveCTENode:
+	case *unsplitAllNode:
+
+	case *applyJoinNode, *lookupJoinNode, *zigzagJoinNode, *saveTableNode:
+		// These nodes are only planned by the optimizer.
 
 	default:
 		panic(fmt.Sprintf("unhandled node type: %T", plan))
@@ -249,4 +266,8 @@ func getLimit(count, offset int64) int64 {
 		count = math.MaxInt64 - offset
 	}
 	return count + offset
+}
+
+func isFilterTrue(expr tree.TypedExpr) bool {
+	return expr == nil || expr == tree.DBoolTrue
 }

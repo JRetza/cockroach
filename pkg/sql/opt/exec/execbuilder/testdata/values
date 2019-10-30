@@ -1,33 +1,29 @@
-# LogicTest: opt
+# LogicTest: local
 
 # Tests for the implicit one row, zero column values operator.
 query TTTTT
-EXPLAIN (VERBOSE) SELECT 1
+EXPLAIN (VERBOSE) SELECT 1 a
 ----
-render         ·         ·  ("1")  ·
- │             render 0  1  ·      ·
- └── emptyrow  ·         ·  ()     ·
-
-query I
-SELECT 1
-----
-1
+·       distributed    false            ·    ·
+·       vectorized     false            ·    ·
+values  ·              ·                (a)  ·
+·       size           1 column, 1 row  ·    ·
+·       row 0, expr 0  1                ·    ·
 
 query TTTTT
-EXPLAIN (VERBOSE) SELECT 1 + 2
+EXPLAIN (VERBOSE) SELECT 1 + 2 a
 ----
-render         ·         ·  ("1 + 2")  ·
- │             render 0  3  ·          ·
- └── emptyrow  ·         ·  ()         ·
-
-query I
-SELECT 1 + 2
-----
-3
+·       distributed    false            ·    ·
+·       vectorized     false            ·    ·
+values  ·              ·                (a)  ·
+·       size           1 column, 1 row  ·    ·
+·       row 0, expr 0  3                ·    ·
 
 query TTTTT
 EXPLAIN (VERBOSE) VALUES (1, 2, 3), (4, 5, 6)
 ----
+·       distributed    false              ·                            ·
+·       vectorized     false              ·                            ·
 values  ·              ·                  (column1, column2, column3)  ·
 ·       size           3 columns, 2 rows  ·                            ·
 ·       row 0, expr 0  1                  ·                            ·
@@ -37,34 +33,24 @@ values  ·              ·                  (column1, column2, column3)  ·
 ·       row 1, expr 1  5                  ·                            ·
 ·       row 1, expr 2  6                  ·                            ·
 
-query III
-VALUES (1, 2, 3), (4, 5, 6)
-----
-1  2  3
-4  5  6
-
 query TTTTT
-EXPLAIN (VERBOSE) VALUES (LENGTH('a')), (1 + LENGTH('a')), (LENGTH('abc')), (LENGTH('ab') * 2)
+EXPLAIN (VERBOSE) VALUES (length('a')), (1 + length('a')), (length('abc')), (length('ab') * 2)
 ----
+·       distributed    false             ·          ·
+·       vectorized     false             ·          ·
 values  ·              ·                 (column1)  ·
 ·       size           1 column, 4 rows  ·          ·
-·       row 0, expr 0  length('a')       ·          ·
-·       row 1, expr 0  1 + length('a')   ·          ·
-·       row 2, expr 0  length('abc')     ·          ·
-·       row 3, expr 0  length('ab') * 2  ·          ·
-
-query I
-VALUES (LENGTH('a')), (1 + LENGTH('a')), (LENGTH('abc')), (LENGTH('ab') * 2)
-----
-1
-2
-3
-4
+·       row 0, expr 0  1                 ·          ·
+·       row 1, expr 0  2                 ·          ·
+·       row 2, expr 0  3                 ·          ·
+·       row 3, expr 0  4                 ·          ·
 
 query TTTTT
-EXPLAIN (VERBOSE) SELECT a + b FROM (VALUES (1, 2), (3, 4), (5, 6)) AS v(a, b)
+EXPLAIN (VERBOSE) SELECT a + b AS r FROM (VALUES (1, 2), (3, 4), (5, 6)) AS v(a, b)
 ----
-render       ·              ·                  ("a + b")           ·
+·            distributed    false              ·                   ·
+·            vectorized     false              ·                   ·
+render       ·              ·                  (r)                 ·
  │           render 0       column1 + column2  ·                   ·
  └── values  ·              ·                  (column1, column2)  ·
 ·            size           2 columns, 3 rows  ·                   ·
@@ -74,10 +60,3 @@ render       ·              ·                  ("a + b")           ·
 ·            row 1, expr 1  4                  ·                   ·
 ·            row 2, expr 0  5                  ·                   ·
 ·            row 2, expr 1  6                  ·                   ·
-
-query I
-SELECT a + b FROM (VALUES (1, 2), (3, 4), (5, 6)) AS v(a, b)
-----
-3
-7
-11

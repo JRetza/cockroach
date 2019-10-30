@@ -1,4 +1,0 @@
-# LogicTest: default
-
-statement error pq: unimplemented
-ALTER TABLE foo RENAME CONSTRAINT x TO y

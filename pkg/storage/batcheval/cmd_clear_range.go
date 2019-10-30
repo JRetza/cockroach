@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package batcheval
 
@@ -24,24 +20,24 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/spanset"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/kr/pretty"
 )
 
-// clearRangeBytesThreshold is the threshold over which the ClearRange
+// ClearRangeBytesThreshold is the threshold over which the ClearRange
 // command will use engine.ClearRange to efficiently perform a range
 // deletion. Otherwise, will revert to iterating through the values
 // and clearing them individually with engine.Clear.
-const clearRangeBytesThreshold = 512 << 10 // 512KiB
+const ClearRangeBytesThreshold = 512 << 10 // 512KiB
 
 func init() {
 	RegisterCommand(roachpb.ClearRange, declareKeysClearRange, ClearRange)
 }
 
 func declareKeysClearRange(
-	desc roachpb.RangeDescriptor, header roachpb.Header, req roachpb.Request, spans *spanset.SpanSet,
+	desc *roachpb.RangeDescriptor, header roachpb.Header, req roachpb.Request, spans *spanset.SpanSet,
 ) {
 	DefaultDeclareKeys(desc, header, req, spans)
 	// We look up the range descriptor key to check whether the span
@@ -54,7 +50,8 @@ func declareKeysClearRange(
 //
 // Note that "correct" use of this command is only possible for key
 // spans consisting of user data that we know is not being written to
-// or queried any more, such as after a DROP or TRUNCATE table.
+// or queried any more, such as after a DROP or TRUNCATE table, or
+// DROP index.
 func ClearRange(
 	ctx context.Context, batch engine.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
 ) (result.Result, error) {
@@ -65,8 +62,8 @@ func ClearRange(
 
 	// Encode MVCCKey values for start and end of clear span.
 	args := cArgs.Args.(*roachpb.ClearRangeRequest)
-	from := engine.MVCCKey{Key: args.Key}
-	to := engine.MVCCKey{Key: args.EndKey}
+	from := args.Key
+	to := args.EndKey
 	var pd result.Result
 
 	// Before clearing, compute the delta in MVCCStats.
@@ -79,10 +76,9 @@ func ClearRange(
 	// If the total size of data to be cleared is less than
 	// clearRangeBytesThreshold, clear the individual values manually,
 	// instead of using a range tombstone (inefficient for small ranges).
-	if total := statsDelta.Total(); total < clearRangeBytesThreshold {
-		log.VEventf(ctx, 2, "delta=%d < threshold=%d; using non-range clear", total, clearRangeBytesThreshold)
-		if err := batch.Iterate(
-			from, to,
+	if total := statsDelta.Total(); total < ClearRangeBytesThreshold {
+		log.VEventf(ctx, 2, "delta=%d < threshold=%d; using non-range clear", total, ClearRangeBytesThreshold)
+		if err := batch.Iterate(from, to,
 			func(kv engine.MVCCKeyValue) (bool, error) {
 				return false, batch.Clear(kv.Key)
 			},
@@ -94,17 +90,18 @@ func ClearRange(
 
 	// Otherwise, suggest a compaction for the cleared range and clear
 	// the key span using engine.ClearRange.
-	pd.Replicated.SuggestedCompactions = []storagebase.SuggestedCompaction{
+	pd.Replicated.SuggestedCompactions = []storagepb.SuggestedCompaction{
 		{
-			StartKey: from.Key,
-			EndKey:   to.Key,
-			Compaction: storagebase.Compaction{
+			StartKey: from,
+			EndKey:   to,
+			Compaction: storagepb.Compaction{
 				Bytes:            statsDelta.Total(),
 				SuggestedAtNanos: cArgs.Header.Timestamp.WallTime,
 			},
 		},
 	}
-	if err := batch.ClearRange(from, to); err != nil {
+	if err := batch.ClearRange(engine.MakeMVCCMetadataKey(from),
+		engine.MakeMVCCMetadataKey(to)); err != nil {
 		return result.Result{}, err
 	}
 	return pd, nil
@@ -119,14 +116,14 @@ func ClearRange(
 // path of simply subtracting the non-system values is accurate.
 // Returns the delta stats.
 func computeStatsDelta(
-	ctx context.Context, batch engine.ReadWriter, cArgs CommandArgs, from, to engine.MVCCKey,
+	ctx context.Context, batch engine.ReadWriter, cArgs CommandArgs, from, to roachpb.Key,
 ) (enginepb.MVCCStats, error) {
 	desc := cArgs.EvalCtx.Desc()
 	var delta enginepb.MVCCStats
 
 	// We can avoid manually computing the stats delta if we're clearing
 	// the entire range.
-	fast := desc.StartKey.Equal(from.Key) && desc.EndKey.Equal(to.Key)
+	fast := desc.StartKey.Equal(from) && desc.EndKey.Equal(to)
 	if fast {
 		// Note this it is safe to use the full range MVCC stats, as
 		// opposed to the usual method of computing only a localizied
@@ -140,7 +137,7 @@ func computeStatsDelta(
 	// If we can't use the fast stats path, or race test is enabled,
 	// compute stats across the key span to be cleared.
 	if !fast || util.RaceEnabled {
-		iter := batch.NewIterator(engine.IterOptions{})
+		iter := batch.NewIterator(engine.IterOptions{UpperBound: to})
 		computed, err := iter.ComputeStats(from, to, delta.LastUpdateNanos)
 		iter.Close()
 		if err != nil {
@@ -148,6 +145,7 @@ func computeStatsDelta(
 		}
 		// If we took the fast path but race is enabled, assert stats were correctly computed.
 		if fast {
+			delta.ContainsEstimates = computed.ContainsEstimates
 			if !delta.Equal(computed) {
 				log.Fatalf(ctx, "fast-path MVCCStats computation gave wrong result: diff(fast, computed) = %s",
 					pretty.Diff(delta, computed))

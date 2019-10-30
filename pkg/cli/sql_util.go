@@ -1,21 +1,16 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cli
 
 import (
-	"bytes"
 	"context"
 	gosql "database/sql"
 	"database/sql/driver"
@@ -29,15 +24,18 @@ import (
 	"unicode/utf8"
 
 	"github.com/cockroachdb/cockroach-go/crdb"
-	version "github.com/hashicorp/go-version"
-	"github.com/lib/pq"
-	"github.com/pkg/errors"
-
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/version"
+	"github.com/cockroachdb/errors"
+	"github.com/lib/pq"
 )
 
 type sqlConnI interface {
@@ -67,6 +65,43 @@ type sqlConn struct {
 	clusterOrganization string
 }
 
+// initialSQLConnectionError signals to the error decorator in
+// error.go that we're failing during the initial connection set-up.
+type initialSQLConnectionError struct {
+	err error
+}
+
+// Error implements the error interface.
+func (i *initialSQLConnectionError) Error() string { return i.err.Error() }
+
+// Cause implements causer.
+func (i *initialSQLConnectionError) Cause() error { return i.err }
+
+// Format implements fmt.Formatter.
+func (i *initialSQLConnectionError) Format(s fmt.State, verb rune) { errors.FormatError(i, s, verb) }
+
+// FormatError implements errors.Formatter.
+func (i *initialSQLConnectionError) FormatError(p errors.Printer) error {
+	if p.Detail() {
+		p.Print("error while establishing the SQL session")
+	}
+	return i.err
+}
+
+// wrapConnError detects TCP EOF errors during the initial SQL handshake.
+// These are translated to a message "perhaps this is not a CockroachDB node"
+// at the top level.
+// EOF errors later in the SQL session should not be wrapped in that way,
+// because by that time we've established that the server is indeed a SQL
+// server.
+func wrapConnError(err error) error {
+	errMsg := err.Error()
+	if errMsg == "EOF" || errMsg == "unexpected EOF" {
+		return &initialSQLConnectionError{err}
+	}
+	return err
+}
+
 func (c *sqlConn) ensureConn() error {
 	if c.conn == nil {
 		if c.reconnecting && cliCtx.isInteractive {
@@ -75,7 +110,7 @@ func (c *sqlConn) ensureConn() error {
 		}
 		conn, err := pq.Open(c.url)
 		if err != nil {
-			return err
+			return wrapConnError(err)
 		}
 		if c.reconnecting && c.dbName != "" {
 			// Attempt to reset the current database.
@@ -88,7 +123,7 @@ func (c *sqlConn) ensureConn() error {
 		c.conn = conn.(sqlConnI)
 		if err := c.checkServerMetadata(); err != nil {
 			c.Close()
-			return err
+			return wrapConnError(err)
 		}
 		c.reconnecting = false
 	}
@@ -161,6 +196,9 @@ func (c *sqlConn) checkServerMetadata() error {
 	}
 
 	newServerVersion, newClusterID, err := c.getServerMetadata()
+	if err == driver.ErrBadConn {
+		return err
+	}
 	if err != nil {
 		// It is not an error that the server version cannot be retrieved.
 		fmt.Fprintf(stderr, "warning: unable to retrieve the server's version: %s\n", err)
@@ -186,9 +224,9 @@ func (c *sqlConn) checkServerMetadata() error {
 		}
 		fmt.Printf("# Server version: %s%s\n", c.serverBuild, isSame)
 
-		sv, err := version.NewVersion(c.serverVersion)
+		sv, err := version.Parse(c.serverVersion)
 		if err == nil {
-			cv, err := version.NewVersion(client.Tag)
+			cv, err := version.Parse(client.Tag)
 			if err == nil {
 				if sv.Compare(cv) == -1 { // server ver < client ver
 					fmt.Fprintln(stderr, "\nwarning: server version older than client! "+
@@ -217,23 +255,19 @@ func (c *sqlConn) checkServerMetadata() error {
 }
 
 // requireServerVersion returns an error if the version of the connected server
-// does not match the constraints in constraintString.
-func (c *sqlConn) requireServerVersion(constraintString string) error {
+// is not at least the given version.
+func (c *sqlConn) requireServerVersion(required *version.Version) error {
 	versionString, _, err := c.getServerMetadata()
 	if err != nil {
 		return err
 	}
-	constraints, err := version.NewConstraint(constraintString)
+	vers, err := version.Parse(versionString)
 	if err != nil {
-		return err
+		return fmt.Errorf("unable to parse server version %q", versionString)
 	}
-	vers, err := version.NewVersion(versionString)
-	if err != nil {
-		return fmt.Errorf("unable to parse server version %q", c.serverVersion)
-	}
-	if !constraints.Check(vers) {
+	if !vers.AtLeast(required) {
 		return fmt.Errorf("incompatible client and server versions (detected server version: %s, required: %s)",
-			vers, constraints)
+			vers, required)
 	}
 	return nil
 }
@@ -446,102 +480,54 @@ func makeSQLConn(url string) *sqlConn {
 	}
 }
 
-// getPasswordAndMakeSQLClient prompts for a password if running in secure mode
-// and no certificates have been supplied.
-// Attempting to use security.RootUser without valid certificates will return an error.
-func getPasswordAndMakeSQLClient(appName string) (*sqlConn, error) {
-	return makeSQLClient(appName)
-}
+var sqlConnTimeout = envutil.EnvOrDefaultString("COCKROACH_CONNECT_TIMEOUT", "5")
 
-// makeURLFromFlags constructs a pg connection URL using the values
-// initialized by command-line flags.
-func makeURLFromFlags(userinfo *url.Userinfo) *url.URL {
-	host := serverCfg.Addr
-	if !strings.HasPrefix(cliCtx.Addr, ":") {
-		host = cliCtx.Addr
-	}
+// defaultSQLDb describes how a missing database part in the SQL
+// connection string is processed when creating a client connection.
+type defaultSQLDb int
 
-	// Build the URL object.
-	return &url.URL{
-		Scheme: "postgresql",
-		Path:   cliCtx.sqlConnDBName,
-		Host:   host,
-		User:   userinfo,
-	}
-}
+const (
+	// useSystemDb means that a missing database will be overridden with
+	// "system".
+	useSystemDb defaultSQLDb = iota
+	// useDefaultDb means that a missing database will be left as-is so
+	// that the server can default to "defaultdb".
+	useDefaultDb
+)
 
 // makeSQLClient connects to the database using the connection
-// settings set by the command-line flags. The value of --url, if any
-// is provided is used as the source of configuration; otherwise a URL
-// is constructed from the other command-line parameters.
+// settings set by the command-line flags.
+// If a password is needed, it also prompts for the password.
 //
-// If --url is specified but any of the following items is _missing_
-// from the URL, the remaining command-line flags are used to "fill it
-// in":
-//
-// - the current database (--database)
-// - the user (--user)
-// - the SSL configuration (--insecure, --certs-dir, etc)
-//
-// Otherwise, if an item is present both in the URL and specified
-// otherwise, a warning is printed to indicate that the URL prevails.
+// If forceSystemDB is set, it also connects it to the `system`
+// database. The --database flag or database part in the URL is then
+// ignored.
 //
 // The appName given as argument is added to the URL even if --url is
 // specified, but only if the URL didn't already specify
-// application_name.
-func makeSQLClient(appName string) (*sqlConn, error) {
-	var baseURL *url.URL
-	var options url.Values
-
-	defaultUserinfo := url.User(security.RootUser)
-	if cliCtx.sqlConnUser != "" {
-		defaultUserinfo = url.User(cliCtx.sqlConnUser)
+// application_name. It is prefixed with '$ ' to mark it as internal.
+func makeSQLClient(appName string, defaultMode defaultSQLDb) (*sqlConn, error) {
+	baseURL, err := cliCtx.makeClientConnURL()
+	if err != nil {
+		return nil, err
 	}
 
-	// Determine the starting point.
-	if cliCtx.sqlConnURL == "" {
-		baseURL = makeURLFromFlags(defaultUserinfo)
-		options = url.Values{}
-	} else {
-		// User-specified --url is the starting point.
-		var err error
-		baseURL, err = url.Parse(cliCtx.sqlConnURL)
-		if err != nil {
-			return nil, err
-		}
-		options, err = url.ParseQuery(baseURL.RawQuery)
-		if err != nil {
-			return nil, err
-		}
-
-		// Check that any argument otherwise used to
-		// populate a URL, if --url was not specified, have
-		// not been specified if --url was.
-		if baseURL.Path != "" && cliCtx.sqlConnDBName != "" {
-			log.Warning(context.Background(), "parameter --database ignored, using --url instead")
-		}
-		if baseURL.User.Username() != "" && cliCtx.sqlConnUser != "" {
-			log.Warning(context.Background(), "parameter --user ignored, using --url instead")
-		}
-		if !strings.HasPrefix(cliCtx.Addr, ":") {
-			log.Warning(context.Background(), "parameter --host ignored, using --url instead")
-		}
-		if options.Get("sslmode") != "" && cliCtx.Insecure {
-			log.Warning(context.Background(), "parameter --insecure ignored, using --url instead")
-		}
+	if defaultMode == useSystemDb && baseURL.Path == "" {
+		// Override the target database. This is because the current
+		// database can influence the output of CLI commands, and in the
+		// case where the database is missing it will default server-wise to
+		// `defaultdb` which may not exist.
+		baseURL.Path = "system"
 	}
 
-	// If there is no user in the URL already, use the one passed as
-	// command-line flag.
+	// If there is no user in the URL already, fill in the default user.
 	if baseURL.User.Username() == "" {
-		baseURL.User = defaultUserinfo
+		baseURL.User = url.User(security.RootUser)
 	}
 
-	// If there are no SSL options yet, use the command-line flags to set them.
-	if options.Get("sslmode") == "" {
-		if err := cliCtx.LoadSecurityOptions(options, baseURL.User.Username()); err != nil {
-			return nil, err
-		}
+	options, err := url.ParseQuery(baseURL.RawQuery)
+	if err != nil {
+		return nil, err
 	}
 
 	// Insecure connections are insecure and should never see a password. Reject
@@ -572,16 +558,19 @@ func makeSQLClient(appName string) (*sqlConn, error) {
 		}
 	}
 
-	// If there is no database in the URL already, use the one passed as
-	// command-line flag.
-	if baseURL.Path == "" || baseURL.Path == "/" {
-		baseURL.Path = cliCtx.sqlConnDBName
-	}
-
 	// Load the application name. It's not a command-line flag, so
 	// anything already in the URL should take priority.
 	if options.Get("application_name") == "" && appName != "" {
-		options.Set("application_name", appName)
+		options.Set("application_name", sqlbase.ReportableAppNamePrefix+appName)
+	}
+
+	// Set a connection timeout if none is provided already. This
+	// ensures that if the server was not initialized or there is some
+	// network issue, the client will not be left to hang forever.
+	//
+	// This is a lib/pq feature.
+	if options.Get("connect_timeout") == "" {
+		options.Set("connect_timeout", sqlConnTimeout)
 	}
 
 	baseURL.RawQuery = options.Encode()
@@ -731,23 +720,41 @@ func runQueryAndFormatResults(conn *sqlConn, w io.Writer, fn queryFunc) error {
 		}
 
 		cols := getColumnStrings(rows, true)
-		reporter, err := makeReporter()
+		reporter, cleanup, err := makeReporter(w)
 		if err != nil {
 			return err
 		}
-		if err := render(reporter, w, cols, newRowIter(rows, true), noRowsHook); err != nil {
+
+		var queryCompleteTime time.Time
+		completedHook := func() { queryCompleteTime = timeutil.Now() }
+
+		if err := func() error {
+			if cleanup != nil {
+				defer cleanup()
+			}
+			return render(reporter, w, cols, newRowIter(rows, true), completedHook, noRowsHook)
+		}(); err != nil {
 			return err
 		}
 
-		if cliCtx.showTimes {
+		if sqlCtx.showTimes {
 			// Present the time since the last result, or since the
 			// beginning of execution. Currently the execution engine makes
 			// all the work upfront so most of the time is accounted for by
 			// the 1st result; this is subject to change once CockroachDB
 			// evolves to stream results as statements are executed.
-			newNow := timeutil.Now()
-			fmt.Fprintf(w, "\nTime: %s\n\n", newNow.Sub(startTime))
-			startTime = newNow
+			fmt.Fprintf(w, "\nTime: %s\n", queryCompleteTime.Sub(startTime))
+			// Make users better understand any discrepancy they observe.
+			renderDelay := timeutil.Now().Sub(queryCompleteTime)
+			if renderDelay >= 1*time.Second {
+				fmt.Fprintf(w,
+					"Note: an additional delay of %s was spent formatting the results.\n"+
+						"You can use \\set display_format to change the formatting.\n",
+					renderDelay)
+			}
+			fmt.Fprintln(w)
+			// Reset the clock. We ignore the rendering time.
+			startTime = timeutil.Now()
 		}
 
 		if more, err := rows.NextResultSet(); err != nil {
@@ -852,23 +859,21 @@ func formatVal(val driver.Value, showPrintableUnicode bool, showNewLinesAndTabs 
 		return s[1 : len(s)-1]
 
 	case []byte:
-		if showPrintableUnicode {
-			pred := isNotGraphicUnicode
-			if showNewLinesAndTabs {
-				pred = isNotGraphicUnicodeOrTabOrNewline
-			}
-			if utf8.Valid(t) && bytes.IndexFunc(t, pred) == -1 {
-				return string(t)
-			}
-		} else {
-			if bytes.IndexFunc(t, isNotPrintableASCII) == -1 {
-				return string(t)
-			}
-		}
-		// Strip the start and final quotes. The surrounding display
-		// format (e.g. CSV/TSV) will add its own quotes.
-		s := fmt.Sprintf("%+q", t)
-		return s[1 : len(s)-1]
+		// Format the bytes as per bytea_output = escape.
+		//
+		// We use the "escape" format here because it enables printing
+		// readable strings as-is -- the default hex format would always
+		// render as hexadecimal digits. The escape format is also more
+		// compact.
+		//
+		// TODO(knz): this formatting is unfortunate/incorrect, and exists
+		// only because lib/pq incorrectly interprets the bytes received
+		// from the server. The proper behavior would be for the driver to
+		// not interpret the bytes and for us here to print that as-is, so
+		// that we can let the user see and control the result using
+		// `bytea_output`.
+		return lex.EncodeByteArrayToRawBytes(string(t),
+			sessiondata.BytesEncodeEscape, false /* skipHexPrefix */)
 
 	case time.Time:
 		return t.Format(tree.TimestampOutputFormat)

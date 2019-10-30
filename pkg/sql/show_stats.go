@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -19,17 +15,17 @@ import (
 	encjson "encoding/json"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/pkg/errors"
 )
 
 var showTableStatsColumns = sqlbase.ResultColumns{
-	{Name: "name", Typ: types.String},
-	{Name: "columns", Typ: types.TArray{Typ: types.String}},
-	{Name: "created_at", Typ: types.Timestamp},
+	{Name: "statistics_name", Typ: types.String},
+	{Name: "column_names", Typ: types.StringArray},
+	{Name: "created", Typ: types.Timestamp},
 	{Name: "row_count", Typ: types.Int},
 	{Name: "distinct_count", Typ: types.Int},
 	{Name: "null_count", Typ: types.Int},
@@ -37,25 +33,15 @@ var showTableStatsColumns = sqlbase.ResultColumns{
 }
 
 var showTableStatsJSONColumns = sqlbase.ResultColumns{
-	{Name: "statistics", Typ: types.JSON},
+	{Name: "statistics", Typ: types.Jsonb},
 }
 
 // ShowTableStats returns a SHOW STATISTICS statement for the specified table.
 // Privileges: Any privilege on table.
 func (p *planner) ShowTableStats(ctx context.Context, n *tree.ShowTableStats) (planNode, error) {
-	tn, err := n.Table.Normalize()
-	if err != nil {
-		return nil, err
-	}
-
-	var desc *TableDescriptor
 	// We avoid the cache so that we can observe the stats without
 	// taking a lease, like other SHOW commands.
-	//
-	// TODO(vivek): check if the cache can be used.
-	p.runWithOptions(resolveFlags{skipCache: true}, func() {
-		desc, err = ResolveExistingObject(ctx, p, tn, true /*required*/, requireTableDesc)
-	})
+	desc, err := p.ResolveUncachedTableDescriptorEx(ctx, n.Table, true /*required*/, ResolveRequireTableDesc)
 	if err != nil {
 		return nil, err
 	}
@@ -75,7 +61,7 @@ func (p *planner) ShowTableStats(ctx context.Context, n *tree.ShowTableStats) (p
 			//  - convert column IDs to column names
 			//  - if the statistic has a histogram, we return the statistic ID as a
 			//    "handle" which can be used with SHOW HISTOGRAM.
-			rows, _ /* cols */, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.Query(
+			rows, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.Query(
 				ctx,
 				"read-table-stats",
 				p.txn,
@@ -183,7 +169,7 @@ func (p *planner) ShowTableStats(ctx context.Context, n *tree.ShowTableStats) (p
 	}, nil
 }
 
-func statColumnString(desc *TableDescriptor, colID tree.Datum) string {
+func statColumnString(desc *ImmutableTableDescriptor, colID tree.Datum) string {
 	id := sqlbase.ColumnID(*colID.(*tree.DInt))
 	colDesc, err := desc.FindColumnByID(id)
 	if err != nil {

@@ -1,8 +1,8 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Cockroach Community Licence (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed as a CockroachDB Enterprise file under the Cockroach Community
+// License (the "License"); you may not use this file except in compliance with
+// the License. You may obtain a copy of the License at
 //
 //     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
 
@@ -16,7 +16,6 @@ import TimeScaleDropdown from "src/views/cluster/containers/timescale";
 import Dropdown, { DropdownOption } from "src/views/shared/components/dropdown";
 import swapByLicense from "src/views/shared/containers/licenseSwap";
 import { parseLocalityRoute } from "src/util/localities";
-import spinner from "assets/spinner.gif";
 import Loading from "src/views/shared/components/loading";
 import { connect } from "react-redux";
 import { AdminUIState } from "src/redux/state";
@@ -29,6 +28,7 @@ const NodeCanvasContent = swapByLicense(NeedEnterpriseLicense, NodeCanvasContain
 interface ClusterVisualizationProps {
   licenseDataExists: boolean;
   enterpriseEnabled: boolean;
+  clusterDataError: Error | null;
 }
 
 class ClusterVisualization extends React.Component<ClusterVisualizationProps & RouterState & { router: InjectedRouter }> {
@@ -79,11 +79,9 @@ class ClusterVisualization extends React.Component<ClusterVisualizationProps & R
         </div>
         <Loading
           loading={!this.props.licenseDataExists}
-          className="loading-image loading-image__spinner-left"
-          image={spinner}
-        >
-          <NodeCanvasContent tiers={tiers} />
-        </Loading>
+          error={this.props.clusterDataError}
+          render={() => <NodeCanvasContent tiers={tiers} />}
+        />
       </div>
     );
   }
@@ -93,6 +91,7 @@ function mapStateToProps(state: AdminUIState) {
   return {
     licenseDataExists: !!state.cachedData.cluster.data,
     enterpriseEnabled: selectEnterpriseEnabled(state),
+    clusterDataError: state.cachedData.cluster.lastError,
   };
 }
 

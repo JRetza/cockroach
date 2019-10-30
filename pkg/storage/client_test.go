@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 /* Package storage_test provides a means of testing store
 functionality which depends on a fully-functional KV client. This
@@ -33,14 +29,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cenk/backoff"
-	"github.com/coreos/etcd/raft"
-	"github.com/kr/pretty"
-	"github.com/pkg/errors"
-	circuit "github.com/rubyist/circuitbreaker"
-	"google.golang.org/grpc"
-
+	"github.com/cenkalti/backoff"
+	circuit "github.com/cockroachdb/circuitbreaker"
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/gossip/resolver"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
@@ -48,6 +40,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -65,6 +58,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/kr/pretty"
+	"github.com/pkg/errors"
+	"github.com/stretchr/testify/require"
+	"go.etcd.io/etcd/raft"
+	"google.golang.org/grpc"
 )
 
 // createTestStore creates a test store using an in-memory
@@ -72,44 +71,72 @@ import (
 func createTestStore(t testing.TB, stopper *stop.Stopper) (*storage.Store, *hlc.ManualClock) {
 	manual := hlc.NewManualClock(123)
 	cfg := storage.TestStoreConfig(hlc.NewClock(manual.UnixNano, time.Nanosecond))
-	store := createTestStoreWithConfig(t, stopper, cfg)
+	store := createTestStoreWithOpts(t, testStoreOpts{cfg: &cfg}, stopper)
 	return store, manual
 }
 
+// DEPRECATED. Use createTestStoreWithOpts().
 func createTestStoreWithConfig(
 	t testing.TB, stopper *stop.Stopper, storeCfg storage.StoreConfig,
 ) *storage.Store {
-	eng := engine.NewInMem(roachpb.Attributes{}, 10<<20)
-	stopper.AddCloser(eng)
-	store := createTestStoreWithEngine(t,
-		eng,
-		true,
-		storeCfg,
+	store := createTestStoreWithOpts(t,
+		testStoreOpts{
+			cfg: &storeCfg,
+		},
 		stopper,
 	)
 	return store
 }
 
+// testStoreOpts affords control over aspects of store creation.
+type testStoreOpts struct {
+	// dontBootstrap, if set, means that the engine will not be bootstrapped.
+	dontBootstrap bool
+	// dontCreateSystemRanges is relevant only if dontBootstrap is not set.
+	// If set, the store will have a single range. If not set, the store will have
+	// all the system ranges that are generally created for a cluster at boostrap.
+	dontCreateSystemRanges bool
+
+	cfg *storage.StoreConfig
+	eng engine.Engine
+}
+
 // createTestStoreWithEngine creates a test store using the given engine and clock.
 // TestStoreConfig() can be used for creating a config suitable for most
 // tests.
-func createTestStoreWithEngine(
-	t testing.TB,
-	eng engine.Engine,
-	bootstrap bool,
-	storeCfg storage.StoreConfig,
-	stopper *stop.Stopper,
+func createTestStoreWithOpts(
+	t testing.TB, opts testStoreOpts, stopper *stop.Stopper,
 ) *storage.Store {
+	var storeCfg storage.StoreConfig
+	if opts.cfg == nil {
+		manual := hlc.NewManualClock(123)
+		storeCfg = storage.TestStoreConfig(hlc.NewClock(manual.UnixNano, time.Nanosecond))
+	} else {
+		storeCfg = *opts.cfg
+	}
+	eng := opts.eng
+	if eng == nil {
+		eng = engine.NewInMem(roachpb.Attributes{}, 10<<20)
+		stopper.AddCloser(eng)
+	}
+
 	tracer := storeCfg.Settings.Tracer
 	ac := log.AmbientContext{Tracer: tracer}
 	storeCfg.AmbientCtx = ac
 
 	rpcContext := rpc.NewContext(
 		ac, &base.Config{Insecure: true}, storeCfg.Clock, stopper, &storeCfg.Settings.Version)
-	nodeDesc := &roachpb.NodeDescriptor{NodeID: 1}
+	// Ensure that tests using this test context and restart/shut down
+	// their servers do not inadvertently start talking to servers from
+	// unrelated concurrent tests.
+	rpcContext.ClusterID.Set(context.TODO(), uuid.MakeV4())
+	nodeDesc := &roachpb.NodeDescriptor{
+		NodeID:  1,
+		Address: util.MakeUnresolvedAddr("tcp", "invalid.invalid:26257"),
+	}
 	server := rpc.NewServer(rpcContext) // never started
 	storeCfg.Gossip = gossip.NewTest(
-		nodeDesc.NodeID, rpcContext, server, stopper, metric.NewRegistry(),
+		nodeDesc.NodeID, rpcContext, server, stopper, metric.NewRegistry(), storeCfg.DefaultZoneConfig,
 	)
 	storeCfg.ScanMaxIdleTime = 1 * time.Second
 	stores := storage.NewStores(ac, storeCfg.Clock, storeCfg.Settings.Version.MinSupportedVersion, storeCfg.Settings.Version.ServerVersion)
@@ -123,35 +150,53 @@ func createTestStoreWithEngine(
 	distSender := kv.NewDistSender(kv.DistSenderConfig{
 		AmbientCtx: ac,
 		Clock:      storeCfg.Clock,
-		TestingKnobs: kv.DistSenderTestingKnobs{
+		RPCContext: rpcContext,
+		TestingKnobs: kv.ClientTestingKnobs{
 			TransportFactory: kv.SenderTransportFactory(tracer, stores),
 		},
 		RPCRetryOptions: &retryOpts,
 	}, storeCfg.Gossip)
 
 	tcsFactory := kv.NewTxnCoordSenderFactory(
-		ac,
-		storeCfg.Settings,
+		kv.TxnCoordSenderFactoryConfig{
+			AmbientCtx: ac,
+			Settings:   storeCfg.Settings,
+			Clock:      storeCfg.Clock,
+			Stopper:    stopper,
+		},
 		distSender,
-		storeCfg.Clock,
-		false,
-		stopper,
-		kv.MakeTxnMetrics(metric.TestSampleInterval),
 	)
-	storeCfg.DB = client.NewDB(tcsFactory, storeCfg.Clock)
+	storeCfg.DB = client.NewDB(ac, tcsFactory, storeCfg.Clock)
 	storeCfg.StorePool = storage.NewTestStorePool(storeCfg)
 	storeCfg.Transport = storage.NewDummyRaftTransport(storeCfg.Settings)
 	// TODO(bdarnell): arrange to have the transport closed.
-	store := storage.NewStore(storeCfg, eng, nodeDesc)
 	ctx := context.Background()
-	if bootstrap {
-		if err := store.Bootstrap(ctx, roachpb.StoreIdent{NodeID: 1, StoreID: 1}, storeCfg.Settings.Version.BootstrapVersion()); err != nil {
+	if !opts.dontBootstrap {
+		if err := storage.InitEngine(
+			ctx, eng, roachpb.StoreIdent{NodeID: 1, StoreID: 1},
+			storeCfg.Settings.Version.BootstrapVersion(),
+		); err != nil {
 			t.Fatal(err)
 		}
 	}
-	stores.AddStore(store)
-	if bootstrap {
-		err := store.BootstrapRange(sqlbase.MakeMetadataSchema().GetInitialValues(), storeCfg.Settings.Version.ServerVersion)
+	store := storage.NewStore(ctx, storeCfg, eng, nodeDesc)
+	if !opts.dontBootstrap {
+		var kvs []roachpb.KeyValue
+		var splits []roachpb.RKey
+		kvs, tableSplits := sqlbase.MakeMetadataSchema(storeCfg.DefaultZoneConfig, storeCfg.DefaultSystemZoneConfig).GetInitialValues()
+		if !opts.dontCreateSystemRanges {
+			splits = config.StaticSplits()
+			splits = append(splits, tableSplits...)
+			sort.Slice(splits, func(i, j int) bool {
+				return splits[i].Less(splits[j])
+			})
+		}
+		err := storage.WriteInitialClusterData(
+			ctx,
+			eng,
+			kvs, /* initialValues */
+			storeCfg.Settings.Version.BootstrapVersion().Version,
+			1 /* numStores */, splits, storeCfg.Clock.PhysicalNow())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -159,38 +204,69 @@ func createTestStoreWithEngine(
 	if err := store.Start(ctx, stopper); err != nil {
 		t.Fatal(err)
 	}
+	stores.AddStore(store)
 
 	// Connect to gossip and gossip the store's capacity.
 	<-store.Gossip().Connected
-	if err := store.GossipStore(ctx); err != nil {
+	if err := store.GossipStore(ctx, false /* useCached */); err != nil {
 		t.Fatal(err)
 	}
 	// Wait for the store's single range to have quorum before proceeding.
-	repl := store.LookupReplica(roachpb.RKeyMin, nil)
+	repl := store.LookupReplica(roachpb.RKeyMin)
+
+	// Send a request through the range to make sure everything is warmed up
+	// and works.
+	// NB: it's unclear if this code is necessary.
+	var ba roachpb.BatchRequest
+	get := roachpb.GetRequest{}
+	get.Key = keys.LocalMax
+	ba.Header.Replica = repl.Desc().Replicas().Voters()[0]
+	ba.Header.RangeID = repl.RangeID
+	ba.Add(&get)
+	_, pErr := store.Send(ctx, ba)
+	require.NoError(t, pErr.GoError())
+
+	// Wait for the system config to be available in gossip. All sorts of things
+	// might not work properly while the system config is not available.
 	testutils.SucceedsSoon(t, func() error {
-		if !repl.HasQuorum() {
-			return errors.New("first range has not reached quorum")
+		if cfg := store.Gossip().GetSystemConfig(); cfg == nil {
+			return errors.Errorf("system config not available in gossip yet")
 		}
 		return nil
 	})
+
+	// Make all the initial ranges part of replication queue purgatory. This is
+	// similar to what a real cluster does after bootstrap - we want the initial
+	// ranges to up-replicate as soon as other nodes join.
+	if err := store.ForceReplicationScanAndProcess(); err != nil {
+		t.Fatal(err)
+	}
 
 	return store
 }
 
 type multiTestContext struct {
-	t           *testing.T
+	t           testing.TB
 	storeConfig *storage.StoreConfig
 	manualClock *hlc.ManualClock
 	clock       *hlc.Clock
 	rpcContext  *rpc.Context
-	injEngines  bool
+	// rpcTestingKnobs are optional configuration for the rpcContext.
+	rpcTestingKnobs rpc.ContextTestingKnobs
+
+	// By default, a multiTestContext starts with a bunch of system ranges, just
+	// like a regular Server after bootstrap. If startWithSingleRange is set,
+	// we'll start with a single range spanning all the key space. The split
+	// queue, if not disabled, might then create other range system ranges.
+	startWithSingleRange bool
 
 	nodeIDtoAddrMu struct {
 		*syncutil.RWMutex
 		nodeIDtoAddr map[roachpb.NodeID]net.Addr
 	}
 
-	transport *storage.RaftTransport
+	nodeDialer *nodedialer.Dialer
+	transport  *storage.RaftTransport
 
 	// The per-store clocks slice normally contains aliases of
 	// multiTestContext.clock, but it may be populated before Start() to
@@ -202,14 +278,11 @@ type multiTestContext struct {
 	dbs         []*client.DB
 	gossips     []*gossip.Gossip
 	storePools  []*storage.StorePool
-	dirCleanups []func()
-	caches      []engine.RocksDBCache
 	// We use multiple stoppers so we can restart different parts of the
 	// test individually. transportStopper is for 'transport', and the
 	// 'stoppers' slice corresponds to the 'stores'.
-	transportStopper   *stop.Stopper
-	engineStoppers     []*stop.Stopper
-	timeUntilStoreDead time.Duration
+	transportStopper *stop.Stopper
+	engineStoppers   []*stop.Stopper
 
 	// The fields below may mutate at runtime so the pointers they contain are
 	// protected by 'mu'.
@@ -231,7 +304,7 @@ func (m *multiTestContext) getNodeIDAddress(nodeID roachpb.NodeID) (net.Addr, er
 	return nil, errors.Errorf("unknown peer %d", nodeID)
 }
 
-func (m *multiTestContext) Start(t *testing.T, numStores int) {
+func (m *multiTestContext) Start(t testing.TB, numStores int) {
 	{
 		// Only the fields we nil out below can be injected into m as it
 		// starts up, so fail early if anything else was set (as we'd likely
@@ -242,8 +315,8 @@ func (m *multiTestContext) Start(t *testing.T, numStores int) {
 		mCopy.clock = nil
 		mCopy.engines = nil
 		mCopy.engineStoppers = nil
-		mCopy.injEngines = false
-		mCopy.timeUntilStoreDead = 0
+		mCopy.startWithSingleRange = false
+		mCopy.rpcTestingKnobs = rpc.ContextTestingKnobs{}
 		var empty multiTestContext
 		if !reflect.DeepEqual(empty, mCopy) {
 			t.Fatalf("illegal fields set in multiTestContext:\n%s", pretty.Diff(empty, mCopy))
@@ -276,8 +349,16 @@ func (m *multiTestContext) Start(t *testing.T, numStores int) {
 	}
 	st := cluster.MakeTestingClusterSettings()
 	if m.rpcContext == nil {
-		m.rpcContext = rpc.NewContext(log.AmbientContext{Tracer: st.Tracer}, &base.Config{Insecure: true}, m.clock,
-			m.transportStopper, &st.Version)
+		m.rpcContext = rpc.NewContextWithTestingKnobs(log.AmbientContext{Tracer: st.Tracer}, &base.Config{Insecure: true}, m.clock,
+			m.transportStopper, &st.Version, m.rpcTestingKnobs)
+		// Ensure that tests using this test context and restart/shut down
+		// their servers do not inadvertently start talking to servers from
+		// unrelated concurrent tests.
+		m.rpcContext.ClusterID.Set(context.TODO(), uuid.MakeV4())
+		// We are sharing the same RPC context for all simulated nodes, so we can't enforce
+		// some of the RPC check validation.
+		m.rpcContext.TestingAllowNamedRPCToAnonymousServer = true
+
 		// Create a breaker which never trips and never backs off to avoid
 		// introducing timing-based flakes.
 		m.rpcContext.BreakerFactory = func() *circuit.Breaker {
@@ -286,8 +367,10 @@ func (m *multiTestContext) Start(t *testing.T, numStores int) {
 			})
 		}
 	}
+	m.nodeDialer = nodedialer.New(m.rpcContext, m.getNodeIDAddress)
 	m.transport = storage.NewRaftTransport(
-		log.AmbientContext{Tracer: st.Tracer}, st, m.getNodeIDAddress, nil, m.rpcContext,
+		log.AmbientContext{Tracer: st.Tracer}, st,
+		m.nodeDialer, nil, m.transportStopper,
 	)
 
 	for idx := 0; idx < numStores; idx++ {
@@ -297,7 +380,7 @@ func (m *multiTestContext) Start(t *testing.T, numStores int) {
 	// Wait for gossip to startup.
 	testutils.SucceedsSoon(t, func() error {
 		for i, g := range m.gossips {
-			if _, ok := g.GetSystemConfig(); !ok {
+			if cfg := g.GetSystemConfig(); cfg == nil {
 				return errors.Errorf("system config not available at index %d", i)
 			}
 		}
@@ -341,14 +424,6 @@ func (m *multiTestContext) Stop() {
 		}
 		m.transportStopper.Stop(context.TODO())
 
-		for _, cleanup := range m.dirCleanups {
-			cleanup()
-		}
-
-		for _, cache := range m.caches {
-			cache.Release()
-		}
-
 		for _, s := range m.engineStoppers {
 			s.Stop(context.TODO())
 		}
@@ -369,6 +444,14 @@ func (m *multiTestContext) Stop() {
 			panic("timed out during shutdown")
 		}
 	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, s := range m.stores {
+		if s != nil {
+			s.AssertInvariants()
+		}
+	}
 }
 
 // gossipStores forces each store to gossip its store descriptor and then
@@ -377,7 +460,7 @@ func (m *multiTestContext) gossipStores() {
 	timestamps := make(map[string]int64)
 	for i := 0; i < len(m.stores); i++ {
 		<-m.gossips[i].Connected
-		if err := m.stores[i].GossipStore(context.Background()); err != nil {
+		if err := m.stores[i].GossipStore(context.Background(), false /* useCached */); err != nil {
 			m.t.Fatal(err)
 		}
 		infoStatus := m.gossips[i].GetInfoStatus()
@@ -423,7 +506,6 @@ type multiTestContextKVTransport struct {
 	mtc      *multiTestContext
 	idx      int
 	replicas kv.ReplicaSlice
-	args     roachpb.BatchRequest
 	mu       struct {
 		syncutil.Mutex
 		pending map[roachpb.ReplicaID]struct{}
@@ -431,12 +513,11 @@ type multiTestContextKVTransport struct {
 }
 
 func (m *multiTestContext) kvTransportFactory(
-	_ kv.SendOptions, _ *rpc.Context, replicas kv.ReplicaSlice, args roachpb.BatchRequest,
+	_ kv.SendOptions, _ *nodedialer.Dialer, replicas kv.ReplicaSlice,
 ) (kv.Transport, error) {
 	t := &multiTestContextKVTransport{
 		mtc:      m,
 		replicas: replicas,
-		args:     args,
 	}
 	t.mu.pending = map[roachpb.ReplicaID]struct{}{}
 	return t, nil
@@ -450,11 +531,12 @@ func (t *multiTestContextKVTransport) IsExhausted() bool {
 	return t.idx == len(t.replicas)
 }
 
-func (t *multiTestContextKVTransport) GetPending() []roachpb.ReplicaDescriptor {
-	return nil
-}
-
-func (t *multiTestContextKVTransport) SendNext(ctx context.Context, done chan<- kv.BatchCall) {
+func (t *multiTestContextKVTransport) SendNext(
+	ctx context.Context, ba roachpb.BatchRequest,
+) (*roachpb.BatchResponse, error) {
+	if ctx.Err() != nil {
+		return nil, errors.Wrap(ctx.Err(), "send context is canceled")
+	}
 	rep := t.replicas[t.idx]
 	t.idx++
 	t.setPending(rep.ReplicaID, true)
@@ -473,53 +555,62 @@ func (t *multiTestContextKVTransport) SendNext(ctx context.Context, done chan<- 
 	// would happen with real RPCs.
 	t.mtc.mu.RLock()
 	s := t.mtc.stoppers[nodeIndex]
+	sender := t.mtc.senders[nodeIndex]
 	t.mtc.mu.RUnlock()
-	if s == nil || s.RunAsyncTask(ctx, "storage.multiTestContextKVTransport: calling next replica", func(ctx context.Context) {
-		t.mtc.mu.RLock()
-		sender := t.mtc.senders[nodeIndex]
-		t.mtc.mu.RUnlock()
-		// Make a copy and clone txn of batch args for sending.
-		baCopy := t.args
-		baCopy.Replica = rep.ReplicaDescriptor
-		if txn := baCopy.Txn; txn != nil {
-			txnClone := baCopy.Txn.Clone()
-			baCopy.Txn = &txnClone
-		}
-		br, pErr := sender.Send(ctx, baCopy)
-		if br == nil {
-			br = &roachpb.BatchResponse{}
-		}
-		if br.Error != nil {
-			panic(roachpb.ErrorUnexpectedlySet(sender, br))
-		}
-		br.Error = pErr
 
-		// On certain errors, we must expire leases to ensure that the
-		// next attempt has a chance of succeeding.
-		switch tErr := pErr.GetDetail().(type) {
-		case *roachpb.NotLeaseHolderError:
-			if leaseHolder := tErr.LeaseHolder; leaseHolder != nil {
-				t.mtc.mu.RLock()
-				leaseHolderStore := t.mtc.stores[leaseHolder.NodeID-1]
-				t.mtc.mu.RUnlock()
-				if leaseHolderStore == nil {
-					// The lease holder is known but down, so expire its lease.
-					t.mtc.advanceClock(ctx)
-				}
-			} else {
-				// stores has the range, is *not* the lease holder, but the
-				// lease holder is not known; this can happen if the lease
-				// holder is removed from the group. Move the manual clock
-				// forward in an attempt to expire the lease.
+	if s == nil {
+		t.setPending(rep.ReplicaID, false)
+		return nil, roachpb.NewSendError("store is stopped")
+	}
+
+	// Clone txn of ba args for sending.
+	ba.Replica = rep.ReplicaDescriptor
+	if txn := ba.Txn; txn != nil {
+		ba.Txn = ba.Txn.Clone()
+	}
+	var br *roachpb.BatchResponse
+	var pErr *roachpb.Error
+	if err := s.RunTask(ctx, "mtc send", func(ctx context.Context) {
+		br, pErr = sender.Send(ctx, ba)
+	}); err != nil {
+		pErr = roachpb.NewError(err)
+	}
+	if br == nil {
+		br = &roachpb.BatchResponse{}
+	}
+	if br.Error != nil {
+		panic(roachpb.ErrorUnexpectedlySet(sender, br))
+	}
+	br.Error = pErr
+
+	// On certain errors, we must expire leases to ensure that the
+	// next attempt has a chance of succeeding.
+	switch tErr := pErr.GetDetail().(type) {
+	case *roachpb.NotLeaseHolderError:
+		if leaseHolder := tErr.LeaseHolder; leaseHolder != nil {
+			t.mtc.mu.RLock()
+			leaseHolderStore := t.mtc.stores[leaseHolder.NodeID-1]
+			t.mtc.mu.RUnlock()
+			if leaseHolderStore == nil {
+				// The lease holder is known but down, so expire its lease.
 				t.mtc.advanceClock(ctx)
 			}
+		} else {
+			// stores has the range, is *not* the lease holder, but the
+			// lease holder is not known; this can happen if the lease
+			// holder is removed from the group. Move the manual clock
+			// forward in an attempt to expire the lease.
+			t.mtc.advanceClock(ctx)
 		}
-		t.setPending(rep.ReplicaID, false)
-		done <- kv.BatchCall{Reply: br, Err: nil}
-	}) != nil {
-		t.setPending(rep.ReplicaID, false)
-		done <- kv.BatchCall{Err: roachpb.NewSendError("store is stopped")}
 	}
+	t.setPending(rep.ReplicaID, false)
+	return br, nil
+}
+
+func (t *multiTestContextKVTransport) NextInternalClient(
+	ctx context.Context,
+) (context.Context, roachpb.InternalClient, error) {
+	panic("unimplemented")
 }
 
 func (t *multiTestContextKVTransport) NextReplica() roachpb.ReplicaDescriptor {
@@ -557,8 +648,6 @@ func (t *multiTestContextKVTransport) setPending(repID roachpb.ReplicaID, pendin
 	}
 }
 
-func (*multiTestContextKVTransport) Close() {}
-
 // rangeDescByAge implements sort.Interface for RangeDescriptor, sorting by the
 // age of the RangeDescriptor. This is intended to find the most recent version
 // of the same RangeDescriptor, when multiple versions of it are available.
@@ -574,7 +663,7 @@ func (rd rangeDescByAge) Less(i, j int) bool {
 	}
 	// If two RangeDescriptor versions have the same NextReplicaID, then the one
 	// with the fewest replicas is the newest.
-	return len(rd[i].Replicas) > len(rd[j].Replicas)
+	return len(rd[i].InternalReplicas) > len(rd[j].InternalReplicas)
 }
 
 // FirstRange implements the RangeDescriptorDB interface. It returns the range
@@ -583,9 +672,9 @@ func (rd rangeDescByAge) Less(i, j int) bool {
 // DistSender's implementation of FirstRange() does not work correctly because
 // the gossip network used by multiTestContext is only partially operational.
 func (m *multiTestContext) FirstRange() (*roachpb.RangeDescriptor, error) {
-	var descs []*roachpb.RangeDescriptor
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	var descs []*roachpb.RangeDescriptor
 	for _, str := range m.senders {
 		// Node liveness heartbeats start quickly, sometimes before the first
 		// range would be available here and before we've added all ranges.
@@ -594,22 +683,20 @@ func (m *multiTestContext) FirstRange() (*roachpb.RangeDescriptor, error) {
 		}
 		// Find every version of the RangeDescriptor for the first range by
 		// querying all stores; it may not be present on all stores, but the
-		// current version is guaranteed to be present on one of them.
+		// current version is guaranteed to be present on one of them as long
+		// as all stores are alive.
 		if err := str.VisitStores(func(s *storage.Store) error {
-			firstRng := s.LookupReplica(roachpb.RKeyMin, nil)
+			firstRng := s.LookupReplica(roachpb.RKeyMin)
 			if firstRng != nil {
 				descs = append(descs, firstRng.Desc())
 			}
 			return nil
 		}); err != nil {
-			panic(fmt.Sprintf(
-				"no error should be possible from this invocation of VisitStores, but found %s", err))
+			m.t.Fatalf("no error should be possible from this invocation of VisitStores, but found %s", err)
 		}
 	}
 	if len(descs) == 0 {
-		// This is a panic because it should currently be impossible in a properly
-		// constructed multiTestContext.
-		panic("first Range is not present on any store in the multiTestContext.")
+		return nil, errors.New("first Range is not present on any live store in the multiTestContext")
 	}
 	// Sort the RangeDescriptor versions by age and return the most recent
 	// version.
@@ -626,8 +713,10 @@ func (m *multiTestContext) makeStoreConfig(i int) storage.StoreConfig {
 		cfg = storage.TestStoreConfig(m.clocks[i])
 		m.storeConfig = &cfg
 	}
+	cfg.NodeDialer = m.nodeDialer
 	cfg.Transport = m.transport
 	cfg.Gossip = m.gossips[i]
+	cfg.TestingKnobs.DisableMergeQueue = true
 	cfg.TestingKnobs.DisableSplitQueue = true
 	cfg.TestingKnobs.ReplicateQueueAcceptsUnsplit = true
 	return cfg
@@ -649,38 +738,41 @@ func (mrdb mtcRangeDescriptorDB) RangeLookup(
 func (m *multiTestContext) populateDB(idx int, stopper *stop.Stopper) {
 	retryOpts := base.DefaultRetryOptions()
 	retryOpts.Closer = stopper.ShouldQuiesce()
-	ambient := log.AmbientContext{Tracer: m.storeConfig.Settings.Tracer}
+	ambient := m.storeConfig.AmbientCtx
 	m.distSenders[idx] = kv.NewDistSender(kv.DistSenderConfig{
 		AmbientCtx: ambient,
 		Clock:      m.clocks[idx],
+		RPCContext: m.rpcContext,
 		RangeDescriptorDB: mtcRangeDescriptorDB{
 			multiTestContext: m,
 			ds:               &m.distSenders[idx],
 		},
-		TestingKnobs: kv.DistSenderTestingKnobs{
+		TestingKnobs: kv.ClientTestingKnobs{
 			TransportFactory: m.kvTransportFactory,
 		},
 		RPCRetryOptions: &retryOpts,
 	}, m.gossips[idx])
 	tcsFactory := kv.NewTxnCoordSenderFactory(
-		ambient,
-		m.storeConfig.Settings,
+		kv.TxnCoordSenderFactoryConfig{
+			AmbientCtx: ambient,
+			Settings:   m.storeConfig.Settings,
+			Clock:      m.clocks[idx],
+			Stopper:    stopper,
+		},
 		m.distSenders[idx],
-		m.clocks[idx],
-		false,
-		stopper,
-		kv.MakeTxnMetrics(metric.TestSampleInterval),
 	)
-	m.dbs[idx] = client.NewDB(tcsFactory, m.clocks[idx])
+	m.dbs[idx] = client.NewDB(ambient, tcsFactory, m.clocks[idx])
 }
 
-func (m *multiTestContext) populateStorePool(idx int, nodeLiveness *storage.NodeLiveness) {
-	storage.TimeUntilStoreDead.Override(&m.storeConfig.Settings.SV, m.timeUntilStoreDead)
+func (m *multiTestContext) populateStorePool(
+	idx int, cfg storage.StoreConfig, nodeLiveness *storage.NodeLiveness,
+) {
 	m.storePools[idx] = storage.NewStorePool(
-		log.AmbientContext{Tracer: m.storeConfig.Settings.Tracer},
-		m.storeConfig.Settings,
+		cfg.AmbientCtx,
+		cfg.Settings,
 		m.gossips[idx],
 		m.clocks[idx],
+		nodeLiveness.GetNodeCount,
 		storage.MakeStorePoolNodeLivenessFunc(nodeLiveness),
 		/* deterministic */ false,
 	)
@@ -699,24 +791,16 @@ func (m *multiTestContext) addStore(idx int) {
 	var needBootstrap bool
 	if len(m.engines) > idx {
 		eng = m.engines[idx]
-		needBootstrap = m.injEngines
+		_, err := storage.ReadStoreIdent(context.Background(), eng)
+		if _, notBootstrapped := err.(*storage.NotBootstrappedError); notBootstrapped {
+			needBootstrap = true
+		} else if err != nil {
+			m.t.Fatal(err)
+		}
 	} else {
 		engineStopper := stop.NewStopper()
 		m.engineStoppers = append(m.engineStoppers, engineStopper)
-
-		dir, cleanup := testutils.TempDir(m.t)
-		cache := engine.NewRocksDBCache(1 << 20)
-		var err error
-		eng, err = engine.NewRocksDB(engine.RocksDBConfig{
-			Dir:       dir,
-			MustExist: false,
-		}, cache)
-		if err != nil {
-			m.t.Fatal(err)
-		}
-
-		m.dirCleanups = append(m.dirCleanups, cleanup)
-		m.caches = append(m.caches, cache)
+		eng = engine.NewInMem(roachpb.Attributes{}, 1<<20)
 		engineStopper.AddCloser(eng)
 		m.engines = append(m.engines, eng)
 		needBootstrap = true
@@ -749,10 +833,8 @@ func (m *multiTestContext) addStore(idx int) {
 		grpcServer,
 		m.transportStopper,
 		metric.NewRegistry(),
+		config.DefaultZoneConfigRef(),
 	)
-	if m.timeUntilStoreDead == 0 {
-		m.timeUntilStoreDead = storage.TestTimeUntilStoreDeadOff
-	}
 
 	nodeID := roachpb.NodeID(idx + 1)
 	cfg := m.makeStoreConfig(idx)
@@ -763,34 +845,50 @@ func (m *multiTestContext) addStore(idx int) {
 		ambient, m.clocks[idx], m.dbs[idx], m.engines, m.gossips[idx],
 		nlActive, nlRenewal, cfg.Settings, metric.TestSampleInterval,
 	)
-	m.populateStorePool(idx, m.nodeLivenesses[idx])
+	m.populateStorePool(idx, cfg, m.nodeLivenesses[idx])
 	cfg.DB = m.dbs[idx]
 	cfg.NodeLiveness = m.nodeLivenesses[idx]
 	cfg.StorePool = m.storePools[idx]
 
-	store := storage.NewStore(cfg, eng, &roachpb.NodeDescriptor{NodeID: nodeID})
 	ctx := context.Background()
 	if needBootstrap {
-		if err := store.Bootstrap(ctx, roachpb.StoreIdent{
+		if err := storage.InitEngine(ctx, eng, roachpb.StoreIdent{
 			NodeID:  roachpb.NodeID(idx + 1),
 			StoreID: roachpb.StoreID(idx + 1),
 		}, cfg.Settings.Version.BootstrapVersion()); err != nil {
 			m.t.Fatal(err)
 		}
-
-		// Bootstrap the initial range on the first store
-		if idx == 0 {
-			err := store.BootstrapRange(sqlbase.MakeMetadataSchema().GetInitialValues(), cfg.Settings.Version.ServerVersion)
-			if err != nil {
-				m.t.Fatal(err)
-			}
+	}
+	if needBootstrap && idx == 0 {
+		// Bootstrap the initial range on the first engine.
+		var splits []roachpb.RKey
+		kvs, tableSplits := sqlbase.MakeMetadataSchema(cfg.DefaultZoneConfig, cfg.DefaultSystemZoneConfig).GetInitialValues()
+		if !m.startWithSingleRange {
+			splits = config.StaticSplits()
+			splits = append(splits, tableSplits...)
+			sort.Slice(splits, func(i, j int) bool {
+				return splits[i].Less(splits[j])
+			})
 		}
+		err := storage.WriteInitialClusterData(
+			ctx,
+			eng,
+			kvs, /* initialValues */
+			cfg.Settings.Version.BootstrapVersion().Version,
+			len(m.engines), splits, cfg.Clock.PhysicalNow())
+		if err != nil {
+			m.t.Fatal(err)
+		}
+	}
+	store := storage.NewStore(ctx, cfg, eng, &roachpb.NodeDescriptor{NodeID: nodeID})
+	if err := store.Start(ctx, stopper); err != nil {
+		m.t.Fatal(err)
 	}
 
 	sender := storage.NewStores(ambient, clock, cfg.Settings.Version.MinSupportedVersion, cfg.Settings.Version.ServerVersion)
 	sender.AddStore(store)
-	storesServer := storage.MakeServer(&roachpb.NodeDescriptor{NodeID: nodeID}, sender)
-	storage.RegisterConsistencyServer(grpcServer, storesServer)
+	perReplicaServer := storage.MakeServer(&roachpb.NodeDescriptor{NodeID: nodeID}, sender)
+	storage.RegisterPerReplicaServer(grpcServer, perReplicaServer)
 
 	ln, err := netutil.ListenAndServeGRPC(m.transportStopper, grpcServer, util.TestAddr)
 	if err != nil {
@@ -818,7 +916,7 @@ func (m *multiTestContext) addStore(idx int) {
 	m.senders[idx] = sender
 	// Save the store identities for later so we can use them in
 	// replication operations even while the store is stopped.
-	m.idents[idx] = store.Ident
+	m.idents[idx] = *store.Ident
 	m.mu.Unlock()
 
 	// NB: On Mac OS X, we sporadically see excessively long dialing times (~15s)
@@ -826,19 +924,16 @@ func (m *multiTestContext) addStore(idx int) {
 	// having to worry about such conditions we pre-warm the connection
 	// cache. See #8440 for an example of the headaches the long dial times
 	// cause.
-	if _, err := m.rpcContext.GRPCDial(ln.Addr().String()).Connect(ctx); err != nil {
+	if _, err := m.rpcContext.GRPCDialNode(ln.Addr().String(), nodeID,
+		rpc.DefaultClass).Connect(ctx); err != nil {
 		m.t.Fatal(err)
 	}
 
 	m.gossips[idx].Start(ln.Addr(), resolvers)
 
-	if err := store.Start(ctx, stopper); err != nil {
-		m.t.Fatal(err)
-	}
 	if err := m.gossipNodeDesc(m.gossips[idx], nodeID); err != nil {
 		m.t.Fatal(err)
 	}
-	store.WaitForInit()
 
 	ran := struct {
 		sync.Once
@@ -855,6 +950,9 @@ func (m *multiTestContext) addStore(idx int) {
 			close(ran.ch)
 		})
 	})
+
+	store.WaitForInit()
+
 	// Wait until we see the first heartbeat by waiting for the callback (which
 	// fires *after* the node becomes live).
 	<-ran.ch
@@ -898,11 +996,12 @@ func (m *multiTestContext) stopStore(i int) {
 
 	m.mu.Lock()
 	m.stoppers[i] = nil
-	// Break the transport breaker for this node so that messages sent between a
-	// store stopping and that store restarting will never remain in-flight in
+	// Break the transport breakers for this node so that messages sent between
+	// a store stopping and that store restarting will never remain in-flight in
 	// the transport and end up reaching the store. This has been the cause of
 	// flakiness in the past.
-	m.transport.GetCircuitBreaker(m.idents[i].NodeID).Break()
+	m.transport.GetCircuitBreaker(m.idents[i].NodeID, rpc.DefaultClass).Break()
+	m.transport.GetCircuitBreaker(m.idents[i].NodeID, rpc.SystemClass).Break()
 	m.senders[i].RemoveStore(m.stores[i])
 	m.stores[i] = nil
 	m.mu.Unlock()
@@ -923,21 +1022,21 @@ func (m *multiTestContext) restartStoreWithoutHeartbeat(i int) {
 		log.AmbientContext{Tracer: m.storeConfig.Settings.Tracer}, m.clocks[i], m.dbs[i], m.engines,
 		m.gossips[i], nlActive, nlRenewal, cfg.Settings, metric.TestSampleInterval,
 	)
-	m.populateStorePool(i, m.nodeLivenesses[i])
+	m.populateStorePool(i, cfg, m.nodeLivenesses[i])
 	cfg.DB = m.dbs[i]
 	cfg.NodeLiveness = m.nodeLivenesses[i]
 	cfg.StorePool = m.storePools[i]
-	store := storage.NewStore(cfg, m.engines[i], &roachpb.NodeDescriptor{NodeID: roachpb.NodeID(i + 1)})
-	m.stores[i] = store
-
 	ctx := context.Background()
+	store := storage.NewStore(ctx, cfg, m.engines[i], &roachpb.NodeDescriptor{NodeID: roachpb.NodeID(i + 1)})
+	m.stores[i] = store
 
 	// Need to start the store before adding it so that the store ID is initialized.
 	if err := store.Start(ctx, stopper); err != nil {
 		m.t.Fatal(err)
 	}
 	m.senders[i].AddStore(store)
-	m.transport.GetCircuitBreaker(m.idents[i].NodeID).Reset()
+	m.transport.GetCircuitBreaker(m.idents[i].NodeID, rpc.DefaultClass).Reset()
+	m.transport.GetCircuitBreaker(m.idents[i].NodeID, rpc.SystemClass).Reset()
 	m.mu.Unlock()
 	cfg.NodeLiveness.StartHeartbeat(ctx, stopper, func(ctx context.Context) {
 		now := m.clocks[i].Now()
@@ -962,8 +1061,8 @@ func (m *multiTestContext) restartStore(i int) {
 }
 
 func (m *multiTestContext) Store(i int) *storage.Store {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.stores[i]
 }
 
@@ -989,13 +1088,13 @@ func (m *multiTestContext) findMemberStoreLocked(desc roachpb.RangeDescriptor) *
 			// Store is stopped.
 			continue
 		}
-		for _, r := range desc.Replicas {
+		for _, r := range desc.InternalReplicas {
 			if s.StoreID() == r.StoreID {
 				return s
 			}
 		}
 	}
-	m.t.Fatalf("couldn't find a live member of %s", desc)
+	m.t.Fatalf("couldn't find a live member of %s", &desc)
 	return nil // unreached, but the compiler can't tell.
 }
 
@@ -1018,16 +1117,6 @@ func (m *multiTestContext) changeReplicas(
 ) (roachpb.ReplicaID, error) {
 	ctx := context.Background()
 
-	// Perform a consistent read to get the updated range descriptor (as
-	// opposed to just going to one of the stores), to make sure we have
-	// the effects of any previous ChangeReplicas call. By the time
-	// ChangeReplicas returns the raft leader is guaranteed to have the
-	// updated version, but followers are not.
-	var desc roachpb.RangeDescriptor
-	if err := m.dbs[0].GetProto(ctx, keys.RangeDescriptorKey(startKey), &desc); err != nil {
-		return 0, err
-	}
-
 	var alreadyDoneErr string
 	switch changeType {
 	case roachpb.ADD_REPLICA:
@@ -1036,13 +1125,31 @@ func (m *multiTestContext) changeReplicas(
 		alreadyDoneErr = "unable to remove replica .* which is not present"
 	}
 
-	for {
-		err := m.dbs[0].AdminChangeReplicas(
-			ctx, startKey.AsRawKey(), changeType,
-			[]roachpb.ReplicationTarget{{
-				NodeID:  m.idents[dest].NodeID,
-				StoreID: m.idents[dest].StoreID,
-			}},
+	retryOpts := retry.Options{
+		InitialBackoff: time.Millisecond,
+		MaxBackoff:     50 * time.Millisecond,
+	}
+	var desc roachpb.RangeDescriptor
+	for r := retry.Start(retryOpts); r.Next(); {
+
+		// Perform a consistent read to get the updated range descriptor (as
+		// opposed to just going to one of the stores), to make sure we have
+		// the effects of any previous ChangeReplicas call. By the time
+		// ChangeReplicas returns the raft leader is guaranteed to have the
+		// updated version, but followers are not.
+		if err := m.dbs[0].GetProto(ctx, keys.RangeDescriptorKey(startKey), &desc); err != nil {
+			return 0, err
+		}
+
+		_, err := m.dbs[0].AdminChangeReplicas(
+			ctx, startKey.AsRawKey(),
+			desc,
+			roachpb.MakeReplicationChanges(
+				changeType,
+				roachpb.ReplicationTarget{
+					NodeID:  m.idents[dest].NodeID,
+					StoreID: m.idents[dest].StoreID,
+				}),
 		)
 
 		if err == nil || testutils.IsError(err, alreadyDoneErr) {
@@ -1059,7 +1166,8 @@ func (m *multiTestContext) changeReplicas(
 		// We can't use storage.IsSnapshotError() because the original error object
 		// is lost. We could make a this into a roachpb.Error but it seems overkill
 		// for this one usage.
-		if testutils.IsError(err, "snapshot failed: .*") {
+		if testutils.IsError(err, "snapshot failed: .*|descriptor changed") {
+			log.Info(ctx, err)
 			continue
 		}
 		return 0, err
@@ -1105,6 +1213,9 @@ func (m *multiTestContext) replicateRangeNonFatal(rangeID roachpb.RangeID, dests
 			if e := expectedReplicaIDs[i]; repDesc.ReplicaID != e {
 				return errors.Errorf("expected replica %s to have ID %d", repl, e)
 			}
+			if t := repDesc.GetType(); t != roachpb.VOTER_FULL {
+				return errors.Errorf("expected replica %s to be a voter was %s", repl, t)
+			}
 			if !repl.Desc().ContainsKey(startKey) {
 				return errors.Errorf("expected replica %s to contain %s", repl, startKey)
 			}
@@ -1132,13 +1243,31 @@ func (m *multiTestContext) unreplicateRangeNonFatal(rangeID roachpb.RangeID, des
 	return err
 }
 
+// waitForUnreplicated waits until no replica exists for the specified range
+// on the dest store.
+func (m *multiTestContext) waitForUnreplicated(rangeID roachpb.RangeID, dest int) error {
+	// Wait for the unreplications to complete on destination node.
+	return retry.ForDuration(testutils.DefaultSucceedsSoonDuration, func() error {
+		_, err := m.stores[dest].GetReplica(rangeID)
+		switch err.(type) {
+		case nil:
+			return fmt.Errorf("replica still exists on dest %d", dest)
+		case *roachpb.RangeNotFoundError:
+			return nil
+		default:
+			return err
+		}
+	})
+}
+
 // readIntFromEngines reads the current integer value at the given key
 // from all configured engines, filling in zeros when the value is not
 // found. Returns a slice of the same length as mtc.engines.
 func (m *multiTestContext) readIntFromEngines(key roachpb.Key) []int64 {
 	results := make([]int64, len(m.engines))
 	for i, eng := range m.engines {
-		val, _, err := engine.MVCCGet(context.Background(), eng, key, m.clocks[i].Now(), true, nil)
+		val, _, err := engine.MVCCGet(context.Background(), eng, key, m.clocks[i].Now(),
+			engine.MVCCGetOptions{})
 		if err != nil {
 			log.VEventf(context.TODO(), 1, "engine %d: error reading from key %s: %s", i, key, err)
 		} else if val == nil {
@@ -1146,11 +1275,24 @@ func (m *multiTestContext) readIntFromEngines(key roachpb.Key) []int64 {
 		} else {
 			results[i], err = val.GetInt()
 			if err != nil {
-				log.Errorf(context.TODO(), "engine %d: error decoding %s from key %s: %s", i, val, key, err)
+				log.Errorf(context.TODO(), "engine %d: error decoding %s from key %s: %+v", i, val, key, err)
 			}
 		}
 	}
 	return results
+}
+
+// waitForValuesT is like waitForValues but allows the caller to provide a
+// testing.T which may differ from m.t.
+func (m *multiTestContext) waitForValuesT(t testing.TB, key roachpb.Key, expected []int64) {
+	t.Helper()
+	testutils.SucceedsSoon(t, func() error {
+		actual := m.readIntFromEngines(key)
+		if !reflect.DeepEqual(expected, actual) {
+			return errors.Errorf("expected %v, got %v", expected, actual)
+		}
+		return nil
+	})
 }
 
 // waitForValues waits up to the given duration for the integer values
@@ -1158,13 +1300,7 @@ func (m *multiTestContext) readIntFromEngines(key roachpb.Key) []int64 {
 // Fails the test if they do not match.
 func (m *multiTestContext) waitForValues(key roachpb.Key, expected []int64) {
 	m.t.Helper()
-	testutils.SucceedsSoon(m.t, func() error {
-		actual := m.readIntFromEngines(key)
-		if !reflect.DeepEqual(expected, actual) {
-			return errors.Errorf("expected %v, got %v", expected, actual)
-		}
-		return nil
-	})
+	m.waitForValuesT(m.t, key, expected)
 }
 
 // transferLease transfers the lease for the given range from the source
@@ -1197,14 +1333,7 @@ func (m *multiTestContext) transferLeaseNonFatal(
 	// advanced recently, so all the liveness records (including the destination)
 	// are expired. In that case, the simple fact that the transfer succeeded
 	// doesn't mean that the destination now has a usable lease.
-	m.mu.RLock()
-	nl := m.nodeLivenesses[dest]
-	m.mu.RUnlock()
-	l, err := nl.Self()
-	if err != nil {
-		return err
-	}
-	if err := nl.Heartbeat(ctx, l); err != nil {
+	if err := m.heartbeatLiveness(ctx, dest); err != nil {
 		return err
 	}
 
@@ -1212,11 +1341,28 @@ func (m *multiTestContext) transferLeaseNonFatal(
 	if err != nil {
 		return err
 	}
-	if err := sourceRepl.AdminTransferLease(context.Background(), m.idents[dest].StoreID); err != nil {
+	if err := sourceRepl.AdminTransferLease(ctx, m.idents[dest].StoreID); err != nil {
 		return err
 	}
 
 	return nil
+}
+
+func (m *multiTestContext) heartbeatLiveness(ctx context.Context, store int) error {
+	m.mu.RLock()
+	nl := m.nodeLivenesses[store]
+	m.mu.RUnlock()
+	l, err := nl.Self()
+	if err != nil {
+		return err
+	}
+
+	for r := retry.StartWithCtx(ctx, retry.Options{MaxRetries: 5}); r.Next(); {
+		if err = nl.Heartbeat(ctx, l); err != storage.ErrEpochIncremented {
+			break
+		}
+	}
+	return err
 }
 
 // advanceClock advances the mtc's manual clock such that all
@@ -1279,7 +1425,7 @@ func (m *multiTestContext) getRaftLeader(rangeID roachpb.RangeID) *storage.Repli
 // the default replica for the specified key.
 func getArgs(key roachpb.Key) *roachpb.GetRequest {
 	return &roachpb.GetRequest{
-		Span: roachpb.Span{
+		RequestHeader: roachpb.RequestHeader{
 			Key: key,
 		},
 	}
@@ -1289,7 +1435,7 @@ func getArgs(key roachpb.Key) *roachpb.GetRequest {
 // the default replica for the specified key / value.
 func putArgs(key roachpb.Key, value []byte) *roachpb.PutRequest {
 	return &roachpb.PutRequest{
-		Span: roachpb.Span{
+		RequestHeader: roachpb.RequestHeader{
 			Key: key,
 		},
 		Value: roachpb.MakeValueFromBytes(value),
@@ -1300,7 +1446,7 @@ func putArgs(key roachpb.Key, value []byte) *roachpb.PutRequest {
 // for the specified key.
 func incrementArgs(key roachpb.Key, inc int64) *roachpb.IncrementRequest {
 	return &roachpb.IncrementRequest{
-		Span: roachpb.Span{
+		RequestHeader: roachpb.RequestHeader{
 			Key: key,
 		},
 		Increment: inc,
@@ -1311,6 +1457,31 @@ func truncateLogArgs(index uint64, rangeID roachpb.RangeID) *roachpb.TruncateLog
 	return &roachpb.TruncateLogRequest{
 		Index:   index,
 		RangeID: rangeID,
+	}
+}
+
+func heartbeatArgs(
+	txn *roachpb.Transaction, now hlc.Timestamp,
+) (*roachpb.HeartbeatTxnRequest, roachpb.Header) {
+	return &roachpb.HeartbeatTxnRequest{
+		RequestHeader: roachpb.RequestHeader{
+			Key: txn.Key,
+		},
+		Now: now,
+	}, roachpb.Header{Txn: txn}
+}
+
+func pushTxnArgs(
+	pusher, pushee *roachpb.Transaction, pushType roachpb.PushTxnType,
+) *roachpb.PushTxnRequest {
+	return &roachpb.PushTxnRequest{
+		RequestHeader: roachpb.RequestHeader{
+			Key: pushee.Key,
+		},
+		PushTo:    pusher.Timestamp.Next(),
+		PusherTxn: *pusher,
+		PusheeTxn: pushee.TxnMeta,
+		PushType:  pushType,
 	}
 }
 
@@ -1326,10 +1497,10 @@ func TestSortRangeDescByAge(t *testing.T) {
 	newRangeVersion := func(marker string) {
 		currentRepls := append([]roachpb.ReplicaDescriptor(nil), replicaDescs...)
 		rangeDescs = append(rangeDescs, &roachpb.RangeDescriptor{
-			RangeID:       roachpb.RangeID(1),
-			Replicas:      currentRepls,
-			NextReplicaID: roachpb.ReplicaID(nextReplID),
-			EndKey:        roachpb.RKey(marker),
+			RangeID:          roachpb.RangeID(1),
+			InternalReplicas: currentRepls,
+			NextReplicaID:    roachpb.ReplicaID(nextReplID),
+			EndKey:           roachpb.RKey(marker),
 		})
 	}
 
@@ -1375,7 +1546,7 @@ func TestSortRangeDescByAge(t *testing.T) {
 }
 
 func verifyRangeStats(eng engine.Reader, rangeID roachpb.RangeID, expMS enginepb.MVCCStats) error {
-	ms, err := stateloader.Make(nil /* st */, rangeID).LoadMVCCStats(context.Background(), eng)
+	ms, err := stateloader.Make(rangeID).LoadMVCCStats(context.Background(), eng)
 	if err != nil {
 		return err
 	}
@@ -1396,4 +1567,23 @@ func verifyRecomputedStats(
 		return fmt.Errorf("expected range's stats to agree with recomputation: got\n%+v\nrecomputed\n%+v", expMS, ms)
 	}
 	return nil
+}
+
+func waitForTombstone(
+	t *testing.T, eng engine.Reader, rangeID roachpb.RangeID,
+) (tombstone roachpb.RaftTombstone) {
+	testutils.SucceedsSoon(t, func() error {
+		tombstoneKey := keys.RaftTombstoneKey(rangeID)
+		ok, err := engine.MVCCGetProto(
+			context.TODO(), eng, tombstoneKey, hlc.Timestamp{}, &tombstone, engine.MVCCGetOptions{},
+		)
+		if err != nil {
+			t.Fatalf("failed to read tombstone: %v", err)
+		}
+		if !ok {
+			return fmt.Errorf("tombstone not found for range %d", rangeID)
+		}
+		return nil
+	})
+	return tombstone
 }

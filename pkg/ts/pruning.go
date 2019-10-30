@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package ts
 
@@ -20,7 +16,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
@@ -29,41 +24,6 @@ var (
 	firstTSRKey = roachpb.RKey(keys.TimeseriesPrefix)
 	lastTSRKey  = firstTSRKey.PrefixEnd()
 )
-
-// ContainsTimeSeries returns true if the given key range overlaps the
-// range of possible time series keys.
-func (tsdb *DB) ContainsTimeSeries(start, end roachpb.RKey) bool {
-	return !lastTSRKey.Less(start) && !end.Less(firstTSRKey)
-}
-
-// PruneTimeSeries prunes old data for any time series found in the supplied
-// key range.
-//
-// The snapshot should be supplied by a local store, and is used only to
-// discover the names of time series which are store in that snapshot. The KV
-// client is then used to prune old data from the discovered series.
-//
-// The snapshot is used for key discovery (as opposed to the KV client) because
-// the task of pruning time series is distributed across the cluster to the
-// individual ranges which contain that time series data. Because replicas of
-// those ranges are guaranteed to have time series data locally, we can use the
-// snapshot to quickly obtain a set of keys to be pruned with no network calls.
-func (tsdb *DB) PruneTimeSeries(
-	ctx context.Context,
-	snapshot engine.Reader,
-	start, end roachpb.RKey,
-	db *client.DB,
-	timestamp hlc.Timestamp,
-) error {
-	series, err := tsdb.findTimeSeries(snapshot, start, end, timestamp)
-	if err != nil {
-		return err
-	}
-	return tsdb.pruneTimeSeries(ctx, db, series, timestamp)
-}
-
-// Assert that DB implements the necessary interface from the storage package.
-var _ storage.TimeSeriesDataStore = (*DB)(nil)
 
 type timeSeriesResolutionInfo struct {
 	Name       string
@@ -84,9 +44,6 @@ func (tsdb *DB) findTimeSeries(
 ) ([]timeSeriesResolutionInfo, error) {
 	var results []timeSeriesResolutionInfo
 
-	iter := snapshot.NewIterator(engine.IterOptions{})
-	defer iter.Close()
-
 	// Set start boundary for the search, which is the lesser of the range start
 	// key and the beginning of time series data.
 	start := engine.MakeMVCCMetadataKey(startKey.AsRawKey())
@@ -104,6 +61,9 @@ func (tsdb *DB) findTimeSeries(
 	}
 
 	thresholds := tsdb.computeThresholds(now.WallTime)
+
+	iter := snapshot.NewIterator(engine.IterOptions{UpperBound: endKey.AsRawKey()})
+	defer iter.Close()
 
 	for iter.Seek(next); ; iter.Seek(next) {
 		if ok, err := iter.Valid(); err != nil {
@@ -159,7 +119,6 @@ func (tsdb *DB) pruneTimeSeries(
 	for _, timeSeries := range timeSeriesList {
 		// Time series data for a specific resolution falls in a contiguous key
 		// range, and can be deleted with a DelRange command.
-
 		// The start key is the prefix unique to this name/resolution pair.
 		start := makeDataKeySeriesPrefix(timeSeries.Name, timeSeries.Resolution)
 
@@ -176,7 +135,7 @@ func (tsdb *DB) pruneTimeSeries(
 		}
 
 		b.AddRawRequest(&roachpb.DeleteRangeRequest{
-			Span: roachpb.Span{
+			RequestHeader: roachpb.RequestHeader{
 				Key:    start,
 				EndKey: end,
 			},

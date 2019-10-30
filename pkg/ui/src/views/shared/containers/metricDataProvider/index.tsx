@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import React from "react";
 import { createSelector } from "reselect";
 import { connect } from "react-redux";
@@ -21,7 +31,7 @@ import { MilliToNano } from "src/util/convert";
 function queryFromProps(
   metricProps: MetricProps,
   graphProps: MetricsDataComponentProps,
-): protos.cockroach.ts.tspb.Query$Properties {
+): protos.cockroach.ts.tspb.IQuery {
     let derivative = protos.cockroach.ts.tspb.TimeSeriesQueryDerivative.NONE;
     let sourceAggregator = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.SUM;
     let downsampler = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.AVG;

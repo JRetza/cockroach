@@ -6,31 +6,54 @@ package sqlbase
 import proto "github.com/gogo/protobuf/proto"
 import fmt "fmt"
 import math "math"
-import cockroach_util_hlc "github.com/cockroachdb/cockroach/pkg/util/hlc"
+import hlc "github.com/cockroachdb/cockroach/pkg/util/hlc"
 
+import github_com_cockroachdb_cockroach_pkg_sql_types "github.com/cockroachdb/cockroach/pkg/sql/types"
 import github_com_cockroachdb_cockroach_pkg_roachpb "github.com/cockroachdb/cockroach/pkg/roachpb"
 
+import bytes "bytes"
+
 import io "io"
+
+import github_com_gogo_protobuf_proto "github.com/gogo/protobuf/proto"
 
 // Reference imports to suppress errors if they are not otherwise used.
 var _ = proto.Marshal
 var _ = fmt.Errorf
 var _ = math.Inf
 
+// This is a compile-time assertion to ensure that this generated file
+// is compatible with the proto package it is being compiled against.
+// A compilation error at this line likely means your copy of the
+// proto package needs to be updated.
+const _ = proto.GoGoProtoPackageIsVersion2 // please upgrade the proto package
+
 type ConstraintValidity int32
 
 const (
-	ConstraintValidity_Validated   ConstraintValidity = 0
+	// The constraint is valid for all rows.
+	ConstraintValidity_Validated ConstraintValidity = 0
+	// The constraint has not yet been validated for all rows (and will not be
+	// validated until VALIDATE CONSTRAINT is used).
 	ConstraintValidity_Unvalidated ConstraintValidity = 1
+	// The constraint was just added, but the validation for existing rows is not
+	// yet complete. If validation fails, the constraint will be dropped.
+	ConstraintValidity_Validating ConstraintValidity = 2
+	// The constraint is being dropped in the schema changer.
+	ConstraintValidity_Dropping ConstraintValidity = 3
 )
 
 var ConstraintValidity_name = map[int32]string{
 	0: "Validated",
 	1: "Unvalidated",
+	2: "Validating",
+	3: "Dropping",
 }
 var ConstraintValidity_value = map[string]int32{
 	"Validated":   0,
 	"Unvalidated": 1,
+	"Validating":  2,
+	"Dropping":    3,
 }
 
 func (x ConstraintValidity) Enum() *ConstraintValidity {
@@ -49,157 +72,8 @@ func (x *ConstraintValidity) UnmarshalJSON(data []byte) error {
 	*x = ConstraintValidity(value)
 	return nil
 }
-func (ConstraintValidity) EnumDescriptor() ([]byte, []int) { return fileDescriptorStructured, []int{0} }
-
-// These mirror the types supported by the sql/parser. See
-// sql/parser/col_types.go.
-type ColumnType_SemanticType int32
-
-const (
-	ColumnType_BOOL           ColumnType_SemanticType = 0
-	ColumnType_INT            ColumnType_SemanticType = 1
-	ColumnType_FLOAT          ColumnType_SemanticType = 2
-	ColumnType_DECIMAL        ColumnType_SemanticType = 3
-	ColumnType_DATE           ColumnType_SemanticType = 4
-	ColumnType_TIMESTAMP      ColumnType_SemanticType = 5
-	ColumnType_INTERVAL       ColumnType_SemanticType = 6
-	ColumnType_STRING         ColumnType_SemanticType = 7
-	ColumnType_BYTES          ColumnType_SemanticType = 8
-	ColumnType_TIMESTAMPTZ    ColumnType_SemanticType = 9
-	ColumnType_COLLATEDSTRING ColumnType_SemanticType = 10
-	ColumnType_NAME           ColumnType_SemanticType = 11
-	ColumnType_OID            ColumnType_SemanticType = 12
-	// NULL is not supported as a table column type, however it can be
-	// transferred through distsql streams.
-	ColumnType_NULL       ColumnType_SemanticType = 13
-	ColumnType_UUID       ColumnType_SemanticType = 14
-	ColumnType_ARRAY      ColumnType_SemanticType = 15
-	ColumnType_INET       ColumnType_SemanticType = 16
-	ColumnType_TIME       ColumnType_SemanticType = 17
-	ColumnType_JSON       ColumnType_SemanticType = 18
-	ColumnType_TIMETZ     ColumnType_SemanticType = 19
-	ColumnType_INT2VECTOR ColumnType_SemanticType = 200
-	ColumnType_OIDVECTOR  ColumnType_SemanticType = 201
-)
-
-var ColumnType_SemanticType_name = map[int32]string{
-	0:   "BOOL",
-	1:   "INT",
-	2:   "FLOAT",
-	3:   "DECIMAL",
-	4:   "DATE",
-	5:   "TIMESTAMP",
-	6:   "INTERVAL",
-	7:   "STRING",
-	8:   "BYTES",
-	9:   "TIMESTAMPTZ",
-	10:  "COLLATEDSTRING",
-	11:  "NAME",
-	12:  "OID",
-	13:  "NULL",
-	14:  "UUID",
-	15:  "ARRAY",
-	16:  "INET",
-	17:  "TIME",
-	18:  "JSON",
-	19:  "TIMETZ",
-	200: "INT2VECTOR",
-	201: "OIDVECTOR",
-}
-var ColumnType_SemanticType_value = map[string]int32{
-	"BOOL":           0,
-	"INT":            1,
-	"FLOAT":          2,
-	"DECIMAL":        3,
-	"DATE":           4,
-	"TIMESTAMP":      5,
-	"INTERVAL":       6,
-	"STRING":         7,
-	"BYTES":          8,
-	"TIMESTAMPTZ":    9,
-	"COLLATEDSTRING": 10,
-	"NAME":           11,
-	"OID":            12,
-	"NULL":           13,
-	"UUID":           14,
-	"ARRAY":          15,
-	"INET":           16,
-	"TIME":           17,
-	"JSON":           18,
-	"TIMETZ":         19,
-	"INT2VECTOR":     200,
-	"OIDVECTOR":      201,
-}
-
-func (x ColumnType_SemanticType) Enum() *ColumnType_SemanticType {
-	p := new(ColumnType_SemanticType)
-	*p = x
-	return p
-}
-func (x ColumnType_SemanticType) String() string {
-	return proto.EnumName(ColumnType_SemanticType_name, int32(x))
-}
-func (x *ColumnType_SemanticType) UnmarshalJSON(data []byte) error {
-	value, err := proto.UnmarshalJSONEnum(ColumnType_SemanticType_value, data, "ColumnType_SemanticType")
-	if err != nil {
-		return err
-	}
-	*x = ColumnType_SemanticType(value)
-	return nil
-}
-func (ColumnType_SemanticType) EnumDescriptor() ([]byte, []int) {
-	return fileDescriptorStructured, []int{0, 0}
-}
-
-type ColumnType_VisibleType int32
-
-const (
-	ColumnType_NONE             ColumnType_VisibleType = 0
-	ColumnType_INTEGER          ColumnType_VisibleType = 1
-	ColumnType_SMALLINT         ColumnType_VisibleType = 2
-	ColumnType_BIGINT           ColumnType_VisibleType = 3
-	ColumnType_BIT              ColumnType_VisibleType = 4
-	ColumnType_REAL             ColumnType_VisibleType = 5
-	ColumnType_DOUBLE_PRECISION ColumnType_VisibleType = 6
-)
-
-var ColumnType_VisibleType_name = map[int32]string{
-	0: "NONE",
-	1: "INTEGER",
-	2: "SMALLINT",
-	3: "BIGINT",
-	4: "BIT",
-	5: "REAL",
-	6: "DOUBLE_PRECISION",
-}
-var ColumnType_VisibleType_value = map[string]int32{
-	"NONE":             0,
-	"INTEGER":          1,
-	"SMALLINT":         2,
-	"BIGINT":           3,
-	"BIT":              4,
-	"REAL":             5,
-	"DOUBLE_PRECISION": 6,
-}
-
-func (x ColumnType_VisibleType) Enum() *ColumnType_VisibleType {
-	p := new(ColumnType_VisibleType)
-	*p = x
-	return p
-}
-func (x ColumnType_VisibleType) String() string {
-	return proto.EnumName(ColumnType_VisibleType_name, int32(x))
-}
-func (x *ColumnType_VisibleType) UnmarshalJSON(data []byte) error {
-	value, err := proto.UnmarshalJSONEnum(ColumnType_VisibleType_value, data, "ColumnType_VisibleType")
-	if err != nil {
-		return err
-	}
-	*x = ColumnType_VisibleType(value)
-	return nil
-}
-func (ColumnType_VisibleType) EnumDescriptor() ([]byte, []int) {
-	return fileDescriptorStructured, []int{0, 1}
+func (ConstraintValidity) EnumDescriptor() ([]byte, []int) {
+	return fileDescriptor_structured_5011444cd75c25b7, []int{0}
 }
 
 type ForeignKeyReference_Action int32
@@ -232,8 +106,8 @@ func (x ForeignKeyReference_Action) Enum() *ForeignKeyReference_Action {
 	*p = x
 	return p
 }
-func (x ForeignKeyReference_Action) String() string {
-	return proto.EnumName(ForeignKeyReference_Action_name, int32(x))
+func (x ForeignKeyReference_Action) MarshalJSON() ([]byte, error) {
+	return proto.MarshalJSONEnum(ForeignKeyReference_Action_name, int32(x))
 }
 func (x *ForeignKeyReference_Action) UnmarshalJSON(data []byte) error {
 	value, err := proto.UnmarshalJSONEnum(ForeignKeyReference_Action_value, data, "ForeignKeyReference_Action")
@@ -244,7 +118,47 @@ func (x *ForeignKeyReference_Action) UnmarshalJSON(data []byte) error {
 	return nil
 }
 func (ForeignKeyReference_Action) EnumDescriptor() ([]byte, []int) {
-	return fileDescriptorStructured, []int{1, 0}
+	return fileDescriptor_structured_5011444cd75c25b7, []int{0, 0}
+}
+
+// Match is the algorithm used to compare composite keys.
+type ForeignKeyReference_Match int32
+
+const (
+	ForeignKeyReference_SIMPLE  ForeignKeyReference_Match = 0
+	ForeignKeyReference_FULL    ForeignKeyReference_Match = 1
+	ForeignKeyReference_PARTIAL ForeignKeyReference_Match = 2
+)
+
+var ForeignKeyReference_Match_name = map[int32]string{
+	0: "SIMPLE",
+	1: "FULL",
+	2: "PARTIAL",
+}
+var ForeignKeyReference_Match_value = map[string]int32{
+	"SIMPLE":  0,
+	"FULL":    1,
+	"PARTIAL": 2,
+}
+
+func (x ForeignKeyReference_Match) Enum() *ForeignKeyReference_Match {
+	p := new(ForeignKeyReference_Match)
+	*p = x
+	return p
+}
+func (x ForeignKeyReference_Match) MarshalJSON() ([]byte, error) {
+	return proto.MarshalJSONEnum(ForeignKeyReference_Match_name, int32(x))
+}
+func (x *ForeignKeyReference_Match) UnmarshalJSON(data []byte) error {
+	value, err := proto.UnmarshalJSONEnum(ForeignKeyReference_Match_value, data, "ForeignKeyReference_Match")
+	if err != nil {
+		return err
+	}
+	*x = ForeignKeyReference_Match(value)
+	return nil
+}
+func (ForeignKeyReference_Match) EnumDescriptor() ([]byte, []int) {
+	return fileDescriptor_structured_5011444cd75c25b7, []int{0, 1}
 }
 
 // The direction of a column in the index.
@@ -281,10 +195,10 @@ func (x *IndexDescriptor_Direction) UnmarshalJSON(data []byte) error {
 	return nil
 }
 func (IndexDescriptor_Direction) EnumDescriptor() ([]byte, []int) {
-	return fileDescriptorStructured, []int{6, 0}
+	return fileDescriptor_structured_5011444cd75c25b7, []int{6, 0}
 }
 
-// The direction of a column in the index.
+// The type of the index.
 type IndexDescriptor_Type int32
 
 const (
@@ -318,7 +232,50 @@ func (x *IndexDescriptor_Type) UnmarshalJSON(data []byte) error {
 	return nil
 }
 func (IndexDescriptor_Type) EnumDescriptor() ([]byte, []int) {
-	return fileDescriptorStructured, []int{6, 1}
+	return fileDescriptor_structured_5011444cd75c25b7, []int{6, 1}
+}
+
+type ConstraintToUpdate_ConstraintType int32
+
+const (
+	ConstraintToUpdate_CHECK       ConstraintToUpdate_ConstraintType = 0
+	ConstraintToUpdate_FOREIGN_KEY ConstraintToUpdate_ConstraintType = 1
+	// NOT NULL constraints being added are represented by a dummy check
+	// constraint so that a multi-state schema change, including a bulk
+	// validation step, can occur. The check field contains the dummy
+	// constraint.
+	ConstraintToUpdate_NOT_NULL ConstraintToUpdate_ConstraintType = 2
+)
+
+var ConstraintToUpdate_ConstraintType_name = map[int32]string{
+	0: "CHECK",
+	1: "FOREIGN_KEY",
+	2: "NOT_NULL",
+}
+var ConstraintToUpdate_ConstraintType_value = map[string]int32{
+	"CHECK":       0,
+	"FOREIGN_KEY": 1,
+	"NOT_NULL":    2,
+}
+
+func (x ConstraintToUpdate_ConstraintType) Enum() *ConstraintToUpdate_ConstraintType {
+	p := new(ConstraintToUpdate_ConstraintType)
+	*p = x
+	return p
+}
+func (x ConstraintToUpdate_ConstraintType) String() string {
+	return proto.EnumName(ConstraintToUpdate_ConstraintType_name, int32(x))
+}
+func (x *ConstraintToUpdate_ConstraintType) UnmarshalJSON(data []byte) error {
+	value, err := proto.UnmarshalJSONEnum(ConstraintToUpdate_ConstraintType_value, data, "ConstraintToUpdate_ConstraintType")
+	if err != nil {
+		return err
+	}
+	*x = ConstraintToUpdate_ConstraintType(value)
+	return nil
+}
+func (ConstraintToUpdate_ConstraintType) EnumDescriptor() ([]byte, []int) {
+	return fileDescriptor_structured_5011444cd75c25b7, []int{7, 0}
 }
 
 // A descriptor within a mutation is unavailable for reads, writes
@@ -383,7 +340,7 @@ func (x *DescriptorMutation_State) UnmarshalJSON(data []byte) error {
 	return nil
 }
 func (DescriptorMutation_State) EnumDescriptor() ([]byte, []int) {
-	return fileDescriptorStructured, []int{7, 0}
+	return fileDescriptor_structured_5011444cd75c25b7, []int{8, 0}
 }
 
 // Direction of mutation.
@@ -426,7 +383,7 @@ func (x *DescriptorMutation_Direction) UnmarshalJSON(data []byte) error {
 	return nil
 }
 func (DescriptorMutation_Direction) EnumDescriptor() ([]byte, []int) {
-	return fileDescriptorStructured, []int{7, 1}
+	return fileDescriptor_structured_5011444cd75c25b7, []int{8, 1}
 }
 
 // State is set if this TableDescriptor is in the process of being added or deleted.
@@ -443,17 +400,21 @@ const (
 	TableDescriptor_ADD TableDescriptor_State = 1
 	// Descriptor is being dropped.
 	TableDescriptor_DROP TableDescriptor_State = 2
+	// Descriptor is offline (e.g. for bulk-ingestion). See offline_reason.
+	TableDescriptor_OFFLINE TableDescriptor_State = 3
 )
 
 var TableDescriptor_State_name = map[int32]string{
 	0: "PUBLIC",
 	1: "ADD",
 	2: "DROP",
+	3: "OFFLINE",
 }
 var TableDescriptor_State_value = map[string]int32{
-	"PUBLIC": 0,
-	"ADD":    1,
-	"DROP":   2,
+	"PUBLIC":  0,
+	"ADD":     1,
+	"DROP":    2,
+	"OFFLINE": 3,
 }
 
 func (x TableDescriptor_State) Enum() *TableDescriptor_State {
@@ -473,7 +434,7 @@ func (x *TableDescriptor_State) UnmarshalJSON(data []byte) error {
 	return nil
 }
 func (TableDescriptor_State) EnumDescriptor() ([]byte, []int) {
-	return fileDescriptorStructured, []int{8, 0}
+	return fileDescriptor_structured_5011444cd75c25b7, []int{9, 0}
 }
 
 // AuditMode indicates which auditing actions to take when this table is used.
@@ -510,32 +471,8 @@ func (x *TableDescriptor_AuditMode) UnmarshalJSON(data []byte) error {
 	return nil
 }
 func (TableDescriptor_AuditMode) EnumDescriptor() ([]byte, []int) {
-	return fileDescriptorStructured, []int{8, 1}
+	return fileDescriptor_structured_5011444cd75c25b7, []int{9, 1}
 }
-
-type ColumnType struct {
-	SemanticType ColumnType_SemanticType `protobuf:"varint,1,opt,name=semantic_type,json=semanticType,enum=cockroach.sql.sqlbase.ColumnType_SemanticType" json:"semantic_type"`
-	// BIT, INT, FLOAT, DECIMAL, CHAR and BINARY
-	Width int32 `protobuf:"varint,2,opt,name=width" json:"width"`
-	// FLOAT and DECIMAL.
-	Precision int32 `protobuf:"varint,3,opt,name=precision" json:"precision"`
-	// The length of each dimension in the array. A dimension of -1 means that
-	// no bound was specified for that dimension.
-	ArrayDimensions []int32 `protobuf:"varint,4,rep,name=array_dimensions,json=arrayDimensions" json:"array_dimensions,omitempty"`
-	// Collated STRING, CHAR, and VARCHAR
-	Locale *string `protobuf:"bytes,5,opt,name=locale" json:"locale,omitempty"`
-	// Alias for any types where our internal representation is different than
-	// the user specification. Examples are INT4, FLOAT4, etc. Mostly for Postgres
-	// compatibility.
-	VisibleType ColumnType_VisibleType `protobuf:"varint,6,opt,name=visible_type,json=visibleType,enum=cockroach.sql.sqlbase.ColumnType_VisibleType" json:"visible_type"`
-	// Only used if the kind is ARRAY.
-	ArrayContents *ColumnType_SemanticType `protobuf:"varint,7,opt,name=array_contents,json=arrayContents,enum=cockroach.sql.sqlbase.ColumnType_SemanticType" json:"array_contents,omitempty"`
-}
-
-func (m *ColumnType) Reset()                    { *m = ColumnType{} }
-func (m *ColumnType) String() string            { return proto.CompactTextString(m) }
-func (*ColumnType) ProtoMessage()               {}
-func (*ColumnType) Descriptor() ([]byte, []int) { return fileDescriptorStructured, []int{0} }
 
 type ForeignKeyReference struct {
 	Table    ID                 `protobuf:"varint,1,opt,name=table,casttype=ID" json:"table"`
@@ -547,18 +484,113 @@ type ForeignKeyReference struct {
 	SharedPrefixLen int32                      `protobuf:"varint,5,opt,name=shared_prefix_len,json=sharedPrefixLen" json:"shared_prefix_len"`
 	OnDelete        ForeignKeyReference_Action `protobuf:"varint,6,opt,name=on_delete,json=onDelete,enum=cockroach.sql.sqlbase.ForeignKeyReference_Action" json:"on_delete"`
 	OnUpdate        ForeignKeyReference_Action `protobuf:"varint,7,opt,name=on_update,json=onUpdate,enum=cockroach.sql.sqlbase.ForeignKeyReference_Action" json:"on_update"`
+	// This is only important for composite keys. For all prior matches before
+	// the addition of this value, MATCH SIMPLE will be used.
+	Match ForeignKeyReference_Match `protobuf:"varint,8,opt,name=match,enum=cockroach.sql.sqlbase.ForeignKeyReference_Match" json:"match"`
 }
 
-func (m *ForeignKeyReference) Reset()                    { *m = ForeignKeyReference{} }
-func (m *ForeignKeyReference) String() string            { return proto.CompactTextString(m) }
-func (*ForeignKeyReference) ProtoMessage()               {}
-func (*ForeignKeyReference) Descriptor() ([]byte, []int) { return fileDescriptorStructured, []int{1} }
+func (m *ForeignKeyReference) Reset()         { *m = ForeignKeyReference{} }
+func (m *ForeignKeyReference) String() string { return proto.CompactTextString(m) }
+func (*ForeignKeyReference) ProtoMessage()    {}
+func (*ForeignKeyReference) Descriptor() ([]byte, []int) {
+	return fileDescriptor_structured_5011444cd75c25b7, []int{0}
+}
+func (m *ForeignKeyReference) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *ForeignKeyReference) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *ForeignKeyReference) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_ForeignKeyReference.Merge(dst, src)
+}
+func (m *ForeignKeyReference) XXX_Size() int {
+	return m.Size()
+}
+func (m *ForeignKeyReference) XXX_DiscardUnknown() {
+	xxx_messageInfo_ForeignKeyReference.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_ForeignKeyReference proto.InternalMessageInfo
+
+// ForeignKeyConstraint is the new (as of 19.2 and VersionTopLevelForeignKeys)
+// representation for foreign keys. It's stored on the TableDescriptor and is
+// designed to be agnostic to which indexes are available on both the origin
+// and referenced tables, so that the optimizer can have full freedom to choose
+// the best possible index to satisfy constraint checks at runtime.
+type ForeignKeyConstraint struct {
+	OriginTableID       ID                         `protobuf:"varint,1,opt,name=origin_table_id,json=originTableId,casttype=ID" json:"origin_table_id"`
+	OriginColumnIDs     []ColumnID                 `protobuf:"varint,2,rep,name=origin_column_ids,json=originColumnIds,casttype=ColumnID" json:"origin_column_ids,omitempty"`
+	ReferencedColumnIDs []ColumnID                 `protobuf:"varint,3,rep,name=referenced_column_ids,json=referencedColumnIds,casttype=ColumnID" json:"referenced_column_ids,omitempty"`
+	ReferencedTableID   ID                         `protobuf:"varint,4,opt,name=referenced_table_id,json=referencedTableId,casttype=ID" json:"referenced_table_id"`
+	Name                string                     `protobuf:"bytes,5,opt,name=name" json:"name"`
+	Validity            ConstraintValidity         `protobuf:"varint,6,opt,name=validity,enum=cockroach.sql.sqlbase.ConstraintValidity" json:"validity"`
+	OnDelete            ForeignKeyReference_Action `protobuf:"varint,7,opt,name=on_delete,json=onDelete,enum=cockroach.sql.sqlbase.ForeignKeyReference_Action" json:"on_delete"`
+	OnUpdate            ForeignKeyReference_Action `protobuf:"varint,8,opt,name=on_update,json=onUpdate,enum=cockroach.sql.sqlbase.ForeignKeyReference_Action" json:"on_update"`
+	// This is only important for composite keys. For all prior matches before
+	// the addition of this value, MATCH SIMPLE will be used.
+	Match ForeignKeyReference_Match `protobuf:"varint,9,opt,name=match,enum=cockroach.sql.sqlbase.ForeignKeyReference_Match" json:"match"`
+	// LegacyOriginIndex is the ID of the index used for the FK on the origin
+	// table. In versions 19.1 and earlier, foreign keys were represented by
+	// fields on the index that they use. In versions 19.2 and later, we preserve
+	// the semantics of the older FKs which were tied to indexes by specifying
+	// the index as a field on this proto, since the migration process to have
+	// top-level FK fields on the table descriptor requires two releases. In 20.1,
+	// when all 19.2 nodes will be correctly handling the new FK representation,
+	// we will perform a migration to upgrade all table descriptors.
+	LegacyOriginIndex IndexID `protobuf:"varint,10,opt,name=legacy_origin_index,json=legacyOriginIndex,casttype=IndexID" json:"legacy_origin_index"`
+	// LegacyReferencedIndex is the ID of the index used for the FK on the
+	// referenced side. See the comment for LegacyOriginIndex.
+	LegacyReferencedIndex IndexID `protobuf:"varint,11,opt,name=legacy_referenced_index,json=legacyReferencedIndex,casttype=IndexID" json:"legacy_referenced_index"`
+	// These fields are set when upgrading an old-style FK (stored on the index)
+	// into this kind. The purpose is to permit validation that downgrading this
+	// representation to the old representation (which happens when the cluster
+	// is in a mixed-version state containing VersionTopLevelForeignKeys) was done
+	// without creating any accidental changes to the foreign key references.
+	// They are only read and written in a mixed 19.1/19.2 cluster.
+	LegacyUpgradedFromOriginReference     ForeignKeyReference `protobuf:"bytes,12,opt,name=legacy_upgraded_from_origin_reference,json=legacyUpgradedFromOriginReference" json:"legacy_upgraded_from_origin_reference"`             // Deprecated: Do not use.
+	LegacyUpgradedFromReferencedReference ForeignKeyReference `protobuf:"bytes,13,opt,name=legacy_upgraded_from_referenced_reference,json=legacyUpgradedFromReferencedReference" json:"legacy_upgraded_from_referenced_reference"` // Deprecated: Do not use.
+}
+
+func (m *ForeignKeyConstraint) Reset()         { *m = ForeignKeyConstraint{} }
+func (m *ForeignKeyConstraint) String() string { return proto.CompactTextString(m) }
+func (*ForeignKeyConstraint) ProtoMessage()    {}
+func (*ForeignKeyConstraint) Descriptor() ([]byte, []int) {
+	return fileDescriptor_structured_5011444cd75c25b7, []int{1}
+}
+func (m *ForeignKeyConstraint) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *ForeignKeyConstraint) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *ForeignKeyConstraint) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_ForeignKeyConstraint.Merge(dst, src)
+}
+func (m *ForeignKeyConstraint) XXX_Size() int {
+	return m.Size()
+}
+func (m *ForeignKeyConstraint) XXX_DiscardUnknown() {
+	xxx_messageInfo_ForeignKeyConstraint.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_ForeignKeyConstraint proto.InternalMessageInfo
 
 type ColumnDescriptor struct {
-	Name     string     `protobuf:"bytes,1,opt,name=name" json:"name"`
-	ID       ColumnID   `protobuf:"varint,2,opt,name=id,casttype=ColumnID" json:"id"`
-	Type     ColumnType `protobuf:"bytes,3,opt,name=type" json:"type"`
-	Nullable bool       `protobuf:"varint,4,opt,name=nullable" json:"nullable"`
+	Name     string                                           `protobuf:"bytes,1,opt,name=name" json:"name"`
+	ID       ColumnID                                         `protobuf:"varint,2,opt,name=id,casttype=ColumnID" json:"id"`
+	Type     github_com_cockroachdb_cockroach_pkg_sql_types.T `protobuf:"bytes,3,opt,name=type,customtype=github.com/cockroachdb/cockroach/pkg/sql/types.T" json:"type"`
+	Nullable bool                                             `protobuf:"varint,4,opt,name=nullable" json:"nullable"`
 	// Default expression to use to populate the column on insert if no
 	// value is provided.
 	DefaultExpr *string `protobuf:"bytes,5,opt,name=default_expr,json=defaultExpr" json:"default_expr,omitempty"`
@@ -570,10 +602,34 @@ type ColumnDescriptor struct {
 	ComputeExpr *string `protobuf:"bytes,11,opt,name=compute_expr,json=computeExpr" json:"compute_expr,omitempty"`
 }
 
-func (m *ColumnDescriptor) Reset()                    { *m = ColumnDescriptor{} }
-func (m *ColumnDescriptor) String() string            { return proto.CompactTextString(m) }
-func (*ColumnDescriptor) ProtoMessage()               {}
-func (*ColumnDescriptor) Descriptor() ([]byte, []int) { return fileDescriptorStructured, []int{2} }
+func (m *ColumnDescriptor) Reset()         { *m = ColumnDescriptor{} }
+func (m *ColumnDescriptor) String() string { return proto.CompactTextString(m) }
+func (*ColumnDescriptor) ProtoMessage()    {}
+func (*ColumnDescriptor) Descriptor() ([]byte, []int) {
+	return fileDescriptor_structured_5011444cd75c25b7, []int{2}
+}
+func (m *ColumnDescriptor) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *ColumnDescriptor) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *ColumnDescriptor) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_ColumnDescriptor.Merge(dst, src)
+}
+func (m *ColumnDescriptor) XXX_Size() int {
+	return m.Size()
+}
+func (m *ColumnDescriptor) XXX_DiscardUnknown() {
+	xxx_messageInfo_ColumnDescriptor.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_ColumnDescriptor proto.InternalMessageInfo
 
 // ColumnFamilyDescriptor is set of columns stored together in one kv entry.
 type ColumnFamilyDescriptor struct {
@@ -597,10 +653,34 @@ type ColumnFamilyDescriptor struct {
 	DefaultColumnID ColumnID `protobuf:"varint,5,opt,name=default_column_id,json=defaultColumnId,casttype=ColumnID" json:"default_column_id"`
 }
 
-func (m *ColumnFamilyDescriptor) Reset()                    { *m = ColumnFamilyDescriptor{} }
-func (m *ColumnFamilyDescriptor) String() string            { return proto.CompactTextString(m) }
-func (*ColumnFamilyDescriptor) ProtoMessage()               {}
-func (*ColumnFamilyDescriptor) Descriptor() ([]byte, []int) { return fileDescriptorStructured, []int{3} }
+func (m *ColumnFamilyDescriptor) Reset()         { *m = ColumnFamilyDescriptor{} }
+func (m *ColumnFamilyDescriptor) String() string { return proto.CompactTextString(m) }
+func (*ColumnFamilyDescriptor) ProtoMessage()    {}
+func (*ColumnFamilyDescriptor) Descriptor() ([]byte, []int) {
+	return fileDescriptor_structured_5011444cd75c25b7, []int{3}
+}
+func (m *ColumnFamilyDescriptor) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *ColumnFamilyDescriptor) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *ColumnFamilyDescriptor) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_ColumnFamilyDescriptor.Merge(dst, src)
+}
+func (m *ColumnFamilyDescriptor) XXX_Size() int {
+	return m.Size()
+}
+func (m *ColumnFamilyDescriptor) XXX_DiscardUnknown() {
+	xxx_messageInfo_ColumnFamilyDescriptor.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_ColumnFamilyDescriptor proto.InternalMessageInfo
 
 // InterleaveDescriptor represents an index (either primary or secondary) that
 // is interleaved into another table's data.
@@ -619,13 +699,37 @@ type InterleaveDescriptor struct {
 	Ancestors []InterleaveDescriptor_Ancestor `protobuf:"bytes,1,rep,name=ancestors" json:"ancestors"`
 }
 
-func (m *InterleaveDescriptor) Reset()                    { *m = InterleaveDescriptor{} }
-func (m *InterleaveDescriptor) String() string            { return proto.CompactTextString(m) }
-func (*InterleaveDescriptor) ProtoMessage()               {}
-func (*InterleaveDescriptor) Descriptor() ([]byte, []int) { return fileDescriptorStructured, []int{4} }
+func (m *InterleaveDescriptor) Reset()         { *m = InterleaveDescriptor{} }
+func (m *InterleaveDescriptor) String() string { return proto.CompactTextString(m) }
+func (*InterleaveDescriptor) ProtoMessage()    {}
+func (*InterleaveDescriptor) Descriptor() ([]byte, []int) {
+	return fileDescriptor_structured_5011444cd75c25b7, []int{4}
+}
+func (m *InterleaveDescriptor) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *InterleaveDescriptor) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *InterleaveDescriptor) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_InterleaveDescriptor.Merge(dst, src)
+}
+func (m *InterleaveDescriptor) XXX_Size() int {
+	return m.Size()
+}
+func (m *InterleaveDescriptor) XXX_DiscardUnknown() {
+	xxx_messageInfo_InterleaveDescriptor.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_InterleaveDescriptor proto.InternalMessageInfo
 
 type InterleaveDescriptor_Ancestor struct {
-	// TableID the ID of the table being interleaved into.
+	// TableID is the ID of the table being interleaved into.
 	TableID ID `protobuf:"varint,1,opt,name=table_id,json=tableId,casttype=ID" json:"table_id"`
 	// IndexID is the ID of the parent index being interleaved into.
 	IndexID IndexID `protobuf:"varint,2,opt,name=index_id,json=indexId,casttype=IndexID" json:"index_id"`
@@ -634,6 +738,8 @@ type InterleaveDescriptor_Ancestor struct {
 	// grandparent. Thus, the sum of SharedPrefixLens in the components of an
 	// InterleaveDescriptor is never more than the number of fields in the index
 	// being interleaved.
+	// In cockroach 1.0, this value did not exist and thus a check for > 0
+	// must be performed prior to its use.
 	SharedPrefixLen uint32 `protobuf:"varint,3,opt,name=shared_prefix_len,json=sharedPrefixLen" json:"shared_prefix_len"`
 }
 
@@ -641,8 +747,30 @@ func (m *InterleaveDescriptor_Ancestor) Reset()         { *m = InterleaveDescrip
 func (m *InterleaveDescriptor_Ancestor) String() string { return proto.CompactTextString(m) }
 func (*InterleaveDescriptor_Ancestor) ProtoMessage()    {}
 func (*InterleaveDescriptor_Ancestor) Descriptor() ([]byte, []int) {
-	return fileDescriptorStructured, []int{4, 0}
+	return fileDescriptor_structured_5011444cd75c25b7, []int{4, 0}
 }
+func (m *InterleaveDescriptor_Ancestor) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *InterleaveDescriptor_Ancestor) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *InterleaveDescriptor_Ancestor) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_InterleaveDescriptor_Ancestor.Merge(dst, src)
+}
+func (m *InterleaveDescriptor_Ancestor) XXX_Size() int {
+	return m.Size()
+}
+func (m *InterleaveDescriptor_Ancestor) XXX_DiscardUnknown() {
+	xxx_messageInfo_InterleaveDescriptor_Ancestor.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_InterleaveDescriptor_Ancestor proto.InternalMessageInfo
 
 // PartitioningDescriptor represents the partitioning of an index into spans
 // of keys addressable by a zone config. The key encoding is unchanged. Each
@@ -660,10 +788,34 @@ type PartitioningDescriptor struct {
 	Range []PartitioningDescriptor_Range `protobuf:"bytes,3,rep,name=range" json:"range"`
 }
 
-func (m *PartitioningDescriptor) Reset()                    { *m = PartitioningDescriptor{} }
-func (m *PartitioningDescriptor) String() string            { return proto.CompactTextString(m) }
-func (*PartitioningDescriptor) ProtoMessage()               {}
-func (*PartitioningDescriptor) Descriptor() ([]byte, []int) { return fileDescriptorStructured, []int{5} }
+func (m *PartitioningDescriptor) Reset()         { *m = PartitioningDescriptor{} }
+func (m *PartitioningDescriptor) String() string { return proto.CompactTextString(m) }
+func (*PartitioningDescriptor) ProtoMessage()    {}
+func (*PartitioningDescriptor) Descriptor() ([]byte, []int) {
+	return fileDescriptor_structured_5011444cd75c25b7, []int{5}
+}
+func (m *PartitioningDescriptor) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *PartitioningDescriptor) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *PartitioningDescriptor) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_PartitioningDescriptor.Merge(dst, src)
+}
+func (m *PartitioningDescriptor) XXX_Size() int {
+	return m.Size()
+}
+func (m *PartitioningDescriptor) XXX_DiscardUnknown() {
+	xxx_messageInfo_PartitioningDescriptor.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_PartitioningDescriptor proto.InternalMessageInfo
 
 // List represents a list partitioning, which maps individual tuples to
 // partitions.
@@ -683,12 +835,34 @@ func (m *PartitioningDescriptor_List) Reset()         { *m = PartitioningDescrip
 func (m *PartitioningDescriptor_List) String() string { return proto.CompactTextString(m) }
 func (*PartitioningDescriptor_List) ProtoMessage()    {}
 func (*PartitioningDescriptor_List) Descriptor() ([]byte, []int) {
-	return fileDescriptorStructured, []int{5, 0}
+	return fileDescriptor_structured_5011444cd75c25b7, []int{5, 0}
 }
+func (m *PartitioningDescriptor_List) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *PartitioningDescriptor_List) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *PartitioningDescriptor_List) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_PartitioningDescriptor_List.Merge(dst, src)
+}
+func (m *PartitioningDescriptor_List) XXX_Size() int {
+	return m.Size()
+}
+func (m *PartitioningDescriptor_List) XXX_DiscardUnknown() {
+	xxx_messageInfo_PartitioningDescriptor_List.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_PartitioningDescriptor_List proto.InternalMessageInfo
 
 // Range represents a range partitioning, which maps ranges of tuples to
 // partitions by specifying exclusive upper bounds. The range partitions in a
-// PartitioningDescriptor are required be sorted by UpperBound.
+// PartitioningDescriptor are required to be sorted by UpperBound.
 type PartitioningDescriptor_Range struct {
 	// Name is the partition name.
 	Name string `protobuf:"bytes,1,opt,name=name" json:"name"`
@@ -706,8 +880,30 @@ func (m *PartitioningDescriptor_Range) Reset()         { *m = PartitioningDescri
 func (m *PartitioningDescriptor_Range) String() string { return proto.CompactTextString(m) }
 func (*PartitioningDescriptor_Range) ProtoMessage()    {}
 func (*PartitioningDescriptor_Range) Descriptor() ([]byte, []int) {
-	return fileDescriptorStructured, []int{5, 1}
+	return fileDescriptor_structured_5011444cd75c25b7, []int{5, 1}
 }
+func (m *PartitioningDescriptor_Range) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *PartitioningDescriptor_Range) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *PartitioningDescriptor_Range) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_PartitioningDescriptor_Range.Merge(dst, src)
+}
+func (m *PartitioningDescriptor_Range) XXX_Size() int {
+	return m.Size()
+}
+func (m *PartitioningDescriptor_Range) XXX_DiscardUnknown() {
+	xxx_messageInfo_PartitioningDescriptor_Range.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_PartitioningDescriptor_Range proto.InternalMessageInfo
 
 // IndexDescriptor describes an index (primary or secondary).
 //
@@ -796,9 +992,10 @@ type IndexDescriptor struct {
 	// CompositeColumnIDs contains an ordered list of IDs of columns that appear
 	// in the index and have a composite encoding. Includes IDs from both
 	// column_ids and extra_column_ids.
-	CompositeColumnIDs []ColumnID            `protobuf:"varint,13,rep,name=composite_column_ids,json=compositeColumnIds,casttype=ColumnID" json:"composite_column_ids,omitempty"`
-	ForeignKey         ForeignKeyReference   `protobuf:"bytes,9,opt,name=foreign_key,json=foreignKey" json:"foreign_key"`
-	ReferencedBy       []ForeignKeyReference `protobuf:"bytes,10,rep,name=referenced_by,json=referencedBy" json:"referenced_by"`
+	CompositeColumnIDs []ColumnID `protobuf:"varint,13,rep,name=composite_column_ids,json=compositeColumnIds,casttype=ColumnID" json:"composite_column_ids,omitempty"`
+	// ForeignKey and ReferencedBy are deprecated and not stored from 19.2 onward.
+	ForeignKey   ForeignKeyReference   `protobuf:"bytes,9,opt,name=foreign_key,json=foreignKey" json:"foreign_key"`        // Deprecated: Do not use.
+	ReferencedBy []ForeignKeyReference `protobuf:"bytes,10,rep,name=referenced_by,json=referencedBy" json:"referenced_by"` // Deprecated: Do not use.
 	// Interleave, if it's not the zero value, describes how this index's data is
 	// interleaved into another index's data.
 	Interleave InterleaveDescriptor `protobuf:"bytes,11,opt,name=interleave" json:"interleave"`
@@ -812,10 +1009,85 @@ type IndexDescriptor struct {
 	Type IndexDescriptor_Type `protobuf:"varint,16,opt,name=type,enum=cockroach.sql.sqlbase.IndexDescriptor_Type" json:"type"`
 }
 
-func (m *IndexDescriptor) Reset()                    { *m = IndexDescriptor{} }
-func (m *IndexDescriptor) String() string            { return proto.CompactTextString(m) }
-func (*IndexDescriptor) ProtoMessage()               {}
-func (*IndexDescriptor) Descriptor() ([]byte, []int) { return fileDescriptorStructured, []int{6} }
+func (m *IndexDescriptor) Reset()         { *m = IndexDescriptor{} }
+func (m *IndexDescriptor) String() string { return proto.CompactTextString(m) }
+func (*IndexDescriptor) ProtoMessage()    {}
+func (*IndexDescriptor) Descriptor() ([]byte, []int) {
+	return fileDescriptor_structured_5011444cd75c25b7, []int{6}
+}
+func (m *IndexDescriptor) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *IndexDescriptor) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *IndexDescriptor) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_IndexDescriptor.Merge(dst, src)
+}
+func (m *IndexDescriptor) XXX_Size() int {
+	return m.Size()
+}
+func (m *IndexDescriptor) XXX_DiscardUnknown() {
+	xxx_messageInfo_IndexDescriptor.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_IndexDescriptor proto.InternalMessageInfo
+
+// ConstraintToUpdate represents a constraint to be added to the table and
+// validated for existing rows. More generally, in the future, when we support
+// adding constraints that are unvalidated for existing rows and can be
+// validated later using VALIDATE CONSTRAINT, this mutation will also represent
+// either adding an unvalidated constraint or validating an existing constraint.
+//
+// This mutation effects changes only in the backfill step of the schema
+// changer: First, a new version of the table descriptor with the constraint
+// added is published, after all columns being added have been backfilled. After
+// waiting for the constraint to be enforced for writes on all nodes, the
+// constraint is then validated for all existing rows. This ensures that
+// constraints added to columns that are being added are correctly enforced
+// before the column becomes public.
+type ConstraintToUpdate struct {
+	ConstraintType ConstraintToUpdate_ConstraintType `protobuf:"varint,1,req,name=constraint_type,json=constraintType,enum=cockroach.sql.sqlbase.ConstraintToUpdate_ConstraintType" json:"constraint_type"`
+	Name           string                            `protobuf:"bytes,2,req,name=name" json:"name"`
+	Check          TableDescriptor_CheckConstraint   `protobuf:"bytes,3,opt,name=check" json:"check"`
+	// All fields past 3 haven't been persisted before 19.2.
+	ForeignKey    ForeignKeyConstraint `protobuf:"bytes,4,opt,name=foreign_key,json=foreignKey" json:"foreign_key"`
+	NotNullColumn ColumnID             `protobuf:"varint,6,opt,name=not_null_column,json=notNullColumn,casttype=ColumnID" json:"not_null_column"`
+}
+
+func (m *ConstraintToUpdate) Reset()         { *m = ConstraintToUpdate{} }
+func (m *ConstraintToUpdate) String() string { return proto.CompactTextString(m) }
+func (*ConstraintToUpdate) ProtoMessage()    {}
+func (*ConstraintToUpdate) Descriptor() ([]byte, []int) {
+	return fileDescriptor_structured_5011444cd75c25b7, []int{7}
+}
+func (m *ConstraintToUpdate) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *ConstraintToUpdate) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *ConstraintToUpdate) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_ConstraintToUpdate.Merge(dst, src)
+}
+func (m *ConstraintToUpdate) XXX_Size() int {
+	return m.Size()
+}
+func (m *ConstraintToUpdate) XXX_DiscardUnknown() {
+	xxx_messageInfo_ConstraintToUpdate.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_ConstraintToUpdate proto.InternalMessageInfo
 
 // A DescriptorMutation represents a column or an index that
 // has either been added or dropped and hasn't yet transitioned
@@ -823,10 +1095,13 @@ func (*IndexDescriptor) Descriptor() ([]byte, []int) { return fileDescriptorStru
 // completely deleted. A table descriptor in the middle of a
 // schema change will have a DescriptorMutation FIFO queue
 // containing each column/index descriptor being added or dropped.
+// Mutations for constraints work differently from columns and
+// indexes; see the documentation for ConstraintToUpdate.
 type DescriptorMutation struct {
 	// Types that are valid to be assigned to Descriptor_:
 	//	*DescriptorMutation_Column
 	//	*DescriptorMutation_Index
+	//	*DescriptorMutation_Constraint
 	Descriptor_ isDescriptorMutation_Descriptor_ `protobuf_oneof:"descriptor"`
 	State       DescriptorMutation_State         `protobuf:"varint,3,opt,name=state,enum=cockroach.sql.sqlbase.DescriptorMutation_State" json:"state"`
 	Direction   DescriptorMutation_Direction     `protobuf:"varint,4,opt,name=direction,enum=cockroach.sql.sqlbase.DescriptorMutation_Direction" json:"direction"`
@@ -839,13 +1114,38 @@ type DescriptorMutation struct {
 	Rollback bool `protobuf:"varint,7,opt,name=rollback" json:"rollback"`
 }
 
-func (m *DescriptorMutation) Reset()                    { *m = DescriptorMutation{} }
-func (m *DescriptorMutation) String() string            { return proto.CompactTextString(m) }
-func (*DescriptorMutation) ProtoMessage()               {}
-func (*DescriptorMutation) Descriptor() ([]byte, []int) { return fileDescriptorStructured, []int{7} }
+func (m *DescriptorMutation) Reset()         { *m = DescriptorMutation{} }
+func (m *DescriptorMutation) String() string { return proto.CompactTextString(m) }
+func (*DescriptorMutation) ProtoMessage()    {}
+func (*DescriptorMutation) Descriptor() ([]byte, []int) {
+	return fileDescriptor_structured_5011444cd75c25b7, []int{8}
+}
+func (m *DescriptorMutation) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *DescriptorMutation) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *DescriptorMutation) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_DescriptorMutation.Merge(dst, src)
+}
+func (m *DescriptorMutation) XXX_Size() int {
+	return m.Size()
+}
+func (m *DescriptorMutation) XXX_DiscardUnknown() {
+	xxx_messageInfo_DescriptorMutation.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_DescriptorMutation proto.InternalMessageInfo
 
 type isDescriptorMutation_Descriptor_ interface {
 	isDescriptorMutation_Descriptor_()
+	Equal(interface{}) bool
 	MarshalTo([]byte) (int, error)
 	Size() int
 }
@@ -856,9 +1156,13 @@ type DescriptorMutation_Column struct {
 type DescriptorMutation_Index struct {
 	Index *IndexDescriptor `protobuf:"bytes,2,opt,name=index,oneof"`
 }
+type DescriptorMutation_Constraint struct {
+	Constraint *ConstraintToUpdate `protobuf:"bytes,8,opt,name=constraint,oneof"`
+}
 
-func (*DescriptorMutation_Column) isDescriptorMutation_Descriptor_() {}
-func (*DescriptorMutation_Index) isDescriptorMutation_Descriptor_()  {}
+func (*DescriptorMutation_Column) isDescriptorMutation_Descriptor_()     {}
+func (*DescriptorMutation_Index) isDescriptorMutation_Descriptor_()      {}
+func (*DescriptorMutation_Constraint) isDescriptorMutation_Descriptor_() {}
 
 func (m *DescriptorMutation) GetDescriptor_() isDescriptorMutation_Descriptor_ {
 	if m != nil {
@@ -881,11 +1185,19 @@ func (m *DescriptorMutation) GetIndex() *IndexDescriptor {
 	return nil
 }
 
+func (m *DescriptorMutation) GetConstraint() *ConstraintToUpdate {
+	if x, ok := m.GetDescriptor_().(*DescriptorMutation_Constraint); ok {
+		return x.Constraint
+	}
+	return nil
+}
+
 // XXX_OneofFuncs is for the internal use of the proto package.
 func (*DescriptorMutation) XXX_OneofFuncs() (func(msg proto.Message, b *proto.Buffer) error, func(msg proto.Message, tag, wire int, b *proto.Buffer) (bool, error), func(msg proto.Message) (n int), []interface{}) {
 	return _DescriptorMutation_OneofMarshaler, _DescriptorMutation_OneofUnmarshaler, _DescriptorMutation_OneofSizer, []interface{}{
 		(*DescriptorMutation_Column)(nil),
 		(*DescriptorMutation_Index)(nil),
+		(*DescriptorMutation_Constraint)(nil),
 	}
 }
 
@@ -901,6 +1213,11 @@ func _DescriptorMutation_OneofMarshaler(msg proto.Message, b *proto.Buffer) erro
 	case *DescriptorMutation_Index:
 		_ = b.EncodeVarint(2<<3 | proto.WireBytes)
 		if err := b.EncodeMessage(x.Index); err != nil {
+			return err
+		}
+	case *DescriptorMutation_Constraint:
+		_ = b.EncodeVarint(8<<3 | proto.WireBytes)
+		if err := b.EncodeMessage(x.Constraint); err != nil {
 			return err
 		}
 	case nil:
@@ -929,6 +1246,14 @@ func _DescriptorMutation_OneofUnmarshaler(msg proto.Message, tag, wire int, b *p
 		err := b.DecodeMessage(msg)
 		m.Descriptor_ = &DescriptorMutation_Index{msg}
 		return true, err
+	case 8: // descriptor.constraint
+		if wire != proto.WireBytes {
+			return true, proto.ErrInternalBadWireType
+		}
+		msg := new(ConstraintToUpdate)
+		err := b.DecodeMessage(msg)
+		m.Descriptor_ = &DescriptorMutation_Constraint{msg}
+		return true, err
 	default:
 		return false, nil
 	}
@@ -940,12 +1265,17 @@ func _DescriptorMutation_OneofSizer(msg proto.Message) (n int) {
 	switch x := m.Descriptor_.(type) {
 	case *DescriptorMutation_Column:
 		s := proto.Size(x.Column)
-		n += proto.SizeVarint(1<<3 | proto.WireBytes)
+		n += 1 // tag and wire
 		n += proto.SizeVarint(uint64(s))
 		n += s
 	case *DescriptorMutation_Index:
 		s := proto.Size(x.Index)
-		n += proto.SizeVarint(2<<3 | proto.WireBytes)
+		n += 1 // tag and wire
+		n += proto.SizeVarint(uint64(s))
+		n += s
+	case *DescriptorMutation_Constraint:
+		s := proto.Size(x.Constraint)
+		n += 1 // tag and wire
 		n += proto.SizeVarint(uint64(s))
 		n += s
 	case nil:
@@ -967,51 +1297,32 @@ type TableDescriptor struct {
 	ParentID ID `protobuf:"varint,4,opt,name=parent_id,json=parentId,casttype=ID" json:"parent_id"`
 	// Monotonically increasing version of the table descriptor.
 	//
-	// Invariants:
-	// 1. not more than two subsequent versions of the table
-	// descriptor can be leased. This is to make the system
-	// easy to reason about, by permitting mutation state
-	// changes (reflected in the next version), only when the existing
-	// state (reflected in the current version) is present on all
-	// outstanding unexpired leases.
-	// 2. A schema change command (ALTER, RENAME, etc) never directly
-	// increments the version. This allows the command to execute without
-	// waiting for the entire cluster to converge to a single version
-	// preventing weird deadlock situations. For instance, a transaction
-	// with a schema change command might use a descriptor lease that is
-	// at version: v - 1, and therefore deadlock when it tries to wait
-	// for version: v, in the process of incrementing it to v + 1.
-	// Therefore, a schema change command never increments the version,
-	// and instead, sets the up_version boolean to notify the schema
-	// changer execution engine that runs a future transaction to
-	// increment the version.
+	// The design maintains two invariants:
+	// 1. Two safe versions: A transaction at a particular timestamp is
+	//    allowed to use one of two versions of a table descriptor:
+	//    the one that would be read from the store at that timestamp,
+	//    and the one behind it in version.
+	// 2. Two leased versions: There can be valid leases on at most the 2
+	//    latest versions of a table in the cluster at any time. New leases
+	//    are only granted on the latest version.
 	//
-	// The schema change commands must therefore make *safe* modifications
-	// to the table descriptor, such as scheduling long running schema
-	// changes through mutations for future execution, or making simple
-	// schema changes like RENAME that only modify the table descriptor in a
-	// single transaction.
+	// The database must maintain correctness in light of there being two
+	// versions of a descriptor that can be used.
 	//
-	// Multiple schema changes in the same transaction set up_version.
-	// The actual schema change execution that follows a schema change
-	// command sees the up_version boolean set, and increments the
-	// table version after ensuring that there are no unexpired leases
-	// for version - 1. The schema change execution must increment
-	// the version before executing future state changes, to ensure
-	// that the scheduled mutations made by the original commands are
-	// visible on all leases. Multiple schema change mutations can be
-	// grouped together on a particular version increment.
-	//
-	// If schema change commands are safe to run without incrementing
-	// the version, why do it later on? We increment the version
-	// to ensure that all the nodes renew their leases with the new version
-	// and get to see what the schema change command has done quickly.
+	// Multiple schema change mutations can be grouped together on a
+	// particular version increment.
 	Version DescriptorVersion `protobuf:"varint,5,opt,name=version,casttype=DescriptorVersion" json:"version"`
-	// See comment above.
-	UpVersion bool `protobuf:"varint,6,opt,name=up_version,json=upVersion" json:"up_version"`
 	// Last modification time of the table descriptor.
-	ModificationTime cockroach_util_hlc.Timestamp `protobuf:"bytes,7,opt,name=modification_time,json=modificationTime" json:"modification_time"`
-	Columns          []ColumnDescriptor           `protobuf:"bytes,8,rep,name=columns" json:"columns"`
+	// Starting in 19.2 this field's value may sometime be zero-valued in which
+	// case the MVCC timestamp of the row containing the value should be used to
+	// populate it. This dance allows us to avoid observing the commit timestamp
+	// for transactions which increment the descriptor version.
+	// Encoded TableDescriptor structs should not be stored directly but rather
+	// should live inside of a Descriptor. The Descriptor.Table() method takes an
+	// hlc timestamp to ensure that this field is set properly when extracted from
+	// a Descriptor.
+	ModificationTime hlc.Timestamp      `protobuf:"bytes,7,opt,name=modification_time,json=modificationTime" json:"modification_time"`
+	Columns          []ColumnDescriptor `protobuf:"bytes,8,rep,name=columns" json:"columns"`
 	// next_column_id is used to ensure that deleted column ids are not reused.
 	NextColumnID ColumnID                 `protobuf:"varint,9,opt,name=next_column_id,json=nextColumnId,casttype=ColumnID" json:"next_column_id"`
 	Families     []ColumnFamilyDescriptor `protobuf:"bytes,22,rep,name=families" json:"families"`
@@ -1032,6 +1343,7 @@ type TableDescriptor struct {
 	// represent the data in this table.
 	FormatVersion FormatVersion                      `protobuf:"varint,17,opt,name=format_version,json=formatVersion,casttype=FormatVersion" json:"format_version"`
 	State         TableDescriptor_State              `protobuf:"varint,19,opt,name=state,enum=cockroach.sql.sqlbase.TableDescriptor_State" json:"state"`
+	OfflineReason string                             `protobuf:"bytes,38,opt,name=offline_reason,json=offlineReason" json:"offline_reason"`
 	Checks        []*TableDescriptor_CheckConstraint `protobuf:"bytes,20,rep,name=checks" json:"checks,omitempty"`
 	// A list of draining names. The draining name entries are drained from
 	// the cluster wide name caches by incrementing the version for this
@@ -1078,12 +1390,68 @@ type TableDescriptor struct {
 	// can be used when trying to track a table's history across truncatations.
 	ReplacementOf TableDescriptor_Replacement `protobuf:"bytes,30,opt,name=replacement_of,json=replacementOf" json:"replacement_of"`
 	AuditMode     TableDescriptor_AuditMode   `protobuf:"varint,31,opt,name=audit_mode,json=auditMode,enum=cockroach.sql.sqlbase.TableDescriptor_AuditMode" json:"audit_mode"`
+	// The job id for a drop job is the id in the system.jobs table of the
+	// dropping of this table.
+	DropJobID int64 `protobuf:"varint,32,opt,name=drop_job_id,json=dropJobId" json:"drop_job_id"`
+	// The schema elements that have been dropped and whose underlying
+	// data needs to be gc-ed. These schema elements have already transitioned
+	// through the drop state machine when they were in the above mutations
+	// list, and can be safely deleted. The names for these schema elements
+	// can be reused. This list is separate because mutations can
+	// lie in this list for a long time (gc deadline) and should not block
+	// the execution of other schema changes on the table.
+	//
+	// TODO(vivekmenezes): This is currently only used by the non-interleaved drop
+	// index case. Also use for dropped interleaved indexes and columns.
+	GCMutations []TableDescriptor_GCDescriptorMutation `protobuf:"bytes,33,rep,name=gc_mutations,json=gcMutations" json:"gc_mutations"`
+	CreateQuery string                                 `protobuf:"bytes,34,opt,name=create_query,json=createQuery" json:"create_query"`
+	// Starting in 19.2 CreateAsOfTime is initialized to zero for the first
+	// version of a table and is populated from the MVCC timestamp of the read
+	// like ModificationTime. See Descriptor.Table().
+	// CreateAsOfSystemTime is used for CREATE TABLE ... AS ... and was
+	// added in 19.1.
+	CreateAsOfTime hlc.Timestamp `protobuf:"bytes,35,opt,name=create_as_of_time,json=createAsOfTime" json:"create_as_of_time"`
+	// outbound_fks contains all foreign key constraints that have this table as
+	// the origin table.
+	OutboundFKs []ForeignKeyConstraint `protobuf:"bytes,36,rep,name=outbound_fks,json=outboundFks" json:"outbound_fks"`
+	// inbound_fks contains all foreign key constraints that have this table as
+	// the referenced table.
+	InboundFKs []ForeignKeyConstraint `protobuf:"bytes,37,rep,name=inbound_fks,json=inboundFks" json:"inbound_fks"`
+	// Temporary table support will be added to CRDB starting from 20.1 . The temporary
+	// flag is set to true for all temporary tables. All table descriptors created
+	// before 20.1 refer to persistent tables, so lack of the flag being set implies
+	// the table is persistent.
+	Temporary bool `protobuf:"varint,39,opt,name=temporary" json:"temporary"`
 }
 
-func (m *TableDescriptor) Reset()                    { *m = TableDescriptor{} }
-func (m *TableDescriptor) String() string            { return proto.CompactTextString(m) }
-func (*TableDescriptor) ProtoMessage()               {}
-func (*TableDescriptor) Descriptor() ([]byte, []int) { return fileDescriptorStructured, []int{8} }
+func (m *TableDescriptor) Reset()         { *m = TableDescriptor{} }
+func (m *TableDescriptor) String() string { return proto.CompactTextString(m) }
+func (*TableDescriptor) ProtoMessage()    {}
+func (*TableDescriptor) Descriptor() ([]byte, []int) {
+	return fileDescriptor_structured_5011444cd75c25b7, []int{9}
+}
+func (m *TableDescriptor) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *TableDescriptor) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *TableDescriptor) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_TableDescriptor.Merge(dst, src)
+}
+func (m *TableDescriptor) XXX_Size() int {
+	return m.Size()
+}
+func (m *TableDescriptor) XXX_DiscardUnknown() {
+	xxx_messageInfo_TableDescriptor.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_TableDescriptor proto.InternalMessageInfo
 
 func (m *TableDescriptor) GetName() string {
 	if m != nil {
@@ -1113,18 +1481,11 @@ func (m *TableDescriptor) GetVersion() DescriptorVersion {
 	return 0
 }
 
-func (m *TableDescriptor) GetUpVersion() bool {
-	if m != nil {
-		return m.UpVersion
-	}
-	return false
-}
-
-func (m *TableDescriptor) GetModificationTime() cockroach_util_hlc.Timestamp {
+func (m *TableDescriptor) GetModificationTime() hlc.Timestamp {
 	if m != nil {
 		return m.ModificationTime
 	}
-	return cockroach_util_hlc.Timestamp{}
+	return hlc.Timestamp{}
 }
 
 func (m *TableDescriptor) GetColumns() []ColumnDescriptor {
@@ -1218,6 +1579,13 @@ func (m *TableDescriptor) GetState() TableDescriptor_State {
 	return TableDescriptor_PUBLIC
 }
 
+func (m *TableDescriptor) GetOfflineReason() string {
+	if m != nil {
+		return m.OfflineReason
+	}
+	return ""
+}
+
 func (m *TableDescriptor) GetChecks() []*TableDescriptor_CheckConstraint {
 	if m != nil {
 		return m.Checks
@@ -1288,6 +1656,55 @@ func (m *TableDescriptor) GetAuditMode() TableDescriptor_AuditMode {
 	return TableDescriptor_DISABLED
 }
 
+func (m *TableDescriptor) GetDropJobID() int64 {
+	if m != nil {
+		return m.DropJobID
+	}
+	return 0
+}
+
+func (m *TableDescriptor) GetGCMutations() []TableDescriptor_GCDescriptorMutation {
+	if m != nil {
+		return m.GCMutations
+	}
+	return nil
+}
+
+func (m *TableDescriptor) GetCreateQuery() string {
+	if m != nil {
+		return m.CreateQuery
+	}
+	return ""
+}
+
+func (m *TableDescriptor) GetCreateAsOfTime() hlc.Timestamp {
+	if m != nil {
+		return m.CreateAsOfTime
+	}
+	return hlc.Timestamp{}
+}
+
+func (m *TableDescriptor) GetOutboundFKs() []ForeignKeyConstraint {
+	if m != nil {
+		return m.OutboundFKs
+	}
+	return nil
+}
+
+func (m *TableDescriptor) GetInboundFKs() []ForeignKeyConstraint {
+	if m != nil {
+		return m.InboundFKs
+	}
+	return nil
+}
+
+func (m *TableDescriptor) GetTemporary() bool {
+	if m != nil {
+		return m.Temporary
+	}
+	return false
+}
+
 // The schema update lease. A single goroutine across a cockroach cluster
 // can own it, and will execute pending schema changes for this table.
 // Since the execution of a pending schema change is through transactions,
@@ -1303,23 +1720,68 @@ func (m *TableDescriptor_SchemaChangeLease) Reset()         { *m = TableDescript
 func (m *TableDescriptor_SchemaChangeLease) String() string { return proto.CompactTextString(m) }
 func (*TableDescriptor_SchemaChangeLease) ProtoMessage()    {}
 func (*TableDescriptor_SchemaChangeLease) Descriptor() ([]byte, []int) {
-	return fileDescriptorStructured, []int{8, 0}
+	return fileDescriptor_structured_5011444cd75c25b7, []int{9, 0}
 }
+func (m *TableDescriptor_SchemaChangeLease) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *TableDescriptor_SchemaChangeLease) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *TableDescriptor_SchemaChangeLease) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_TableDescriptor_SchemaChangeLease.Merge(dst, src)
+}
+func (m *TableDescriptor_SchemaChangeLease) XXX_Size() int {
+	return m.Size()
+}
+func (m *TableDescriptor_SchemaChangeLease) XXX_DiscardUnknown() {
+	xxx_messageInfo_TableDescriptor_SchemaChangeLease.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_TableDescriptor_SchemaChangeLease proto.InternalMessageInfo
 
 type TableDescriptor_CheckConstraint struct {
 	Expr     string             `protobuf:"bytes,1,opt,name=expr" json:"expr"`
 	Name     string             `protobuf:"bytes,2,opt,name=name" json:"name"`
 	Validity ConstraintValidity `protobuf:"varint,3,opt,name=validity,enum=cockroach.sql.sqlbase.ConstraintValidity" json:"validity"`
 	// An ordered list of column IDs used by the check constraint.
-	ColumnIDs []ColumnID `protobuf:"varint,5,rep,name=column_ids,json=columnIds,casttype=ColumnID" json:"column_ids,omitempty"`
+	ColumnIDs           []ColumnID `protobuf:"varint,5,rep,name=column_ids,json=columnIds,casttype=ColumnID" json:"column_ids,omitempty"`
+	IsNonNullConstraint bool       `protobuf:"varint,6,opt,name=is_non_null_constraint,json=isNonNullConstraint" json:"is_non_null_constraint"`
 }
 
 func (m *TableDescriptor_CheckConstraint) Reset()         { *m = TableDescriptor_CheckConstraint{} }
 func (m *TableDescriptor_CheckConstraint) String() string { return proto.CompactTextString(m) }
 func (*TableDescriptor_CheckConstraint) ProtoMessage()    {}
 func (*TableDescriptor_CheckConstraint) Descriptor() ([]byte, []int) {
-	return fileDescriptorStructured, []int{8, 1}
+	return fileDescriptor_structured_5011444cd75c25b7, []int{9, 1}
 }
+func (m *TableDescriptor_CheckConstraint) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *TableDescriptor_CheckConstraint) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *TableDescriptor_CheckConstraint) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_TableDescriptor_CheckConstraint.Merge(dst, src)
+}
+func (m *TableDescriptor_CheckConstraint) XXX_Size() int {
+	return m.Size()
+}
+func (m *TableDescriptor_CheckConstraint) XXX_DiscardUnknown() {
+	xxx_messageInfo_TableDescriptor_CheckConstraint.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_TableDescriptor_CheckConstraint proto.InternalMessageInfo
 
 // A table descriptor is named through a name map stored in the
 // system.namespace table: a map from {parent_id, table_name} -> id.
@@ -1399,8 +1861,30 @@ func (m *TableDescriptor_NameInfo) Reset()         { *m = TableDescriptor_NameIn
 func (m *TableDescriptor_NameInfo) String() string { return proto.CompactTextString(m) }
 func (*TableDescriptor_NameInfo) ProtoMessage()    {}
 func (*TableDescriptor_NameInfo) Descriptor() ([]byte, []int) {
-	return fileDescriptorStructured, []int{8, 2}
+	return fileDescriptor_structured_5011444cd75c25b7, []int{9, 2}
 }
+func (m *TableDescriptor_NameInfo) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *TableDescriptor_NameInfo) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *TableDescriptor_NameInfo) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_TableDescriptor_NameInfo.Merge(dst, src)
+}
+func (m *TableDescriptor_NameInfo) XXX_Size() int {
+	return m.Size()
+}
+func (m *TableDescriptor_NameInfo) XXX_DiscardUnknown() {
+	xxx_messageInfo_TableDescriptor_NameInfo.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_TableDescriptor_NameInfo proto.InternalMessageInfo
 
 type TableDescriptor_Reference struct {
 	// The ID of the relation that depends on this one.
@@ -1417,8 +1901,30 @@ func (m *TableDescriptor_Reference) Reset()         { *m = TableDescriptor_Refer
 func (m *TableDescriptor_Reference) String() string { return proto.CompactTextString(m) }
 func (*TableDescriptor_Reference) ProtoMessage()    {}
 func (*TableDescriptor_Reference) Descriptor() ([]byte, []int) {
-	return fileDescriptorStructured, []int{8, 3}
+	return fileDescriptor_structured_5011444cd75c25b7, []int{9, 3}
 }
+func (m *TableDescriptor_Reference) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *TableDescriptor_Reference) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *TableDescriptor_Reference) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_TableDescriptor_Reference.Merge(dst, src)
+}
+func (m *TableDescriptor_Reference) XXX_Size() int {
+	return m.Size()
+}
+func (m *TableDescriptor_Reference) XXX_DiscardUnknown() {
+	xxx_messageInfo_TableDescriptor_Reference.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_TableDescriptor_Reference proto.InternalMessageInfo
 
 type TableDescriptor_MutationJob struct {
 	// The mutation id of this mutation job.
@@ -1432,8 +1938,30 @@ func (m *TableDescriptor_MutationJob) Reset()         { *m = TableDescriptor_Mut
 func (m *TableDescriptor_MutationJob) String() string { return proto.CompactTextString(m) }
 func (*TableDescriptor_MutationJob) ProtoMessage()    {}
 func (*TableDescriptor_MutationJob) Descriptor() ([]byte, []int) {
-	return fileDescriptorStructured, []int{8, 4}
+	return fileDescriptor_structured_5011444cd75c25b7, []int{9, 4}
 }
+func (m *TableDescriptor_MutationJob) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *TableDescriptor_MutationJob) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *TableDescriptor_MutationJob) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_TableDescriptor_MutationJob.Merge(dst, src)
+}
+func (m *TableDescriptor_MutationJob) XXX_Size() int {
+	return m.Size()
+}
+func (m *TableDescriptor_MutationJob) XXX_DiscardUnknown() {
+	xxx_messageInfo_TableDescriptor_MutationJob.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_TableDescriptor_MutationJob proto.InternalMessageInfo
 
 type TableDescriptor_SequenceOpts struct {
 	// How much to increment the sequence by when nextval() is called.
@@ -1444,26 +1972,109 @@ type TableDescriptor_SequenceOpts struct {
 	MaxValue int64 `protobuf:"varint,3,opt,name=max_value,json=maxValue" json:"max_value"`
 	// Start value of the sequence.
 	Start int64 `protobuf:"varint,4,opt,name=start" json:"start"`
+	// Whether the sequence is virtual.
+	Virtual bool `protobuf:"varint,5,opt,name=virtual" json:"virtual"`
 }
 
 func (m *TableDescriptor_SequenceOpts) Reset()         { *m = TableDescriptor_SequenceOpts{} }
 func (m *TableDescriptor_SequenceOpts) String() string { return proto.CompactTextString(m) }
 func (*TableDescriptor_SequenceOpts) ProtoMessage()    {}
 func (*TableDescriptor_SequenceOpts) Descriptor() ([]byte, []int) {
-	return fileDescriptorStructured, []int{8, 5}
+	return fileDescriptor_structured_5011444cd75c25b7, []int{9, 5}
+}
+func (m *TableDescriptor_SequenceOpts) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *TableDescriptor_SequenceOpts) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *TableDescriptor_SequenceOpts) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_TableDescriptor_SequenceOpts.Merge(dst, src)
+}
+func (m *TableDescriptor_SequenceOpts) XXX_Size() int {
+	return m.Size()
+}
+func (m *TableDescriptor_SequenceOpts) XXX_DiscardUnknown() {
+	xxx_messageInfo_TableDescriptor_SequenceOpts.DiscardUnknown(m)
 }
 
+var xxx_messageInfo_TableDescriptor_SequenceOpts proto.InternalMessageInfo
+
 type TableDescriptor_Replacement struct {
-	ID   ID                           `protobuf:"varint,1,opt,name=id,casttype=ID" json:"id"`
-	Time cockroach_util_hlc.Timestamp `protobuf:"bytes,2,opt,name=time" json:"time"`
+	ID   ID            `protobuf:"varint,1,opt,name=id,casttype=ID" json:"id"`
+	Time hlc.Timestamp `protobuf:"bytes,2,opt,name=time" json:"time"`
 }
 
 func (m *TableDescriptor_Replacement) Reset()         { *m = TableDescriptor_Replacement{} }
 func (m *TableDescriptor_Replacement) String() string { return proto.CompactTextString(m) }
 func (*TableDescriptor_Replacement) ProtoMessage()    {}
 func (*TableDescriptor_Replacement) Descriptor() ([]byte, []int) {
-	return fileDescriptorStructured, []int{8, 6}
+	return fileDescriptor_structured_5011444cd75c25b7, []int{9, 6}
 }
+func (m *TableDescriptor_Replacement) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *TableDescriptor_Replacement) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *TableDescriptor_Replacement) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_TableDescriptor_Replacement.Merge(dst, src)
+}
+func (m *TableDescriptor_Replacement) XXX_Size() int {
+	return m.Size()
+}
+func (m *TableDescriptor_Replacement) XXX_DiscardUnknown() {
+	xxx_messageInfo_TableDescriptor_Replacement.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_TableDescriptor_Replacement proto.InternalMessageInfo
+
+type TableDescriptor_GCDescriptorMutation struct {
+	IndexID  IndexID `protobuf:"varint,1,opt,name=index_id,json=indexId,casttype=IndexID" json:"index_id"`
+	DropTime int64   `protobuf:"varint,2,opt,name=drop_time,json=dropTime" json:"drop_time"`
+	// The job id for a mutation job is the id in the system.jobs table of the
+	// schema change job executing the mutation referenced by mutation_id.
+	JobID int64 `protobuf:"varint,3,opt,name=job_id,json=jobId" json:"job_id"`
+}
+
+func (m *TableDescriptor_GCDescriptorMutation) Reset()         { *m = TableDescriptor_GCDescriptorMutation{} }
+func (m *TableDescriptor_GCDescriptorMutation) String() string { return proto.CompactTextString(m) }
+func (*TableDescriptor_GCDescriptorMutation) ProtoMessage()    {}
+func (*TableDescriptor_GCDescriptorMutation) Descriptor() ([]byte, []int) {
+	return fileDescriptor_structured_5011444cd75c25b7, []int{9, 7}
+}
+func (m *TableDescriptor_GCDescriptorMutation) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *TableDescriptor_GCDescriptorMutation) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *TableDescriptor_GCDescriptorMutation) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_TableDescriptor_GCDescriptorMutation.Merge(dst, src)
+}
+func (m *TableDescriptor_GCDescriptorMutation) XXX_Size() int {
+	return m.Size()
+}
+func (m *TableDescriptor_GCDescriptorMutation) XXX_DiscardUnknown() {
+	xxx_messageInfo_TableDescriptor_GCDescriptorMutation.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_TableDescriptor_GCDescriptorMutation proto.InternalMessageInfo
 
 // DatabaseDescriptor represents a namespace (aka database) and is stored
 // in a structured metadata key. The DatabaseDescriptor has a globally-unique
@@ -1475,10 +2086,34 @@ type DatabaseDescriptor struct {
 	Privileges *PrivilegeDescriptor `protobuf:"bytes,3,opt,name=privileges" json:"privileges,omitempty"`
 }
 
-func (m *DatabaseDescriptor) Reset()                    { *m = DatabaseDescriptor{} }
-func (m *DatabaseDescriptor) String() string            { return proto.CompactTextString(m) }
-func (*DatabaseDescriptor) ProtoMessage()               {}
-func (*DatabaseDescriptor) Descriptor() ([]byte, []int) { return fileDescriptorStructured, []int{9} }
+func (m *DatabaseDescriptor) Reset()         { *m = DatabaseDescriptor{} }
+func (m *DatabaseDescriptor) String() string { return proto.CompactTextString(m) }
+func (*DatabaseDescriptor) ProtoMessage()    {}
+func (*DatabaseDescriptor) Descriptor() ([]byte, []int) {
+	return fileDescriptor_structured_5011444cd75c25b7, []int{10}
+}
+func (m *DatabaseDescriptor) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *DatabaseDescriptor) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *DatabaseDescriptor) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_DatabaseDescriptor.Merge(dst, src)
+}
+func (m *DatabaseDescriptor) XXX_Size() int {
+	return m.Size()
+}
+func (m *DatabaseDescriptor) XXX_DiscardUnknown() {
+	xxx_messageInfo_DatabaseDescriptor.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_DatabaseDescriptor proto.InternalMessageInfo
 
 func (m *DatabaseDescriptor) GetName() string {
 	if m != nil {
@@ -1509,13 +2144,38 @@ type Descriptor struct {
 	Union isDescriptor_Union `protobuf_oneof:"union"`
 }
 
-func (m *Descriptor) Reset()                    { *m = Descriptor{} }
-func (m *Descriptor) String() string            { return proto.CompactTextString(m) }
-func (*Descriptor) ProtoMessage()               {}
-func (*Descriptor) Descriptor() ([]byte, []int) { return fileDescriptorStructured, []int{10} }
+func (m *Descriptor) Reset()         { *m = Descriptor{} }
+func (m *Descriptor) String() string { return proto.CompactTextString(m) }
+func (*Descriptor) ProtoMessage()    {}
+func (*Descriptor) Descriptor() ([]byte, []int) {
+	return fileDescriptor_structured_5011444cd75c25b7, []int{11}
+}
+func (m *Descriptor) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *Descriptor) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *Descriptor) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_Descriptor.Merge(dst, src)
+}
+func (m *Descriptor) XXX_Size() int {
+	return m.Size()
+}
+func (m *Descriptor) XXX_DiscardUnknown() {
+	xxx_messageInfo_Descriptor.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_Descriptor proto.InternalMessageInfo
 
 type isDescriptor_Union interface {
 	isDescriptor_Union()
+	Equal(interface{}) bool
 	MarshalTo([]byte) (int, error)
 	Size() int
 }
@@ -1610,12 +2270,12 @@ func _Descriptor_OneofSizer(msg proto.Message) (n int) {
 	switch x := m.Union.(type) {
 	case *Descriptor_Table:
 		s := proto.Size(x.Table)
-		n += proto.SizeVarint(1<<3 | proto.WireBytes)
+		n += 1 // tag and wire
 		n += proto.SizeVarint(uint64(s))
 		n += s
 	case *Descriptor_Database:
 		s := proto.Size(x.Database)
-		n += proto.SizeVarint(2<<3 | proto.WireBytes)
+		n += 1 // tag and wire
 		n += proto.SizeVarint(uint64(s))
 		n += s
 	case nil:
@@ -1626,8 +2286,8 @@ func _Descriptor_OneofSizer(msg proto.Message) (n int) {
 }
 
 func init() {
-	proto.RegisterType((*ColumnType)(nil), "cockroach.sql.sqlbase.ColumnType")
 	proto.RegisterType((*ForeignKeyReference)(nil), "cockroach.sql.sqlbase.ForeignKeyReference")
+	proto.RegisterType((*ForeignKeyConstraint)(nil), "cockroach.sql.sqlbase.ForeignKeyConstraint")
 	proto.RegisterType((*ColumnDescriptor)(nil), "cockroach.sql.sqlbase.ColumnDescriptor")
 	proto.RegisterType((*ColumnFamilyDescriptor)(nil), "cockroach.sql.sqlbase.ColumnFamilyDescriptor")
 	proto.RegisterType((*InterleaveDescriptor)(nil), "cockroach.sql.sqlbase.InterleaveDescriptor")
@@ -1636,6 +2296,7 @@ func init() {
 	proto.RegisterType((*PartitioningDescriptor_List)(nil), "cockroach.sql.sqlbase.PartitioningDescriptor.List")
 	proto.RegisterType((*PartitioningDescriptor_Range)(nil), "cockroach.sql.sqlbase.PartitioningDescriptor.Range")
 	proto.RegisterType((*IndexDescriptor)(nil), "cockroach.sql.sqlbase.IndexDescriptor")
+	proto.RegisterType((*ConstraintToUpdate)(nil), "cockroach.sql.sqlbase.ConstraintToUpdate")
 	proto.RegisterType((*DescriptorMutation)(nil), "cockroach.sql.sqlbase.DescriptorMutation")
 	proto.RegisterType((*TableDescriptor)(nil), "cockroach.sql.sqlbase.TableDescriptor")
 	proto.RegisterType((*TableDescriptor_SchemaChangeLease)(nil), "cockroach.sql.sqlbase.TableDescriptor.SchemaChangeLease")
@@ -1645,27 +2306,28 @@ func init() {
 	proto.RegisterType((*TableDescriptor_MutationJob)(nil), "cockroach.sql.sqlbase.TableDescriptor.MutationJob")
 	proto.RegisterType((*TableDescriptor_SequenceOpts)(nil), "cockroach.sql.sqlbase.TableDescriptor.SequenceOpts")
 	proto.RegisterType((*TableDescriptor_Replacement)(nil), "cockroach.sql.sqlbase.TableDescriptor.Replacement")
+	proto.RegisterType((*TableDescriptor_GCDescriptorMutation)(nil), "cockroach.sql.sqlbase.TableDescriptor.GCDescriptorMutation")
 	proto.RegisterType((*DatabaseDescriptor)(nil), "cockroach.sql.sqlbase.DatabaseDescriptor")
 	proto.RegisterType((*Descriptor)(nil), "cockroach.sql.sqlbase.Descriptor")
 	proto.RegisterEnum("cockroach.sql.sqlbase.ConstraintValidity", ConstraintValidity_name, ConstraintValidity_value)
-	proto.RegisterEnum("cockroach.sql.sqlbase.ColumnType_SemanticType", ColumnType_SemanticType_name, ColumnType_SemanticType_value)
-	proto.RegisterEnum("cockroach.sql.sqlbase.ColumnType_VisibleType", ColumnType_VisibleType_name, ColumnType_VisibleType_value)
 	proto.RegisterEnum("cockroach.sql.sqlbase.ForeignKeyReference_Action", ForeignKeyReference_Action_name, ForeignKeyReference_Action_value)
+	proto.RegisterEnum("cockroach.sql.sqlbase.ForeignKeyReference_Match", ForeignKeyReference_Match_name, ForeignKeyReference_Match_value)
 	proto.RegisterEnum("cockroach.sql.sqlbase.IndexDescriptor_Direction", IndexDescriptor_Direction_name, IndexDescriptor_Direction_value)
 	proto.RegisterEnum("cockroach.sql.sqlbase.IndexDescriptor_Type", IndexDescriptor_Type_name, IndexDescriptor_Type_value)
+	proto.RegisterEnum("cockroach.sql.sqlbase.ConstraintToUpdate_ConstraintType", ConstraintToUpdate_ConstraintType_name, ConstraintToUpdate_ConstraintType_value)
 	proto.RegisterEnum("cockroach.sql.sqlbase.DescriptorMutation_State", DescriptorMutation_State_name, DescriptorMutation_State_value)
 	proto.RegisterEnum("cockroach.sql.sqlbase.DescriptorMutation_Direction", DescriptorMutation_Direction_name, DescriptorMutation_Direction_value)
 	proto.RegisterEnum("cockroach.sql.sqlbase.TableDescriptor_State", TableDescriptor_State_name, TableDescriptor_State_value)
 	proto.RegisterEnum("cockroach.sql.sqlbase.TableDescriptor_AuditMode", TableDescriptor_AuditMode_name, TableDescriptor_AuditMode_value)
 }
-func (this *ColumnType) Equal(that interface{}) bool {
+func (this *ForeignKeyReference) Equal(that interface{}) bool {
 	if that == nil {
 		return this == nil
 	}
 
-	that1, ok := that.(*ColumnType)
+	that1, ok := that.(*ForeignKeyReference)
 	if !ok {
-		that2, ok := that.(ColumnType)
+		that2, ok := that.(ForeignKeyReference)
 		if ok {
 			that1 = &that2
 		} else {
@@ -1677,94 +2339,1185 @@ func (this *ColumnType) Equal(that interface{}) bool {
 	} else if this == nil {
 		return false
 	}
-	if this.SemanticType != that1.SemanticType {
+	if this.Table != that1.Table {
 		return false
 	}
-	if this.Width != that1.Width {
+	if this.Index != that1.Index {
 		return false
 	}
-	if this.Precision != that1.Precision {
+	if this.Name != that1.Name {
 		return false
 	}
-	if len(this.ArrayDimensions) != len(that1.ArrayDimensions) {
+	if this.Validity != that1.Validity {
 		return false
 	}
-	for i := range this.ArrayDimensions {
-		if this.ArrayDimensions[i] != that1.ArrayDimensions[i] {
-			return false
-		}
-	}
-	if this.Locale != nil && that1.Locale != nil {
-		if *this.Locale != *that1.Locale {
-			return false
-		}
-	} else if this.Locale != nil {
-		return false
-	} else if that1.Locale != nil {
+	if this.SharedPrefixLen != that1.SharedPrefixLen {
 		return false
 	}
-	if this.VisibleType != that1.VisibleType {
+	if this.OnDelete != that1.OnDelete {
 		return false
 	}
-	if this.ArrayContents != nil && that1.ArrayContents != nil {
-		if *this.ArrayContents != *that1.ArrayContents {
-			return false
-		}
-	} else if this.ArrayContents != nil {
+	if this.OnUpdate != that1.OnUpdate {
 		return false
-	} else if that1.ArrayContents != nil {
+	}
+	if this.Match != that1.Match {
 		return false
 	}
 	return true
 }
-func (m *ColumnType) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
-	dAtA = make([]byte, size)
-	n, err := m.MarshalTo(dAtA)
-	if err != nil {
-		return nil, err
+func (this *ForeignKeyConstraint) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
 	}
-	return dAtA[:n], nil
-}
 
-func (m *ColumnType) MarshalTo(dAtA []byte) (int, error) {
-	var i int
-	_ = i
-	var l int
-	_ = l
-	dAtA[i] = 0x8
-	i++
-	i = encodeVarintStructured(dAtA, i, uint64(m.SemanticType))
-	dAtA[i] = 0x10
-	i++
-	i = encodeVarintStructured(dAtA, i, uint64(m.Width))
-	dAtA[i] = 0x18
-	i++
-	i = encodeVarintStructured(dAtA, i, uint64(m.Precision))
-	if len(m.ArrayDimensions) > 0 {
-		for _, num := range m.ArrayDimensions {
-			dAtA[i] = 0x20
-			i++
-			i = encodeVarintStructured(dAtA, i, uint64(num))
+	that1, ok := that.(*ForeignKeyConstraint)
+	if !ok {
+		that2, ok := that.(ForeignKeyConstraint)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
 		}
 	}
-	if m.Locale != nil {
-		dAtA[i] = 0x2a
-		i++
-		i = encodeVarintStructured(dAtA, i, uint64(len(*m.Locale)))
-		i += copy(dAtA[i:], *m.Locale)
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
 	}
-	dAtA[i] = 0x30
-	i++
-	i = encodeVarintStructured(dAtA, i, uint64(m.VisibleType))
-	if m.ArrayContents != nil {
-		dAtA[i] = 0x38
-		i++
-		i = encodeVarintStructured(dAtA, i, uint64(*m.ArrayContents))
+	if this.OriginTableID != that1.OriginTableID {
+		return false
 	}
-	return i, nil
+	if len(this.OriginColumnIDs) != len(that1.OriginColumnIDs) {
+		return false
+	}
+	for i := range this.OriginColumnIDs {
+		if this.OriginColumnIDs[i] != that1.OriginColumnIDs[i] {
+			return false
+		}
+	}
+	if len(this.ReferencedColumnIDs) != len(that1.ReferencedColumnIDs) {
+		return false
+	}
+	for i := range this.ReferencedColumnIDs {
+		if this.ReferencedColumnIDs[i] != that1.ReferencedColumnIDs[i] {
+			return false
+		}
+	}
+	if this.ReferencedTableID != that1.ReferencedTableID {
+		return false
+	}
+	if this.Name != that1.Name {
+		return false
+	}
+	if this.Validity != that1.Validity {
+		return false
+	}
+	if this.OnDelete != that1.OnDelete {
+		return false
+	}
+	if this.OnUpdate != that1.OnUpdate {
+		return false
+	}
+	if this.Match != that1.Match {
+		return false
+	}
+	if this.LegacyOriginIndex != that1.LegacyOriginIndex {
+		return false
+	}
+	if this.LegacyReferencedIndex != that1.LegacyReferencedIndex {
+		return false
+	}
+	if !this.LegacyUpgradedFromOriginReference.Equal(&that1.LegacyUpgradedFromOriginReference) {
+		return false
+	}
+	if !this.LegacyUpgradedFromReferencedReference.Equal(&that1.LegacyUpgradedFromReferencedReference) {
+		return false
+	}
+	return true
 }
+func (this *ColumnDescriptor) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
 
+	that1, ok := that.(*ColumnDescriptor)
+	if !ok {
+		that2, ok := that.(ColumnDescriptor)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if this.Name != that1.Name {
+		return false
+	}
+	if this.ID != that1.ID {
+		return false
+	}
+	if !this.Type.Equal(that1.Type) {
+		return false
+	}
+	if this.Nullable != that1.Nullable {
+		return false
+	}
+	if this.DefaultExpr != nil && that1.DefaultExpr != nil {
+		if *this.DefaultExpr != *that1.DefaultExpr {
+			return false
+		}
+	} else if this.DefaultExpr != nil {
+		return false
+	} else if that1.DefaultExpr != nil {
+		return false
+	}
+	if this.Hidden != that1.Hidden {
+		return false
+	}
+	if len(this.UsesSequenceIds) != len(that1.UsesSequenceIds) {
+		return false
+	}
+	for i := range this.UsesSequenceIds {
+		if this.UsesSequenceIds[i] != that1.UsesSequenceIds[i] {
+			return false
+		}
+	}
+	if this.ComputeExpr != nil && that1.ComputeExpr != nil {
+		if *this.ComputeExpr != *that1.ComputeExpr {
+			return false
+		}
+	} else if this.ComputeExpr != nil {
+		return false
+	} else if that1.ComputeExpr != nil {
+		return false
+	}
+	return true
+}
+func (this *ColumnFamilyDescriptor) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*ColumnFamilyDescriptor)
+	if !ok {
+		that2, ok := that.(ColumnFamilyDescriptor)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if this.Name != that1.Name {
+		return false
+	}
+	if this.ID != that1.ID {
+		return false
+	}
+	if len(this.ColumnNames) != len(that1.ColumnNames) {
+		return false
+	}
+	for i := range this.ColumnNames {
+		if this.ColumnNames[i] != that1.ColumnNames[i] {
+			return false
+		}
+	}
+	if len(this.ColumnIDs) != len(that1.ColumnIDs) {
+		return false
+	}
+	for i := range this.ColumnIDs {
+		if this.ColumnIDs[i] != that1.ColumnIDs[i] {
+			return false
+		}
+	}
+	if this.DefaultColumnID != that1.DefaultColumnID {
+		return false
+	}
+	return true
+}
+func (this *InterleaveDescriptor) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*InterleaveDescriptor)
+	if !ok {
+		that2, ok := that.(InterleaveDescriptor)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if len(this.Ancestors) != len(that1.Ancestors) {
+		return false
+	}
+	for i := range this.Ancestors {
+		if !this.Ancestors[i].Equal(&that1.Ancestors[i]) {
+			return false
+		}
+	}
+	return true
+}
+func (this *InterleaveDescriptor_Ancestor) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*InterleaveDescriptor_Ancestor)
+	if !ok {
+		that2, ok := that.(InterleaveDescriptor_Ancestor)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if this.TableID != that1.TableID {
+		return false
+	}
+	if this.IndexID != that1.IndexID {
+		return false
+	}
+	if this.SharedPrefixLen != that1.SharedPrefixLen {
+		return false
+	}
+	return true
+}
+func (this *PartitioningDescriptor) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*PartitioningDescriptor)
+	if !ok {
+		that2, ok := that.(PartitioningDescriptor)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if this.NumColumns != that1.NumColumns {
+		return false
+	}
+	if len(this.List) != len(that1.List) {
+		return false
+	}
+	for i := range this.List {
+		if !this.List[i].Equal(&that1.List[i]) {
+			return false
+		}
+	}
+	if len(this.Range) != len(that1.Range) {
+		return false
+	}
+	for i := range this.Range {
+		if !this.Range[i].Equal(&that1.Range[i]) {
+			return false
+		}
+	}
+	return true
+}
+func (this *PartitioningDescriptor_List) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*PartitioningDescriptor_List)
+	if !ok {
+		that2, ok := that.(PartitioningDescriptor_List)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if this.Name != that1.Name {
+		return false
+	}
+	if len(this.Values) != len(that1.Values) {
+		return false
+	}
+	for i := range this.Values {
+		if !bytes.Equal(this.Values[i], that1.Values[i]) {
+			return false
+		}
+	}
+	if !this.Subpartitioning.Equal(&that1.Subpartitioning) {
+		return false
+	}
+	return true
+}
+func (this *PartitioningDescriptor_Range) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*PartitioningDescriptor_Range)
+	if !ok {
+		that2, ok := that.(PartitioningDescriptor_Range)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if this.Name != that1.Name {
+		return false
+	}
+	if !bytes.Equal(this.FromInclusive, that1.FromInclusive) {
+		return false
+	}
+	if !bytes.Equal(this.ToExclusive, that1.ToExclusive) {
+		return false
+	}
+	return true
+}
+func (this *IndexDescriptor) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*IndexDescriptor)
+	if !ok {
+		that2, ok := that.(IndexDescriptor)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if this.Name != that1.Name {
+		return false
+	}
+	if this.ID != that1.ID {
+		return false
+	}
+	if this.Unique != that1.Unique {
+		return false
+	}
+	if len(this.ColumnNames) != len(that1.ColumnNames) {
+		return false
+	}
+	for i := range this.ColumnNames {
+		if this.ColumnNames[i] != that1.ColumnNames[i] {
+			return false
+		}
+	}
+	if len(this.ColumnDirections) != len(that1.ColumnDirections) {
+		return false
+	}
+	for i := range this.ColumnDirections {
+		if this.ColumnDirections[i] != that1.ColumnDirections[i] {
+			return false
+		}
+	}
+	if len(this.StoreColumnNames) != len(that1.StoreColumnNames) {
+		return false
+	}
+	for i := range this.StoreColumnNames {
+		if this.StoreColumnNames[i] != that1.StoreColumnNames[i] {
+			return false
+		}
+	}
+	if len(this.ColumnIDs) != len(that1.ColumnIDs) {
+		return false
+	}
+	for i := range this.ColumnIDs {
+		if this.ColumnIDs[i] != that1.ColumnIDs[i] {
+			return false
+		}
+	}
+	if len(this.ExtraColumnIDs) != len(that1.ExtraColumnIDs) {
+		return false
+	}
+	for i := range this.ExtraColumnIDs {
+		if this.ExtraColumnIDs[i] != that1.ExtraColumnIDs[i] {
+			return false
+		}
+	}
+	if len(this.StoreColumnIDs) != len(that1.StoreColumnIDs) {
+		return false
+	}
+	for i := range this.StoreColumnIDs {
+		if this.StoreColumnIDs[i] != that1.StoreColumnIDs[i] {
+			return false
+		}
+	}
+	if len(this.CompositeColumnIDs) != len(that1.CompositeColumnIDs) {
+		return false
+	}
+	for i := range this.CompositeColumnIDs {
+		if this.CompositeColumnIDs[i] != that1.CompositeColumnIDs[i] {
+			return false
+		}
+	}
+	if !this.ForeignKey.Equal(&that1.ForeignKey) {
+		return false
+	}
+	if len(this.ReferencedBy) != len(that1.ReferencedBy) {
+		return false
+	}
+	for i := range this.ReferencedBy {
+		if !this.ReferencedBy[i].Equal(&that1.ReferencedBy[i]) {
+			return false
+		}
+	}
+	if !this.Interleave.Equal(&that1.Interleave) {
+		return false
+	}
+	if len(this.InterleavedBy) != len(that1.InterleavedBy) {
+		return false
+	}
+	for i := range this.InterleavedBy {
+		if !this.InterleavedBy[i].Equal(&that1.InterleavedBy[i]) {
+			return false
+		}
+	}
+	if !this.Partitioning.Equal(&that1.Partitioning) {
+		return false
+	}
+	if this.Type != that1.Type {
+		return false
+	}
+	return true
+}
+func (this *ConstraintToUpdate) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*ConstraintToUpdate)
+	if !ok {
+		that2, ok := that.(ConstraintToUpdate)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if this.ConstraintType != that1.ConstraintType {
+		return false
+	}
+	if this.Name != that1.Name {
+		return false
+	}
+	if !this.Check.Equal(&that1.Check) {
+		return false
+	}
+	if !this.ForeignKey.Equal(&that1.ForeignKey) {
+		return false
+	}
+	if this.NotNullColumn != that1.NotNullColumn {
+		return false
+	}
+	return true
+}
+func (this *DescriptorMutation) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*DescriptorMutation)
+	if !ok {
+		that2, ok := that.(DescriptorMutation)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if that1.Descriptor_ == nil {
+		if this.Descriptor_ != nil {
+			return false
+		}
+	} else if this.Descriptor_ == nil {
+		return false
+	} else if !this.Descriptor_.Equal(that1.Descriptor_) {
+		return false
+	}
+	if this.State != that1.State {
+		return false
+	}
+	if this.Direction != that1.Direction {
+		return false
+	}
+	if this.MutationID != that1.MutationID {
+		return false
+	}
+	if this.Rollback != that1.Rollback {
+		return false
+	}
+	return true
+}
+func (this *DescriptorMutation_Column) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*DescriptorMutation_Column)
+	if !ok {
+		that2, ok := that.(DescriptorMutation_Column)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if !this.Column.Equal(that1.Column) {
+		return false
+	}
+	return true
+}
+func (this *DescriptorMutation_Index) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*DescriptorMutation_Index)
+	if !ok {
+		that2, ok := that.(DescriptorMutation_Index)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if !this.Index.Equal(that1.Index) {
+		return false
+	}
+	return true
+}
+func (this *DescriptorMutation_Constraint) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*DescriptorMutation_Constraint)
+	if !ok {
+		that2, ok := that.(DescriptorMutation_Constraint)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if !this.Constraint.Equal(that1.Constraint) {
+		return false
+	}
+	return true
+}
+func (this *TableDescriptor) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*TableDescriptor)
+	if !ok {
+		that2, ok := that.(TableDescriptor)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if this.Name != that1.Name {
+		return false
+	}
+	if this.ID != that1.ID {
+		return false
+	}
+	if this.ParentID != that1.ParentID {
+		return false
+	}
+	if this.Version != that1.Version {
+		return false
+	}
+	if !this.ModificationTime.Equal(&that1.ModificationTime) {
+		return false
+	}
+	if len(this.Columns) != len(that1.Columns) {
+		return false
+	}
+	for i := range this.Columns {
+		if !this.Columns[i].Equal(&that1.Columns[i]) {
+			return false
+		}
+	}
+	if this.NextColumnID != that1.NextColumnID {
+		return false
+	}
+	if len(this.Families) != len(that1.Families) {
+		return false
+	}
+	for i := range this.Families {
+		if !this.Families[i].Equal(&that1.Families[i]) {
+			return false
+		}
+	}
+	if this.NextFamilyID != that1.NextFamilyID {
+		return false
+	}
+	if !this.PrimaryIndex.Equal(&that1.PrimaryIndex) {
+		return false
+	}
+	if len(this.Indexes) != len(that1.Indexes) {
+		return false
+	}
+	for i := range this.Indexes {
+		if !this.Indexes[i].Equal(&that1.Indexes[i]) {
+			return false
+		}
+	}
+	if this.NextIndexID != that1.NextIndexID {
+		return false
+	}
+	if !this.Privileges.Equal(that1.Privileges) {
+		return false
+	}
+	if len(this.Mutations) != len(that1.Mutations) {
+		return false
+	}
+	for i := range this.Mutations {
+		if !this.Mutations[i].Equal(&that1.Mutations[i]) {
+			return false
+		}
+	}
+	if !this.Lease.Equal(that1.Lease) {
+		return false
+	}
+	if this.NextMutationID != that1.NextMutationID {
+		return false
+	}
+	if this.FormatVersion != that1.FormatVersion {
+		return false
+	}
+	if this.State != that1.State {
+		return false
+	}
+	if this.OfflineReason != that1.OfflineReason {
+		return false
+	}
+	if len(this.Checks) != len(that1.Checks) {
+		return false
+	}
+	for i := range this.Checks {
+		if !this.Checks[i].Equal(that1.Checks[i]) {
+			return false
+		}
+	}
+	if len(this.DrainingNames) != len(that1.DrainingNames) {
+		return false
+	}
+	for i := range this.DrainingNames {
+		if !this.DrainingNames[i].Equal(&that1.DrainingNames[i]) {
+			return false
+		}
+	}
+	if this.ViewQuery != that1.ViewQuery {
+		return false
+	}
+	if len(this.DependsOn) != len(that1.DependsOn) {
+		return false
+	}
+	for i := range this.DependsOn {
+		if this.DependsOn[i] != that1.DependsOn[i] {
+			return false
+		}
+	}
+	if len(this.DependedOnBy) != len(that1.DependedOnBy) {
+		return false
+	}
+	for i := range this.DependedOnBy {
+		if !this.DependedOnBy[i].Equal(&that1.DependedOnBy[i]) {
+			return false
+		}
+	}
+	if len(this.MutationJobs) != len(that1.MutationJobs) {
+		return false
+	}
+	for i := range this.MutationJobs {
+		if !this.MutationJobs[i].Equal(&that1.MutationJobs[i]) {
+			return false
+		}
+	}
+	if !this.SequenceOpts.Equal(that1.SequenceOpts) {
+		return false
+	}
+	if this.DropTime != that1.DropTime {
+		return false
+	}
+	if !this.ReplacementOf.Equal(&that1.ReplacementOf) {
+		return false
+	}
+	if this.AuditMode != that1.AuditMode {
+		return false
+	}
+	if this.DropJobID != that1.DropJobID {
+		return false
+	}
+	if len(this.GCMutations) != len(that1.GCMutations) {
+		return false
+	}
+	for i := range this.GCMutations {
+		if !this.GCMutations[i].Equal(&that1.GCMutations[i]) {
+			return false
+		}
+	}
+	if this.CreateQuery != that1.CreateQuery {
+		return false
+	}
+	if !this.CreateAsOfTime.Equal(&that1.CreateAsOfTime) {
+		return false
+	}
+	if len(this.OutboundFKs) != len(that1.OutboundFKs) {
+		return false
+	}
+	for i := range this.OutboundFKs {
+		if !this.OutboundFKs[i].Equal(&that1.OutboundFKs[i]) {
+			return false
+		}
+	}
+	if len(this.InboundFKs) != len(that1.InboundFKs) {
+		return false
+	}
+	for i := range this.InboundFKs {
+		if !this.InboundFKs[i].Equal(&that1.InboundFKs[i]) {
+			return false
+		}
+	}
+	if this.Temporary != that1.Temporary {
+		return false
+	}
+	return true
+}
+func (this *TableDescriptor_SchemaChangeLease) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*TableDescriptor_SchemaChangeLease)
+	if !ok {
+		that2, ok := that.(TableDescriptor_SchemaChangeLease)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if this.NodeID != that1.NodeID {
+		return false
+	}
+	if this.ExpirationTime != that1.ExpirationTime {
+		return false
+	}
+	return true
+}
+func (this *TableDescriptor_CheckConstraint) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*TableDescriptor_CheckConstraint)
+	if !ok {
+		that2, ok := that.(TableDescriptor_CheckConstraint)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if this.Expr != that1.Expr {
+		return false
+	}
+	if this.Name != that1.Name {
+		return false
+	}
+	if this.Validity != that1.Validity {
+		return false
+	}
+	if len(this.ColumnIDs) != len(that1.ColumnIDs) {
+		return false
+	}
+	for i := range this.ColumnIDs {
+		if this.ColumnIDs[i] != that1.ColumnIDs[i] {
+			return false
+		}
+	}
+	if this.IsNonNullConstraint != that1.IsNonNullConstraint {
+		return false
+	}
+	return true
+}
+func (this *TableDescriptor_NameInfo) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*TableDescriptor_NameInfo)
+	if !ok {
+		that2, ok := that.(TableDescriptor_NameInfo)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if this.ParentID != that1.ParentID {
+		return false
+	}
+	if this.Name != that1.Name {
+		return false
+	}
+	return true
+}
+func (this *TableDescriptor_Reference) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*TableDescriptor_Reference)
+	if !ok {
+		that2, ok := that.(TableDescriptor_Reference)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if this.ID != that1.ID {
+		return false
+	}
+	if this.IndexID != that1.IndexID {
+		return false
+	}
+	if len(this.ColumnIDs) != len(that1.ColumnIDs) {
+		return false
+	}
+	for i := range this.ColumnIDs {
+		if this.ColumnIDs[i] != that1.ColumnIDs[i] {
+			return false
+		}
+	}
+	return true
+}
+func (this *TableDescriptor_MutationJob) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*TableDescriptor_MutationJob)
+	if !ok {
+		that2, ok := that.(TableDescriptor_MutationJob)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if this.MutationID != that1.MutationID {
+		return false
+	}
+	if this.JobID != that1.JobID {
+		return false
+	}
+	return true
+}
+func (this *TableDescriptor_SequenceOpts) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*TableDescriptor_SequenceOpts)
+	if !ok {
+		that2, ok := that.(TableDescriptor_SequenceOpts)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if this.Increment != that1.Increment {
+		return false
+	}
+	if this.MinValue != that1.MinValue {
+		return false
+	}
+	if this.MaxValue != that1.MaxValue {
+		return false
+	}
+	if this.Start != that1.Start {
+		return false
+	}
+	if this.Virtual != that1.Virtual {
+		return false
+	}
+	return true
+}
+func (this *TableDescriptor_Replacement) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*TableDescriptor_Replacement)
+	if !ok {
+		that2, ok := that.(TableDescriptor_Replacement)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if this.ID != that1.ID {
+		return false
+	}
+	if !this.Time.Equal(&that1.Time) {
+		return false
+	}
+	return true
+}
+func (this *TableDescriptor_GCDescriptorMutation) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*TableDescriptor_GCDescriptorMutation)
+	if !ok {
+		that2, ok := that.(TableDescriptor_GCDescriptorMutation)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if this.IndexID != that1.IndexID {
+		return false
+	}
+	if this.DropTime != that1.DropTime {
+		return false
+	}
+	if this.JobID != that1.JobID {
+		return false
+	}
+	return true
+}
+func (this *DatabaseDescriptor) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*DatabaseDescriptor)
+	if !ok {
+		that2, ok := that.(DatabaseDescriptor)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if this.Name != that1.Name {
+		return false
+	}
+	if this.ID != that1.ID {
+		return false
+	}
+	if !this.Privileges.Equal(that1.Privileges) {
+		return false
+	}
+	return true
+}
+func (this *Descriptor) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*Descriptor)
+	if !ok {
+		that2, ok := that.(Descriptor)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if that1.Union == nil {
+		if this.Union != nil {
+			return false
+		}
+	} else if this.Union == nil {
+		return false
+	} else if !this.Union.Equal(that1.Union) {
+		return false
+	}
+	return true
+}
+func (this *Descriptor_Table) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*Descriptor_Table)
+	if !ok {
+		that2, ok := that.(Descriptor_Table)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if !this.Table.Equal(that1.Table) {
+		return false
+	}
+	return true
+}
+func (this *Descriptor_Database) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*Descriptor_Database)
+	if !ok {
+		that2, ok := that.(Descriptor_Database)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if !this.Database.Equal(that1.Database) {
+		return false
+	}
+	return true
+}
 func (m *ForeignKeyReference) Marshal() (dAtA []byte, err error) {
 	size := m.Size()
 	dAtA = make([]byte, size)
@@ -1802,6 +3555,85 @@ func (m *ForeignKeyReference) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0x38
 	i++
 	i = encodeVarintStructured(dAtA, i, uint64(m.OnUpdate))
+	dAtA[i] = 0x40
+	i++
+	i = encodeVarintStructured(dAtA, i, uint64(m.Match))
+	return i, nil
+}
+
+func (m *ForeignKeyConstraint) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *ForeignKeyConstraint) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	dAtA[i] = 0x8
+	i++
+	i = encodeVarintStructured(dAtA, i, uint64(m.OriginTableID))
+	if len(m.OriginColumnIDs) > 0 {
+		for _, num := range m.OriginColumnIDs {
+			dAtA[i] = 0x10
+			i++
+			i = encodeVarintStructured(dAtA, i, uint64(num))
+		}
+	}
+	if len(m.ReferencedColumnIDs) > 0 {
+		for _, num := range m.ReferencedColumnIDs {
+			dAtA[i] = 0x18
+			i++
+			i = encodeVarintStructured(dAtA, i, uint64(num))
+		}
+	}
+	dAtA[i] = 0x20
+	i++
+	i = encodeVarintStructured(dAtA, i, uint64(m.ReferencedTableID))
+	dAtA[i] = 0x2a
+	i++
+	i = encodeVarintStructured(dAtA, i, uint64(len(m.Name)))
+	i += copy(dAtA[i:], m.Name)
+	dAtA[i] = 0x30
+	i++
+	i = encodeVarintStructured(dAtA, i, uint64(m.Validity))
+	dAtA[i] = 0x38
+	i++
+	i = encodeVarintStructured(dAtA, i, uint64(m.OnDelete))
+	dAtA[i] = 0x40
+	i++
+	i = encodeVarintStructured(dAtA, i, uint64(m.OnUpdate))
+	dAtA[i] = 0x48
+	i++
+	i = encodeVarintStructured(dAtA, i, uint64(m.Match))
+	dAtA[i] = 0x50
+	i++
+	i = encodeVarintStructured(dAtA, i, uint64(m.LegacyOriginIndex))
+	dAtA[i] = 0x58
+	i++
+	i = encodeVarintStructured(dAtA, i, uint64(m.LegacyReferencedIndex))
+	dAtA[i] = 0x62
+	i++
+	i = encodeVarintStructured(dAtA, i, uint64(m.LegacyUpgradedFromOriginReference.Size()))
+	n1, err := m.LegacyUpgradedFromOriginReference.MarshalTo(dAtA[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n1
+	dAtA[i] = 0x6a
+	i++
+	i = encodeVarintStructured(dAtA, i, uint64(m.LegacyUpgradedFromReferencedReference.Size()))
+	n2, err := m.LegacyUpgradedFromReferencedReference.MarshalTo(dAtA[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n2
 	return i, nil
 }
 
@@ -1830,11 +3662,11 @@ func (m *ColumnDescriptor) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0x1a
 	i++
 	i = encodeVarintStructured(dAtA, i, uint64(m.Type.Size()))
-	n1, err := m.Type.MarshalTo(dAtA[i:])
+	n3, err := m.Type.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n1
+	i += n3
 	dAtA[i] = 0x20
 	i++
 	if m.Nullable {
@@ -2055,11 +3887,11 @@ func (m *PartitioningDescriptor_List) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0x1a
 	i++
 	i = encodeVarintStructured(dAtA, i, uint64(m.Subpartitioning.Size()))
-	n2, err := m.Subpartitioning.MarshalTo(dAtA[i:])
+	n4, err := m.Subpartitioning.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n2
+	i += n4
 	return i, nil
 }
 
@@ -2181,11 +4013,11 @@ func (m *IndexDescriptor) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0x4a
 	i++
 	i = encodeVarintStructured(dAtA, i, uint64(m.ForeignKey.Size()))
-	n3, err := m.ForeignKey.MarshalTo(dAtA[i:])
+	n5, err := m.ForeignKey.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n3
+	i += n5
 	if len(m.ReferencedBy) > 0 {
 		for _, msg := range m.ReferencedBy {
 			dAtA[i] = 0x52
@@ -2201,11 +4033,11 @@ func (m *IndexDescriptor) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0x5a
 	i++
 	i = encodeVarintStructured(dAtA, i, uint64(m.Interleave.Size()))
-	n4, err := m.Interleave.MarshalTo(dAtA[i:])
+	n6, err := m.Interleave.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n4
+	i += n6
 	if len(m.InterleavedBy) > 0 {
 		for _, msg := range m.InterleavedBy {
 			dAtA[i] = 0x62
@@ -2235,16 +4067,60 @@ func (m *IndexDescriptor) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0x7a
 	i++
 	i = encodeVarintStructured(dAtA, i, uint64(m.Partitioning.Size()))
-	n5, err := m.Partitioning.MarshalTo(dAtA[i:])
+	n7, err := m.Partitioning.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n5
+	i += n7
 	dAtA[i] = 0x80
 	i++
 	dAtA[i] = 0x1
 	i++
 	i = encodeVarintStructured(dAtA, i, uint64(m.Type))
+	return i, nil
+}
+
+func (m *ConstraintToUpdate) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *ConstraintToUpdate) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	dAtA[i] = 0x8
+	i++
+	i = encodeVarintStructured(dAtA, i, uint64(m.ConstraintType))
+	dAtA[i] = 0x12
+	i++
+	i = encodeVarintStructured(dAtA, i, uint64(len(m.Name)))
+	i += copy(dAtA[i:], m.Name)
+	dAtA[i] = 0x1a
+	i++
+	i = encodeVarintStructured(dAtA, i, uint64(m.Check.Size()))
+	n8, err := m.Check.MarshalTo(dAtA[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n8
+	dAtA[i] = 0x22
+	i++
+	i = encodeVarintStructured(dAtA, i, uint64(m.ForeignKey.Size()))
+	n9, err := m.ForeignKey.MarshalTo(dAtA[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n9
+	dAtA[i] = 0x30
+	i++
+	i = encodeVarintStructured(dAtA, i, uint64(m.NotNullColumn))
 	return i, nil
 }
 
@@ -2264,11 +4140,11 @@ func (m *DescriptorMutation) MarshalTo(dAtA []byte) (int, error) {
 	var l int
 	_ = l
 	if m.Descriptor_ != nil {
-		nn6, err := m.Descriptor_.MarshalTo(dAtA[i:])
+		nn10, err := m.Descriptor_.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += nn6
+		i += nn10
 	}
 	dAtA[i] = 0x18
 	i++
@@ -2296,11 +4172,11 @@ func (m *DescriptorMutation_Column) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0xa
 		i++
 		i = encodeVarintStructured(dAtA, i, uint64(m.Column.Size()))
-		n7, err := m.Column.MarshalTo(dAtA[i:])
+		n11, err := m.Column.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n7
+		i += n11
 	}
 	return i, nil
 }
@@ -2310,11 +4186,25 @@ func (m *DescriptorMutation_Index) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0x12
 		i++
 		i = encodeVarintStructured(dAtA, i, uint64(m.Index.Size()))
-		n8, err := m.Index.MarshalTo(dAtA[i:])
+		n12, err := m.Index.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n8
+		i += n12
+	}
+	return i, nil
+}
+func (m *DescriptorMutation_Constraint) MarshalTo(dAtA []byte) (int, error) {
+	i := 0
+	if m.Constraint != nil {
+		dAtA[i] = 0x42
+		i++
+		i = encodeVarintStructured(dAtA, i, uint64(m.Constraint.Size()))
+		n13, err := m.Constraint.MarshalTo(dAtA[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n13
 	}
 	return i, nil
 }
@@ -2346,22 +4236,14 @@ func (m *TableDescriptor) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0x28
 	i++
 	i = encodeVarintStructured(dAtA, i, uint64(m.Version))
-	dAtA[i] = 0x30
-	i++
-	if m.UpVersion {
-		dAtA[i] = 1
-	} else {
-		dAtA[i] = 0
-	}
-	i++
 	dAtA[i] = 0x3a
 	i++
 	i = encodeVarintStructured(dAtA, i, uint64(m.ModificationTime.Size()))
-	n9, err := m.ModificationTime.MarshalTo(dAtA[i:])
+	n14, err := m.ModificationTime.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n9
+	i += n14
 	if len(m.Columns) > 0 {
 		for _, msg := range m.Columns {
 			dAtA[i] = 0x42
@@ -2380,11 +4262,11 @@ func (m *TableDescriptor) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0x52
 	i++
 	i = encodeVarintStructured(dAtA, i, uint64(m.PrimaryIndex.Size()))
-	n10, err := m.PrimaryIndex.MarshalTo(dAtA[i:])
+	n15, err := m.PrimaryIndex.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n10
+	i += n15
 	if len(m.Indexes) > 0 {
 		for _, msg := range m.Indexes {
 			dAtA[i] = 0x5a
@@ -2404,11 +4286,11 @@ func (m *TableDescriptor) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0x6a
 		i++
 		i = encodeVarintStructured(dAtA, i, uint64(m.Privileges.Size()))
-		n11, err := m.Privileges.MarshalTo(dAtA[i:])
+		n16, err := m.Privileges.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n11
+		i += n16
 	}
 	if len(m.Mutations) > 0 {
 		for _, msg := range m.Mutations {
@@ -2426,11 +4308,11 @@ func (m *TableDescriptor) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0x7a
 		i++
 		i = encodeVarintStructured(dAtA, i, uint64(m.Lease.Size()))
-		n12, err := m.Lease.MarshalTo(dAtA[i:])
+		n17, err := m.Lease.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n12
+		i += n17
 	}
 	dAtA[i] = 0x80
 	i++
@@ -2543,11 +4425,11 @@ func (m *TableDescriptor) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0x1
 		i++
 		i = encodeVarintStructured(dAtA, i, uint64(m.SequenceOpts.Size()))
-		n13, err := m.SequenceOpts.MarshalTo(dAtA[i:])
+		n18, err := m.SequenceOpts.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n13
+		i += n18
 	}
 	dAtA[i] = 0xe8
 	i++
@@ -2559,16 +4441,95 @@ func (m *TableDescriptor) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0x1
 	i++
 	i = encodeVarintStructured(dAtA, i, uint64(m.ReplacementOf.Size()))
-	n14, err := m.ReplacementOf.MarshalTo(dAtA[i:])
+	n19, err := m.ReplacementOf.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n14
+	i += n19
 	dAtA[i] = 0xf8
 	i++
 	dAtA[i] = 0x1
 	i++
 	i = encodeVarintStructured(dAtA, i, uint64(m.AuditMode))
+	dAtA[i] = 0x80
+	i++
+	dAtA[i] = 0x2
+	i++
+	i = encodeVarintStructured(dAtA, i, uint64(m.DropJobID))
+	if len(m.GCMutations) > 0 {
+		for _, msg := range m.GCMutations {
+			dAtA[i] = 0x8a
+			i++
+			dAtA[i] = 0x2
+			i++
+			i = encodeVarintStructured(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
+	}
+	dAtA[i] = 0x92
+	i++
+	dAtA[i] = 0x2
+	i++
+	i = encodeVarintStructured(dAtA, i, uint64(len(m.CreateQuery)))
+	i += copy(dAtA[i:], m.CreateQuery)
+	dAtA[i] = 0x9a
+	i++
+	dAtA[i] = 0x2
+	i++
+	i = encodeVarintStructured(dAtA, i, uint64(m.CreateAsOfTime.Size()))
+	n20, err := m.CreateAsOfTime.MarshalTo(dAtA[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n20
+	if len(m.OutboundFKs) > 0 {
+		for _, msg := range m.OutboundFKs {
+			dAtA[i] = 0xa2
+			i++
+			dAtA[i] = 0x2
+			i++
+			i = encodeVarintStructured(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
+	}
+	if len(m.InboundFKs) > 0 {
+		for _, msg := range m.InboundFKs {
+			dAtA[i] = 0xaa
+			i++
+			dAtA[i] = 0x2
+			i++
+			i = encodeVarintStructured(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
+	}
+	dAtA[i] = 0xb2
+	i++
+	dAtA[i] = 0x2
+	i++
+	i = encodeVarintStructured(dAtA, i, uint64(len(m.OfflineReason)))
+	i += copy(dAtA[i:], m.OfflineReason)
+	dAtA[i] = 0xb8
+	i++
+	dAtA[i] = 0x2
+	i++
+	if m.Temporary {
+		dAtA[i] = 1
+	} else {
+		dAtA[i] = 0
+	}
+	i++
 	return i, nil
 }
 
@@ -2629,6 +4590,14 @@ func (m *TableDescriptor_CheckConstraint) MarshalTo(dAtA []byte) (int, error) {
 			i = encodeVarintStructured(dAtA, i, uint64(num))
 		}
 	}
+	dAtA[i] = 0x30
+	i++
+	if m.IsNonNullConstraint {
+		dAtA[i] = 1
+	} else {
+		dAtA[i] = 0
+	}
+	i++
 	return i, nil
 }
 
@@ -2739,6 +4708,14 @@ func (m *TableDescriptor_SequenceOpts) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0x20
 	i++
 	i = encodeVarintStructured(dAtA, i, uint64(m.Start))
+	dAtA[i] = 0x28
+	i++
+	if m.Virtual {
+		dAtA[i] = 1
+	} else {
+		dAtA[i] = 0
+	}
+	i++
 	return i, nil
 }
 
@@ -2763,11 +4740,38 @@ func (m *TableDescriptor_Replacement) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0x12
 	i++
 	i = encodeVarintStructured(dAtA, i, uint64(m.Time.Size()))
-	n15, err := m.Time.MarshalTo(dAtA[i:])
+	n21, err := m.Time.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n15
+	i += n21
+	return i, nil
+}
+
+func (m *TableDescriptor_GCDescriptorMutation) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *TableDescriptor_GCDescriptorMutation) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	dAtA[i] = 0x8
+	i++
+	i = encodeVarintStructured(dAtA, i, uint64(m.IndexID))
+	dAtA[i] = 0x10
+	i++
+	i = encodeVarintStructured(dAtA, i, uint64(m.DropTime))
+	dAtA[i] = 0x18
+	i++
+	i = encodeVarintStructured(dAtA, i, uint64(m.JobID))
 	return i, nil
 }
 
@@ -2797,11 +4801,11 @@ func (m *DatabaseDescriptor) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0x1a
 		i++
 		i = encodeVarintStructured(dAtA, i, uint64(m.Privileges.Size()))
-		n16, err := m.Privileges.MarshalTo(dAtA[i:])
+		n22, err := m.Privileges.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n16
+		i += n22
 	}
 	return i, nil
 }
@@ -2822,11 +4826,11 @@ func (m *Descriptor) MarshalTo(dAtA []byte) (int, error) {
 	var l int
 	_ = l
 	if m.Union != nil {
-		nn17, err := m.Union.MarshalTo(dAtA[i:])
+		nn23, err := m.Union.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += nn17
+		i += nn23
 	}
 	return i, nil
 }
@@ -2837,11 +4841,11 @@ func (m *Descriptor_Table) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0xa
 		i++
 		i = encodeVarintStructured(dAtA, i, uint64(m.Table.Size()))
-		n18, err := m.Table.MarshalTo(dAtA[i:])
+		n24, err := m.Table.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n18
+		i += n24
 	}
 	return i, nil
 }
@@ -2851,11 +4855,11 @@ func (m *Descriptor_Database) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0x12
 		i++
 		i = encodeVarintStructured(dAtA, i, uint64(m.Database.Size()))
-		n19, err := m.Database.MarshalTo(dAtA[i:])
+		n25, err := m.Database.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n19
+		i += n25
 	}
 	return i, nil
 }
@@ -2868,29 +4872,10 @@ func encodeVarintStructured(dAtA []byte, offset int, v uint64) int {
 	dAtA[offset] = uint8(v)
 	return offset + 1
 }
-func (m *ColumnType) Size() (n int) {
-	var l int
-	_ = l
-	n += 1 + sovStructured(uint64(m.SemanticType))
-	n += 1 + sovStructured(uint64(m.Width))
-	n += 1 + sovStructured(uint64(m.Precision))
-	if len(m.ArrayDimensions) > 0 {
-		for _, e := range m.ArrayDimensions {
-			n += 1 + sovStructured(uint64(e))
-		}
-	}
-	if m.Locale != nil {
-		l = len(*m.Locale)
-		n += 1 + l + sovStructured(uint64(l))
-	}
-	n += 1 + sovStructured(uint64(m.VisibleType))
-	if m.ArrayContents != nil {
-		n += 1 + sovStructured(uint64(*m.ArrayContents))
-	}
-	return n
-}
-
 func (m *ForeignKeyReference) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	n += 1 + sovStructured(uint64(m.Table))
@@ -2901,10 +4886,47 @@ func (m *ForeignKeyReference) Size() (n int) {
 	n += 1 + sovStructured(uint64(m.SharedPrefixLen))
 	n += 1 + sovStructured(uint64(m.OnDelete))
 	n += 1 + sovStructured(uint64(m.OnUpdate))
+	n += 1 + sovStructured(uint64(m.Match))
+	return n
+}
+
+func (m *ForeignKeyConstraint) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	n += 1 + sovStructured(uint64(m.OriginTableID))
+	if len(m.OriginColumnIDs) > 0 {
+		for _, e := range m.OriginColumnIDs {
+			n += 1 + sovStructured(uint64(e))
+		}
+	}
+	if len(m.ReferencedColumnIDs) > 0 {
+		for _, e := range m.ReferencedColumnIDs {
+			n += 1 + sovStructured(uint64(e))
+		}
+	}
+	n += 1 + sovStructured(uint64(m.ReferencedTableID))
+	l = len(m.Name)
+	n += 1 + l + sovStructured(uint64(l))
+	n += 1 + sovStructured(uint64(m.Validity))
+	n += 1 + sovStructured(uint64(m.OnDelete))
+	n += 1 + sovStructured(uint64(m.OnUpdate))
+	n += 1 + sovStructured(uint64(m.Match))
+	n += 1 + sovStructured(uint64(m.LegacyOriginIndex))
+	n += 1 + sovStructured(uint64(m.LegacyReferencedIndex))
+	l = m.LegacyUpgradedFromOriginReference.Size()
+	n += 1 + l + sovStructured(uint64(l))
+	l = m.LegacyUpgradedFromReferencedReference.Size()
+	n += 1 + l + sovStructured(uint64(l))
 	return n
 }
 
 func (m *ColumnDescriptor) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	l = len(m.Name)
@@ -2931,6 +4953,9 @@ func (m *ColumnDescriptor) Size() (n int) {
 }
 
 func (m *ColumnFamilyDescriptor) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	l = len(m.Name)
@@ -2952,6 +4977,9 @@ func (m *ColumnFamilyDescriptor) Size() (n int) {
 }
 
 func (m *InterleaveDescriptor) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	if len(m.Ancestors) > 0 {
@@ -2964,6 +4992,9 @@ func (m *InterleaveDescriptor) Size() (n int) {
 }
 
 func (m *InterleaveDescriptor_Ancestor) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	n += 1 + sovStructured(uint64(m.TableID))
@@ -2973,6 +5004,9 @@ func (m *InterleaveDescriptor_Ancestor) Size() (n int) {
 }
 
 func (m *PartitioningDescriptor) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	n += 1 + sovStructured(uint64(m.NumColumns))
@@ -2992,6 +5026,9 @@ func (m *PartitioningDescriptor) Size() (n int) {
 }
 
 func (m *PartitioningDescriptor_List) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	l = len(m.Name)
@@ -3008,6 +5045,9 @@ func (m *PartitioningDescriptor_List) Size() (n int) {
 }
 
 func (m *PartitioningDescriptor_Range) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	l = len(m.Name)
@@ -3024,6 +5064,9 @@ func (m *PartitioningDescriptor_Range) Size() (n int) {
 }
 
 func (m *IndexDescriptor) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	l = len(m.Name)
@@ -3089,7 +5132,27 @@ func (m *IndexDescriptor) Size() (n int) {
 	return n
 }
 
+func (m *ConstraintToUpdate) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	n += 1 + sovStructured(uint64(m.ConstraintType))
+	l = len(m.Name)
+	n += 1 + l + sovStructured(uint64(l))
+	l = m.Check.Size()
+	n += 1 + l + sovStructured(uint64(l))
+	l = m.ForeignKey.Size()
+	n += 1 + l + sovStructured(uint64(l))
+	n += 1 + sovStructured(uint64(m.NotNullColumn))
+	return n
+}
+
 func (m *DescriptorMutation) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	if m.Descriptor_ != nil {
@@ -3103,6 +5166,9 @@ func (m *DescriptorMutation) Size() (n int) {
 }
 
 func (m *DescriptorMutation_Column) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	if m.Column != nil {
@@ -3112,6 +5178,9 @@ func (m *DescriptorMutation_Column) Size() (n int) {
 	return n
 }
 func (m *DescriptorMutation_Index) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	if m.Index != nil {
@@ -3120,7 +5189,22 @@ func (m *DescriptorMutation_Index) Size() (n int) {
 	}
 	return n
 }
+func (m *DescriptorMutation_Constraint) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.Constraint != nil {
+		l = m.Constraint.Size()
+		n += 1 + l + sovStructured(uint64(l))
+	}
+	return n
+}
 func (m *TableDescriptor) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	l = len(m.Name)
@@ -3128,7 +5212,6 @@ func (m *TableDescriptor) Size() (n int) {
 	n += 1 + sovStructured(uint64(m.ID))
 	n += 1 + sovStructured(uint64(m.ParentID))
 	n += 1 + sovStructured(uint64(m.Version))
-	n += 2
 	l = m.ModificationTime.Size()
 	n += 1 + l + sovStructured(uint64(l))
 	if len(m.Columns) > 0 {
@@ -3210,10 +5293,39 @@ func (m *TableDescriptor) Size() (n int) {
 	l = m.ReplacementOf.Size()
 	n += 2 + l + sovStructured(uint64(l))
 	n += 2 + sovStructured(uint64(m.AuditMode))
+	n += 2 + sovStructured(uint64(m.DropJobID))
+	if len(m.GCMutations) > 0 {
+		for _, e := range m.GCMutations {
+			l = e.Size()
+			n += 2 + l + sovStructured(uint64(l))
+		}
+	}
+	l = len(m.CreateQuery)
+	n += 2 + l + sovStructured(uint64(l))
+	l = m.CreateAsOfTime.Size()
+	n += 2 + l + sovStructured(uint64(l))
+	if len(m.OutboundFKs) > 0 {
+		for _, e := range m.OutboundFKs {
+			l = e.Size()
+			n += 2 + l + sovStructured(uint64(l))
+		}
+	}
+	if len(m.InboundFKs) > 0 {
+		for _, e := range m.InboundFKs {
+			l = e.Size()
+			n += 2 + l + sovStructured(uint64(l))
+		}
+	}
+	l = len(m.OfflineReason)
+	n += 2 + l + sovStructured(uint64(l))
+	n += 3
 	return n
 }
 
 func (m *TableDescriptor_SchemaChangeLease) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	n += 1 + sovStructured(uint64(m.NodeID))
@@ -3222,6 +5334,9 @@ func (m *TableDescriptor_SchemaChangeLease) Size() (n int) {
 }
 
 func (m *TableDescriptor_CheckConstraint) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	l = len(m.Expr)
@@ -3234,10 +5349,14 @@ func (m *TableDescriptor_CheckConstraint) Size() (n int) {
 			n += 1 + sovStructured(uint64(e))
 		}
 	}
+	n += 2
 	return n
 }
 
 func (m *TableDescriptor_NameInfo) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	n += 1 + sovStructured(uint64(m.ParentID))
@@ -3247,6 +5366,9 @@ func (m *TableDescriptor_NameInfo) Size() (n int) {
 }
 
 func (m *TableDescriptor_Reference) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	n += 1 + sovStructured(uint64(m.ID))
@@ -3260,6 +5382,9 @@ func (m *TableDescriptor_Reference) Size() (n int) {
 }
 
 func (m *TableDescriptor_MutationJob) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	n += 1 + sovStructured(uint64(m.MutationID))
@@ -3268,16 +5393,23 @@ func (m *TableDescriptor_MutationJob) Size() (n int) {
 }
 
 func (m *TableDescriptor_SequenceOpts) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	n += 1 + sovStructured(uint64(m.Increment))
 	n += 1 + sovStructured(uint64(m.MinValue))
 	n += 1 + sovStructured(uint64(m.MaxValue))
 	n += 1 + sovStructured(uint64(m.Start))
+	n += 2
 	return n
 }
 
 func (m *TableDescriptor_Replacement) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	n += 1 + sovStructured(uint64(m.ID))
@@ -3286,7 +5418,22 @@ func (m *TableDescriptor_Replacement) Size() (n int) {
 	return n
 }
 
+func (m *TableDescriptor_GCDescriptorMutation) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	n += 1 + sovStructured(uint64(m.IndexID))
+	n += 1 + sovStructured(uint64(m.DropTime))
+	n += 1 + sovStructured(uint64(m.JobID))
+	return n
+}
+
 func (m *DatabaseDescriptor) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	l = len(m.Name)
@@ -3300,6 +5447,9 @@ func (m *DatabaseDescriptor) Size() (n int) {
 }
 
 func (m *Descriptor) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	if m.Union != nil {
@@ -3309,6 +5459,9 @@ func (m *Descriptor) Size() (n int) {
 }
 
 func (m *Descriptor_Table) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	if m.Table != nil {
@@ -3318,6 +5471,9 @@ func (m *Descriptor_Table) Size() (n int) {
 	return n
 }
 func (m *Descriptor_Database) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	if m.Database != nil {
@@ -3339,244 +5495,6 @@ func sovStructured(x uint64) (n int) {
 }
 func sozStructured(x uint64) (n int) {
 	return sovStructured(uint64((x << 1) ^ uint64((int64(x) >> 63))))
-}
-func (m *ColumnType) Unmarshal(dAtA []byte) error {
-	l := len(dAtA)
-	iNdEx := 0
-	for iNdEx < l {
-		preIndex := iNdEx
-		var wire uint64
-		for shift := uint(0); ; shift += 7 {
-			if shift >= 64 {
-				return ErrIntOverflowStructured
-			}
-			if iNdEx >= l {
-				return io.ErrUnexpectedEOF
-			}
-			b := dAtA[iNdEx]
-			iNdEx++
-			wire |= (uint64(b) & 0x7F) << shift
-			if b < 0x80 {
-				break
-			}
-		}
-		fieldNum := int32(wire >> 3)
-		wireType := int(wire & 0x7)
-		if wireType == 4 {
-			return fmt.Errorf("proto: ColumnType: wiretype end group for non-group")
-		}
-		if fieldNum <= 0 {
-			return fmt.Errorf("proto: ColumnType: illegal tag %d (wire type %d)", fieldNum, wire)
-		}
-		switch fieldNum {
-		case 1:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field SemanticType", wireType)
-			}
-			m.SemanticType = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowStructured
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				m.SemanticType |= (ColumnType_SemanticType(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-		case 2:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Width", wireType)
-			}
-			m.Width = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowStructured
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				m.Width |= (int32(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-		case 3:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Precision", wireType)
-			}
-			m.Precision = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowStructured
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				m.Precision |= (int32(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-		case 4:
-			if wireType == 0 {
-				var v int32
-				for shift := uint(0); ; shift += 7 {
-					if shift >= 64 {
-						return ErrIntOverflowStructured
-					}
-					if iNdEx >= l {
-						return io.ErrUnexpectedEOF
-					}
-					b := dAtA[iNdEx]
-					iNdEx++
-					v |= (int32(b) & 0x7F) << shift
-					if b < 0x80 {
-						break
-					}
-				}
-				m.ArrayDimensions = append(m.ArrayDimensions, v)
-			} else if wireType == 2 {
-				var packedLen int
-				for shift := uint(0); ; shift += 7 {
-					if shift >= 64 {
-						return ErrIntOverflowStructured
-					}
-					if iNdEx >= l {
-						return io.ErrUnexpectedEOF
-					}
-					b := dAtA[iNdEx]
-					iNdEx++
-					packedLen |= (int(b) & 0x7F) << shift
-					if b < 0x80 {
-						break
-					}
-				}
-				if packedLen < 0 {
-					return ErrInvalidLengthStructured
-				}
-				postIndex := iNdEx + packedLen
-				if postIndex > l {
-					return io.ErrUnexpectedEOF
-				}
-				for iNdEx < postIndex {
-					var v int32
-					for shift := uint(0); ; shift += 7 {
-						if shift >= 64 {
-							return ErrIntOverflowStructured
-						}
-						if iNdEx >= l {
-							return io.ErrUnexpectedEOF
-						}
-						b := dAtA[iNdEx]
-						iNdEx++
-						v |= (int32(b) & 0x7F) << shift
-						if b < 0x80 {
-							break
-						}
-					}
-					m.ArrayDimensions = append(m.ArrayDimensions, v)
-				}
-			} else {
-				return fmt.Errorf("proto: wrong wireType = %d for field ArrayDimensions", wireType)
-			}
-		case 5:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Locale", wireType)
-			}
-			var stringLen uint64
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowStructured
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				stringLen |= (uint64(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			intStringLen := int(stringLen)
-			if intStringLen < 0 {
-				return ErrInvalidLengthStructured
-			}
-			postIndex := iNdEx + intStringLen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			s := string(dAtA[iNdEx:postIndex])
-			m.Locale = &s
-			iNdEx = postIndex
-		case 6:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field VisibleType", wireType)
-			}
-			m.VisibleType = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowStructured
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				m.VisibleType |= (ColumnType_VisibleType(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-		case 7:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field ArrayContents", wireType)
-			}
-			var v ColumnType_SemanticType
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowStructured
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				v |= (ColumnType_SemanticType(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			m.ArrayContents = &v
-		default:
-			iNdEx = preIndex
-			skippy, err := skipStructured(dAtA[iNdEx:])
-			if err != nil {
-				return err
-			}
-			if skippy < 0 {
-				return ErrInvalidLengthStructured
-			}
-			if (iNdEx + skippy) > l {
-				return io.ErrUnexpectedEOF
-			}
-			iNdEx += skippy
-		}
-	}
-
-	if iNdEx > l {
-		return io.ErrUnexpectedEOF
-	}
-	return nil
 }
 func (m *ForeignKeyReference) Unmarshal(dAtA []byte) error {
 	l := len(dAtA)
@@ -3750,6 +5668,462 @@ func (m *ForeignKeyReference) Unmarshal(dAtA []byte) error {
 					break
 				}
 			}
+		case 8:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Match", wireType)
+			}
+			m.Match = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStructured
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Match |= (ForeignKeyReference_Match(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		default:
+			iNdEx = preIndex
+			skippy, err := skipStructured(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthStructured
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *ForeignKeyConstraint) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowStructured
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: ForeignKeyConstraint: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: ForeignKeyConstraint: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field OriginTableID", wireType)
+			}
+			m.OriginTableID = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStructured
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.OriginTableID |= (ID(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 2:
+			if wireType == 0 {
+				var v ColumnID
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowStructured
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					v |= (ColumnID(b) & 0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				m.OriginColumnIDs = append(m.OriginColumnIDs, v)
+			} else if wireType == 2 {
+				var packedLen int
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowStructured
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					packedLen |= (int(b) & 0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				if packedLen < 0 {
+					return ErrInvalidLengthStructured
+				}
+				postIndex := iNdEx + packedLen
+				if postIndex > l {
+					return io.ErrUnexpectedEOF
+				}
+				var elementCount int
+				var count int
+				for _, integer := range dAtA {
+					if integer < 128 {
+						count++
+					}
+				}
+				elementCount = count
+				if elementCount != 0 && len(m.OriginColumnIDs) == 0 {
+					m.OriginColumnIDs = make([]ColumnID, 0, elementCount)
+				}
+				for iNdEx < postIndex {
+					var v ColumnID
+					for shift := uint(0); ; shift += 7 {
+						if shift >= 64 {
+							return ErrIntOverflowStructured
+						}
+						if iNdEx >= l {
+							return io.ErrUnexpectedEOF
+						}
+						b := dAtA[iNdEx]
+						iNdEx++
+						v |= (ColumnID(b) & 0x7F) << shift
+						if b < 0x80 {
+							break
+						}
+					}
+					m.OriginColumnIDs = append(m.OriginColumnIDs, v)
+				}
+			} else {
+				return fmt.Errorf("proto: wrong wireType = %d for field OriginColumnIDs", wireType)
+			}
+		case 3:
+			if wireType == 0 {
+				var v ColumnID
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowStructured
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					v |= (ColumnID(b) & 0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				m.ReferencedColumnIDs = append(m.ReferencedColumnIDs, v)
+			} else if wireType == 2 {
+				var packedLen int
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowStructured
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					packedLen |= (int(b) & 0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				if packedLen < 0 {
+					return ErrInvalidLengthStructured
+				}
+				postIndex := iNdEx + packedLen
+				if postIndex > l {
+					return io.ErrUnexpectedEOF
+				}
+				var elementCount int
+				var count int
+				for _, integer := range dAtA {
+					if integer < 128 {
+						count++
+					}
+				}
+				elementCount = count
+				if elementCount != 0 && len(m.ReferencedColumnIDs) == 0 {
+					m.ReferencedColumnIDs = make([]ColumnID, 0, elementCount)
+				}
+				for iNdEx < postIndex {
+					var v ColumnID
+					for shift := uint(0); ; shift += 7 {
+						if shift >= 64 {
+							return ErrIntOverflowStructured
+						}
+						if iNdEx >= l {
+							return io.ErrUnexpectedEOF
+						}
+						b := dAtA[iNdEx]
+						iNdEx++
+						v |= (ColumnID(b) & 0x7F) << shift
+						if b < 0x80 {
+							break
+						}
+					}
+					m.ReferencedColumnIDs = append(m.ReferencedColumnIDs, v)
+				}
+			} else {
+				return fmt.Errorf("proto: wrong wireType = %d for field ReferencedColumnIDs", wireType)
+			}
+		case 4:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ReferencedTableID", wireType)
+			}
+			m.ReferencedTableID = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStructured
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.ReferencedTableID |= (ID(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 5:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Name", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStructured
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= (uint64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthStructured
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Name = string(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
+		case 6:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Validity", wireType)
+			}
+			m.Validity = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStructured
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Validity |= (ConstraintValidity(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 7:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field OnDelete", wireType)
+			}
+			m.OnDelete = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStructured
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.OnDelete |= (ForeignKeyReference_Action(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 8:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field OnUpdate", wireType)
+			}
+			m.OnUpdate = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStructured
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.OnUpdate |= (ForeignKeyReference_Action(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 9:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Match", wireType)
+			}
+			m.Match = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStructured
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Match |= (ForeignKeyReference_Match(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 10:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field LegacyOriginIndex", wireType)
+			}
+			m.LegacyOriginIndex = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStructured
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.LegacyOriginIndex |= (IndexID(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 11:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field LegacyReferencedIndex", wireType)
+			}
+			m.LegacyReferencedIndex = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStructured
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.LegacyReferencedIndex |= (IndexID(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 12:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field LegacyUpgradedFromOriginReference", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStructured
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthStructured
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.LegacyUpgradedFromOriginReference.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 13:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field LegacyUpgradedFromReferencedReference", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStructured
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthStructured
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.LegacyUpgradedFromReferencedReference.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipStructured(dAtA[iNdEx:])
@@ -3852,7 +6226,7 @@ func (m *ColumnDescriptor) Unmarshal(dAtA []byte) error {
 			if wireType != 2 {
 				return fmt.Errorf("proto: wrong wireType = %d for field Type", wireType)
 			}
-			var msglen int
+			var byteLen int
 			for shift := uint(0); ; shift += 7 {
 				if shift >= 64 {
 					return ErrIntOverflowStructured
@@ -3862,15 +6236,15 @@ func (m *ColumnDescriptor) Unmarshal(dAtA []byte) error {
 				}
 				b := dAtA[iNdEx]
 				iNdEx++
-				msglen |= (int(b) & 0x7F) << shift
+				byteLen |= (int(b) & 0x7F) << shift
 				if b < 0x80 {
 					break
 				}
 			}
-			if msglen < 0 {
+			if byteLen < 0 {
 				return ErrInvalidLengthStructured
 			}
-			postIndex := iNdEx + msglen
+			postIndex := iNdEx + byteLen
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
@@ -3988,6 +6362,17 @@ func (m *ColumnDescriptor) Unmarshal(dAtA []byte) error {
 				postIndex := iNdEx + packedLen
 				if postIndex > l {
 					return io.ErrUnexpectedEOF
+				}
+				var elementCount int
+				var count int
+				for _, integer := range dAtA {
+					if integer < 128 {
+						count++
+					}
+				}
+				elementCount = count
+				if elementCount != 0 && len(m.UsesSequenceIds) == 0 {
+					m.UsesSequenceIds = make([]ID, 0, elementCount)
 				}
 				for iNdEx < postIndex {
 					var v ID
@@ -4207,6 +6592,17 @@ func (m *ColumnFamilyDescriptor) Unmarshal(dAtA []byte) error {
 				postIndex := iNdEx + packedLen
 				if postIndex > l {
 					return io.ErrUnexpectedEOF
+				}
+				var elementCount int
+				var count int
+				for _, integer := range dAtA {
+					if integer < 128 {
+						count++
+					}
+				}
+				elementCount = count
+				if elementCount != 0 && len(m.ColumnIDs) == 0 {
+					m.ColumnIDs = make([]ColumnID, 0, elementCount)
 				}
 				for iNdEx < postIndex {
 					var v ColumnID
@@ -5063,6 +7459,17 @@ func (m *IndexDescriptor) Unmarshal(dAtA []byte) error {
 				if postIndex > l {
 					return io.ErrUnexpectedEOF
 				}
+				var elementCount int
+				var count int
+				for _, integer := range dAtA {
+					if integer < 128 {
+						count++
+					}
+				}
+				elementCount = count
+				if elementCount != 0 && len(m.ColumnIDs) == 0 {
+					m.ColumnIDs = make([]ColumnID, 0, elementCount)
+				}
 				for iNdEx < postIndex {
 					var v ColumnID
 					for shift := uint(0); ; shift += 7 {
@@ -5125,6 +7532,17 @@ func (m *IndexDescriptor) Unmarshal(dAtA []byte) error {
 				if postIndex > l {
 					return io.ErrUnexpectedEOF
 				}
+				var elementCount int
+				var count int
+				for _, integer := range dAtA {
+					if integer < 128 {
+						count++
+					}
+				}
+				elementCount = count
+				if elementCount != 0 && len(m.ExtraColumnIDs) == 0 {
+					m.ExtraColumnIDs = make([]ColumnID, 0, elementCount)
+				}
 				for iNdEx < postIndex {
 					var v ColumnID
 					for shift := uint(0); ; shift += 7 {
@@ -5186,6 +7604,10 @@ func (m *IndexDescriptor) Unmarshal(dAtA []byte) error {
 				postIndex := iNdEx + packedLen
 				if postIndex > l {
 					return io.ErrUnexpectedEOF
+				}
+				var elementCount int
+				if elementCount != 0 && len(m.ColumnDirections) == 0 {
+					m.ColumnDirections = make([]IndexDescriptor_Direction, 0, elementCount)
 				}
 				for iNdEx < postIndex {
 					var v IndexDescriptor_Direction
@@ -5371,6 +7793,17 @@ func (m *IndexDescriptor) Unmarshal(dAtA []byte) error {
 				if postIndex > l {
 					return io.ErrUnexpectedEOF
 				}
+				var elementCount int
+				var count int
+				for _, integer := range dAtA {
+					if integer < 128 {
+						count++
+					}
+				}
+				elementCount = count
+				if elementCount != 0 && len(m.CompositeColumnIDs) == 0 {
+					m.CompositeColumnIDs = make([]ColumnID, 0, elementCount)
+				}
 				for iNdEx < postIndex {
 					var v ColumnID
 					for shift := uint(0); ; shift += 7 {
@@ -5432,6 +7865,17 @@ func (m *IndexDescriptor) Unmarshal(dAtA []byte) error {
 				postIndex := iNdEx + packedLen
 				if postIndex > l {
 					return io.ErrUnexpectedEOF
+				}
+				var elementCount int
+				var count int
+				for _, integer := range dAtA {
+					if integer < 128 {
+						count++
+					}
+				}
+				elementCount = count
+				if elementCount != 0 && len(m.StoreColumnIDs) == 0 {
+					m.StoreColumnIDs = make([]ColumnID, 0, elementCount)
 				}
 				for iNdEx < postIndex {
 					var v ColumnID
@@ -5517,6 +7961,192 @@ func (m *IndexDescriptor) Unmarshal(dAtA []byte) error {
 			}
 			iNdEx += skippy
 		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *ConstraintToUpdate) Unmarshal(dAtA []byte) error {
+	var hasFields [1]uint64
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowStructured
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: ConstraintToUpdate: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: ConstraintToUpdate: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ConstraintType", wireType)
+			}
+			m.ConstraintType = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStructured
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.ConstraintType |= (ConstraintToUpdate_ConstraintType(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			hasFields[0] |= uint64(0x00000001)
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Name", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStructured
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= (uint64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthStructured
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Name = string(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
+			hasFields[0] |= uint64(0x00000002)
+		case 3:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Check", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStructured
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthStructured
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.Check.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 4:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ForeignKey", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStructured
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthStructured
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.ForeignKey.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 6:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field NotNullColumn", wireType)
+			}
+			m.NotNullColumn = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStructured
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.NotNullColumn |= (ColumnID(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		default:
+			iNdEx = preIndex
+			skippy, err := skipStructured(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthStructured
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+	if hasFields[0]&uint64(0x00000001) == 0 {
+		return github_com_gogo_protobuf_proto.NewRequiredNotSetError("constraint_type")
+	}
+	if hasFields[0]&uint64(0x00000002) == 0 {
+		return github_com_gogo_protobuf_proto.NewRequiredNotSetError("name")
 	}
 
 	if iNdEx > l {
@@ -5694,6 +8324,38 @@ func (m *DescriptorMutation) Unmarshal(dAtA []byte) error {
 				}
 			}
 			m.Rollback = bool(v != 0)
+		case 8:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Constraint", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStructured
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthStructured
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			v := &ConstraintToUpdate{}
+			if err := v.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			m.Descriptor_ = &DescriptorMutation_Constraint{v}
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipStructured(dAtA[iNdEx:])
@@ -5830,26 +8492,6 @@ func (m *TableDescriptor) Unmarshal(dAtA []byte) error {
 					break
 				}
 			}
-		case 6:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field UpVersion", wireType)
-			}
-			var v int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowStructured
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				v |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			m.UpVersion = bool(v != 0)
 		case 7:
 			if wireType != 2 {
 				return fmt.Errorf("proto: wrong wireType = %d for field ModificationTime", wireType)
@@ -6346,6 +8988,17 @@ func (m *TableDescriptor) Unmarshal(dAtA []byte) error {
 				if postIndex > l {
 					return io.ErrUnexpectedEOF
 				}
+				var elementCount int
+				var count int
+				for _, integer := range dAtA {
+					if integer < 128 {
+						count++
+					}
+				}
+				elementCount = count
+				if elementCount != 0 && len(m.DependsOn) == 0 {
+					m.DependsOn = make([]ID, 0, elementCount)
+				}
 				for iNdEx < postIndex {
 					var v ID
 					for shift := uint(0); ; shift += 7 {
@@ -6530,6 +9183,226 @@ func (m *TableDescriptor) Unmarshal(dAtA []byte) error {
 					break
 				}
 			}
+		case 32:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field DropJobID", wireType)
+			}
+			m.DropJobID = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStructured
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.DropJobID |= (int64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 33:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field GCMutations", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStructured
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthStructured
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.GCMutations = append(m.GCMutations, TableDescriptor_GCDescriptorMutation{})
+			if err := m.GCMutations[len(m.GCMutations)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 34:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field CreateQuery", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStructured
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= (uint64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthStructured
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.CreateQuery = string(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
+		case 35:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field CreateAsOfTime", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStructured
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthStructured
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.CreateAsOfTime.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 36:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field OutboundFKs", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStructured
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthStructured
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.OutboundFKs = append(m.OutboundFKs, ForeignKeyConstraint{})
+			if err := m.OutboundFKs[len(m.OutboundFKs)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 37:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field InboundFKs", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStructured
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthStructured
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.InboundFKs = append(m.InboundFKs, ForeignKeyConstraint{})
+			if err := m.InboundFKs[len(m.InboundFKs)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 38:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field OfflineReason", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStructured
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= (uint64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthStructured
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.OfflineReason = string(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
+		case 39:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Temporary", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStructured
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.Temporary = bool(v != 0)
 		default:
 			iNdEx = preIndex
 			skippy, err := skipStructured(dAtA[iNdEx:])
@@ -6786,6 +9659,17 @@ func (m *TableDescriptor_CheckConstraint) Unmarshal(dAtA []byte) error {
 				if postIndex > l {
 					return io.ErrUnexpectedEOF
 				}
+				var elementCount int
+				var count int
+				for _, integer := range dAtA {
+					if integer < 128 {
+						count++
+					}
+				}
+				elementCount = count
+				if elementCount != 0 && len(m.ColumnIDs) == 0 {
+					m.ColumnIDs = make([]ColumnID, 0, elementCount)
+				}
 				for iNdEx < postIndex {
 					var v ColumnID
 					for shift := uint(0); ; shift += 7 {
@@ -6807,6 +9691,26 @@ func (m *TableDescriptor_CheckConstraint) Unmarshal(dAtA []byte) error {
 			} else {
 				return fmt.Errorf("proto: wrong wireType = %d for field ColumnIDs", wireType)
 			}
+		case 6:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field IsNonNullConstraint", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStructured
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.IsNonNullConstraint = bool(v != 0)
 		default:
 			iNdEx = preIndex
 			skippy, err := skipStructured(dAtA[iNdEx:])
@@ -7033,6 +9937,17 @@ func (m *TableDescriptor_Reference) Unmarshal(dAtA []byte) error {
 				postIndex := iNdEx + packedLen
 				if postIndex > l {
 					return io.ErrUnexpectedEOF
+				}
+				var elementCount int
+				var count int
+				for _, integer := range dAtA {
+					if integer < 128 {
+						count++
+					}
+				}
+				elementCount = count
+				if elementCount != 0 && len(m.ColumnIDs) == 0 {
+					m.ColumnIDs = make([]ColumnID, 0, elementCount)
 				}
 				for iNdEx < postIndex {
 					var v ColumnID
@@ -7269,6 +10184,26 @@ func (m *TableDescriptor_SequenceOpts) Unmarshal(dAtA []byte) error {
 					break
 				}
 			}
+		case 5:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Virtual", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStructured
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.Virtual = bool(v != 0)
 		default:
 			iNdEx = preIndex
 			skippy, err := skipStructured(dAtA[iNdEx:])
@@ -7368,6 +10303,113 @@ func (m *TableDescriptor_Replacement) Unmarshal(dAtA []byte) error {
 				return err
 			}
 			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipStructured(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthStructured
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *TableDescriptor_GCDescriptorMutation) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowStructured
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: GCDescriptorMutation: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: GCDescriptorMutation: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field IndexID", wireType)
+			}
+			m.IndexID = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStructured
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.IndexID |= (IndexID(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 2:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field DropTime", wireType)
+			}
+			m.DropTime = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStructured
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.DropTime |= (int64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 3:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field JobID", wireType)
+			}
+			m.JobID = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowStructured
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.JobID |= (int64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
 		default:
 			iNdEx = preIndex
 			skippy, err := skipStructured(dAtA[iNdEx:])
@@ -7739,194 +10781,221 @@ var (
 	ErrIntOverflowStructured   = fmt.Errorf("proto: integer overflow")
 )
 
-func init() { proto.RegisterFile("sql/sqlbase/structured.proto", fileDescriptorStructured) }
+func init() {
+	proto.RegisterFile("sql/sqlbase/structured.proto", fileDescriptor_structured_5011444cd75c25b7)
+}
 
-var fileDescriptorStructured = []byte{
-	// 2967 bytes of a gzipped FileDescriptorProto
-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xa4, 0x59, 0x5b, 0x6f, 0xe3, 0xc6,
-	0x15, 0x36, 0x75, 0xd7, 0xd1, 0x8d, 0x9e, 0xbd, 0x84, 0xab, 0x6c, 0x6c, 0xaf, 0x92, 0x4d, 0x9d,
-	0x9b, 0xbc, 0xf1, 0xa6, 0x6d, 0x90, 0x16, 0x41, 0x25, 0x91, 0xde, 0xa5, 0x57, 0x96, 0xbc, 0x94,
-	0xec, 0xcd, 0x06, 0x69, 0x09, 0x5a, 0x1c, 0xdb, 0xcc, 0x52, 0xa4, 0x96, 0xa4, 0x1c, 0xeb, 0x1f,
-	0xe4, 0xb1, 0x0f, 0x05, 0x8a, 0xbe, 0x04, 0x41, 0xd0, 0xb7, 0xfe, 0x81, 0xfe, 0x84, 0x2d, 0xd0,
-	0x87, 0xa2, 0x4f, 0x7d, 0xe9, 0xa2, 0x75, 0x51, 0xa0, 0xbf, 0xa0, 0x0f, 0x01, 0x0a, 0x14, 0x33,
-	0x9c, 0xa1, 0x28, 0xdf, 0xa2, 0xdd, 0x7d, 0x13, 0xcf, 0x9c, 0xf3, 0xcd, 0x9c, 0x33, 0xe7, 0x7c,
-	0x73, 0x66, 0x04, 0x37, 0xfd, 0xa7, 0xf6, 0x9a, 0xff, 0xd4, 0xde, 0x33, 0x7c, 0xbc, 0xe6, 0x07,
-	0xde, 0x78, 0x10, 0x8c, 0x3d, 0x6c, 0xd6, 0x47, 0x9e, 0x1b, 0xb8, 0xe8, 0xda, 0xc0, 0x1d, 0x3c,
-	0xf1, 0x5c, 0x63, 0x70, 0x58, 0xf7, 0x9f, 0xda, 0x75, 0xa6, 0x57, 0x95, 0xc6, 0x81, 0x65, 0xaf,
-	0x1d, 0xda, 0x83, 0xb5, 0xc0, 0x1a, 0x62, 0x3f, 0x30, 0x86, 0xa3, 0xd0, 0xa0, 0xfa, 0x7a, 0x1c,
-	0x6e, 0xe4, 0x59, 0x47, 0x96, 0x8d, 0x0f, 0x30, 0x1b, 0xbc, 0x7a, 0xe0, 0x1e, 0xb8, 0xf4, 0xe7,
-	0x1a, 0xf9, 0x15, 0x4a, 0x6b, 0xbf, 0xcf, 0x00, 0xb4, 0x5c, 0x7b, 0x3c, 0x74, 0xfa, 0x93, 0x11,
-	0x46, 0x8f, 0xa1, 0xe4, 0xe3, 0xa1, 0xe1, 0x04, 0xd6, 0x40, 0x0f, 0x26, 0x23, 0x2c, 0x09, 0x2b,
-	0xc2, 0x6a, 0x79, 0xbd, 0x5e, 0x3f, 0x77, 0x29, 0xf5, 0xa9, 0x65, 0xbd, 0xc7, 0xcc, 0xc8, 0x47,
-	0x33, 0xf5, 0xec, 0xf9, 0xf2, 0x82, 0x56, 0xf4, 0x63, 0x32, 0x54, 0x85, 0xf4, 0x57, 0x96, 0x19,
-	0x1c, 0x4a, 0x89, 0x15, 0x61, 0x35, 0xcd, 0x54, 0x42, 0x11, 0xaa, 0x41, 0x7e, 0xe4, 0xe1, 0x81,
-	0xe5, 0x5b, 0xae, 0x23, 0x25, 0x63, 0xe3, 0x53, 0x31, 0x7a, 0x07, 0x44, 0xc3, 0xf3, 0x8c, 0x89,
-	0x6e, 0x5a, 0x43, 0xec, 0x10, 0x91, 0x2f, 0xa5, 0x56, 0x92, 0xab, 0x69, 0xad, 0x42, 0xe5, 0x72,
-	0x24, 0x46, 0xd7, 0x21, 0x63, 0xbb, 0x03, 0xc3, 0xc6, 0x52, 0x7a, 0x45, 0x58, 0xcd, 0x6b, 0xec,
-	0x0b, 0xed, 0x42, 0xf1, 0xc8, 0xf2, 0xad, 0x3d, 0x1b, 0x87, 0xce, 0x65, 0xa8, 0x73, 0x1f, 0xfc,
-	0xb0, 0x73, 0xbb, 0xa1, 0x55, 0xcc, 0xb7, 0xc2, 0xd1, 0x54, 0x84, 0x76, 0xa0, 0x1c, 0x2e, 0x6d,
-	0xe0, 0x3a, 0x01, 0x76, 0x02, 0x5f, 0xca, 0xbe, 0x4c, 0xd8, 0xb4, 0x12, 0x45, 0x69, 0x31, 0x90,
-	0xda, 0xef, 0x12, 0x50, 0x8c, 0x8f, 0xa3, 0x1c, 0xa4, 0x9a, 0xdd, 0x6e, 0x5b, 0x5c, 0x40, 0x59,
-	0x48, 0xaa, 0x9d, 0xbe, 0x28, 0xa0, 0x3c, 0xa4, 0x37, 0xda, 0xdd, 0x46, 0x5f, 0x4c, 0xa0, 0x02,
-	0x64, 0x65, 0xa5, 0xa5, 0x6e, 0x35, 0xda, 0x62, 0x92, 0xa8, 0xca, 0x8d, 0xbe, 0x22, 0xa6, 0x50,
-	0x09, 0xf2, 0x7d, 0x75, 0x4b, 0xe9, 0xf5, 0x1b, 0x5b, 0xdb, 0x62, 0x1a, 0x15, 0x21, 0xa7, 0x76,
-	0xfa, 0x8a, 0xb6, 0xdb, 0x68, 0x8b, 0x19, 0x04, 0x90, 0xe9, 0xf5, 0x35, 0xb5, 0x73, 0x4f, 0xcc,
-	0x12, 0xa8, 0xe6, 0xe3, 0xbe, 0xd2, 0x13, 0x73, 0xa8, 0x02, 0x85, 0xc8, 0xa6, 0xff, 0xb9, 0x98,
-	0x47, 0x08, 0xca, 0xad, 0x6e, 0xbb, 0xdd, 0xe8, 0x2b, 0x32, 0xd3, 0x07, 0x32, 0x45, 0xa7, 0xb1,
-	0xa5, 0x88, 0x05, 0xb2, 0x9a, 0xae, 0x2a, 0x8b, 0x45, 0x2a, 0xda, 0x69, 0xb7, 0xc5, 0x12, 0xf9,
-	0xb5, 0xb3, 0xa3, 0xca, 0x62, 0x99, 0xc0, 0x36, 0x34, 0xad, 0xf1, 0x58, 0xac, 0x10, 0xa1, 0xda,
-	0x51, 0xfa, 0xa2, 0x48, 0x7e, 0x91, 0x09, 0xc4, 0x45, 0xf2, 0x6b, 0xb3, 0xd7, 0xed, 0x88, 0x88,
-	0xac, 0x85, 0xc8, 0xfa, 0x9f, 0x8b, 0x57, 0x50, 0x05, 0x40, 0xed, 0xf4, 0xd7, 0x77, 0x95, 0x56,
-	0xbf, 0xab, 0x89, 0xcf, 0x04, 0x54, 0x86, 0x7c, 0x57, 0x95, 0xd9, 0xf7, 0x9f, 0x84, 0xda, 0x01,
-	0x14, 0x62, 0x9b, 0x42, 0x27, 0xee, 0x76, 0x14, 0x71, 0x81, 0x44, 0x81, 0xf8, 0x77, 0x4f, 0xd1,
-	0x44, 0x81, 0x38, 0xdb, 0xdb, 0x6a, 0xb4, 0xdb, 0x24, 0x56, 0x09, 0x32, 0x41, 0x53, 0xbd, 0x47,
-	0x7e, 0x27, 0xc9, 0x92, 0x9b, 0x6a, 0x5f, 0x4c, 0x11, 0x4b, 0x4d, 0x69, 0xb4, 0xc5, 0x34, 0xba,
-	0x0a, 0xa2, 0xdc, 0xdd, 0x69, 0xb6, 0x15, 0x7d, 0x5b, 0x53, 0x5a, 0x6a, 0x4f, 0xed, 0x76, 0xc4,
-	0xcc, 0x27, 0xa9, 0xff, 0x7c, 0xbb, 0x2c, 0xd4, 0xfe, 0x9b, 0x84, 0x2b, 0x1b, 0xae, 0x87, 0xad,
-	0x03, 0xe7, 0x01, 0x9e, 0x68, 0x78, 0x1f, 0x7b, 0xd8, 0x19, 0x60, 0xb4, 0x02, 0xe9, 0xc0, 0xd8,
-	0xb3, 0xc3, 0x3a, 0x29, 0x35, 0x81, 0xe4, 0xc6, 0xf7, 0xcf, 0x97, 0x13, 0xaa, 0xac, 0x85, 0x03,
-	0xe8, 0x36, 0xa4, 0x2d, 0xc7, 0xc4, 0xc7, 0x34, 0xed, 0x4b, 0xcd, 0x0a, 0xd3, 0xc8, 0xaa, 0x44,
-	0x48, 0xd4, 0xe8, 0x28, 0x92, 0x20, 0xe5, 0x18, 0x43, 0x4c, 0x93, 0x3f, 0xcf, 0x72, 0x8c, 0x4a,
-	0xd0, 0x03, 0xc8, 0x1d, 0x19, 0xb6, 0x65, 0x5a, 0xc1, 0x44, 0x4a, 0xd1, 0xb4, 0x7a, 0xe7, 0xc2,
-	0xb4, 0x72, 0xfc, 0xc0, 0x33, 0x2c, 0x27, 0xd8, 0x65, 0x06, 0x0c, 0x28, 0x02, 0x40, 0x77, 0x60,
-	0xd1, 0x3f, 0x34, 0x3c, 0x6c, 0xea, 0x23, 0x0f, 0xef, 0x5b, 0xc7, 0xba, 0x8d, 0x1d, 0x5a, 0x24,
-	0xbc, 0xe0, 0x2a, 0xe1, 0xf0, 0x36, 0x1d, 0x6d, 0x63, 0x07, 0xf5, 0x21, 0xef, 0x3a, 0xba, 0x89,
-	0x6d, 0x1c, 0xf0, 0x82, 0xf9, 0xf0, 0x82, 0xf9, 0xcf, 0x09, 0x50, 0xbd, 0x31, 0x08, 0x2c, 0xd7,
-	0xe1, 0xeb, 0x70, 0x1d, 0x99, 0x02, 0x31, 0xd4, 0xf1, 0xc8, 0x34, 0x02, 0xcc, 0x8a, 0xe5, 0x55,
-	0x50, 0x77, 0x28, 0x50, 0xed, 0x21, 0x64, 0xc2, 0x11, 0x92, 0xf4, 0x9d, 0xae, 0xde, 0x68, 0xf5,
-	0xc9, 0x26, 0x2e, 0x90, 0x3c, 0xd0, 0x14, 0x92, 0xb8, 0xad, 0x3e, 0xcb, 0x0a, 0xa5, 0xaf, 0xd3,
-	0x4c, 0x4d, 0x90, 0x5c, 0x27, 0x5f, 0xb2, 0xb2, 0xd1, 0xd8, 0x69, 0x93, 0xd4, 0x28, 0x40, 0xb6,
-	0xd5, 0xe8, 0xb5, 0x1a, 0xb2, 0x22, 0xa6, 0x6a, 0x7f, 0x4f, 0x80, 0x18, 0x96, 0xab, 0x8c, 0xfd,
-	0x81, 0x67, 0x8d, 0x02, 0xd7, 0x8b, 0x36, 0x4b, 0x38, 0xb3, 0x59, 0x6f, 0x43, 0xc2, 0x32, 0xd9,
-	0x56, 0x5f, 0x27, 0xf2, 0x13, 0x9a, 0x0c, 0xdf, 0x3f, 0x5f, 0xce, 0x85, 0x28, 0xaa, 0xac, 0x25,
-	0x2c, 0x13, 0xfd, 0x0c, 0x52, 0x94, 0x81, 0xc8, 0x76, 0x17, 0xd6, 0x6f, 0xfd, 0x20, 0x4f, 0xf0,
-	0x49, 0x88, 0x11, 0x5a, 0x81, 0x9c, 0x33, 0xb6, 0x6d, 0x9a, 0x77, 0x24, 0x23, 0x72, 0x3c, 0x10,
-	0x5c, 0x8a, 0x6e, 0x41, 0xd1, 0xc4, 0xfb, 0xc6, 0xd8, 0x0e, 0x74, 0x7c, 0x3c, 0xf2, 0x18, 0x0d,
-	0x16, 0x98, 0x4c, 0x39, 0x1e, 0x79, 0xe8, 0x26, 0x64, 0x0e, 0x2d, 0xd3, 0xc4, 0x0e, 0xdd, 0x54,
-	0x0e, 0xc1, 0x64, 0x68, 0x1d, 0x16, 0xc7, 0x3e, 0xf6, 0x75, 0x1f, 0x3f, 0x1d, 0x93, 0x88, 0xeb,
-	0x96, 0xe9, 0x4b, 0xb0, 0x92, 0x5c, 0x2d, 0x35, 0x33, 0x2c, 0xbf, 0x2b, 0x44, 0xa1, 0xc7, 0xc6,
-	0x55, 0xd3, 0x27, 0x93, 0x0e, 0xdc, 0xe1, 0x68, 0x1c, 0xe0, 0x70, 0xd2, 0x42, 0x38, 0x29, 0x93,
-	0x91, 0x49, 0x37, 0x53, 0xb9, 0x9c, 0x98, 0xdf, 0x4c, 0xe5, 0xf2, 0x22, 0x6c, 0xa6, 0x72, 0x59,
-	0x31, 0x57, 0xfb, 0x3a, 0x01, 0xd7, 0x43, 0x37, 0x37, 0x8c, 0xa1, 0x65, 0x4f, 0x5e, 0x35, 0xca,
-	0x21, 0x0a, 0x8b, 0x32, 0x5d, 0x11, 0xc1, 0xd6, 0x89, 0x99, 0x2f, 0x25, 0x57, 0x92, 0xe1, 0x8a,
-	0x88, 0xac, 0x43, 0x44, 0xe8, 0x63, 0x00, 0xa6, 0x42, 0x3c, 0x4c, 0x51, 0x0f, 0x6f, 0x9c, 0x3c,
-	0x5f, 0xce, 0xf3, 0xed, 0xf2, 0x67, 0xf6, 0x2e, 0x1f, 0x2a, 0x13, 0x77, 0xbb, 0xb0, 0xc8, 0x63,
-	0x1c, 0x21, 0xd0, 0x40, 0x97, 0x9a, 0x6f, 0xb2, 0x35, 0x55, 0xe4, 0x50, 0x81, 0x9b, 0xcf, 0x40,
-	0x55, 0xcc, 0x99, 0x41, 0xb3, 0xf6, 0x87, 0x04, 0x5c, 0x55, 0x9d, 0x00, 0x7b, 0x36, 0x36, 0x8e,
-	0x70, 0x2c, 0x10, 0x9f, 0x41, 0xde, 0x70, 0x06, 0xd8, 0x0f, 0x5c, 0xcf, 0x97, 0x84, 0x95, 0xe4,
-	0x6a, 0x61, 0xfd, 0xa3, 0x0b, 0x32, 0xe6, 0x3c, 0xfb, 0x7a, 0x83, 0x19, 0xf3, 0x33, 0x35, 0x02,
-	0xab, 0xfe, 0x51, 0x80, 0x1c, 0x1f, 0x45, 0x77, 0x20, 0x47, 0x29, 0x8b, 0xf8, 0x11, 0xd2, 0xd9,
-	0x35, 0xe6, 0x47, 0xb6, 0x4f, 0xe4, 0x74, 0xfd, 0x64, 0xe7, 0xb3, 0x54, 0x4d, 0x35, 0xd1, 0x8f,
-	0x21, 0x47, 0xd9, 0x4b, 0x8f, 0x76, 0xa3, 0xca, 0x2d, 0x18, 0xbd, 0xc5, 0x99, 0x2e, 0x4b, 0x75,
-	0x55, 0x13, 0xb5, 0xce, 0x23, 0xa1, 0x24, 0xb5, 0x7f, 0x8d, 0x47, 0xae, 0x37, 0x4b, 0x43, 0x67,
-	0x78, 0xa9, 0xf6, 0xef, 0x24, 0x5c, 0xdf, 0x36, 0xbc, 0xc0, 0x22, 0xf5, 0x6e, 0x39, 0x07, 0xb1,
-	0x78, 0xdd, 0x86, 0x82, 0x33, 0x1e, 0xb2, 0x5d, 0xf1, 0x99, 0x2f, 0xa1, 0xef, 0xe0, 0x8c, 0x87,
-	0x61, 0xc0, 0x7d, 0xd4, 0x86, 0x94, 0x6d, 0xf9, 0x81, 0x94, 0xa0, 0x11, 0x5d, 0xbf, 0x20, 0xa2,
-	0xe7, 0xcf, 0x51, 0x6f, 0x5b, 0x7e, 0xc0, 0x73, 0x92, 0xa0, 0xa0, 0x2e, 0xa4, 0x3d, 0xc3, 0x39,
-	0xc0, 0x34, 0xc9, 0x0a, 0xeb, 0x77, 0x5f, 0x0c, 0x4e, 0x23, 0xa6, 0xbc, 0x27, 0xa2, 0x38, 0xd5,
-	0xdf, 0x0a, 0x90, 0x22, 0xb3, 0x5c, 0x52, 0x07, 0xd7, 0x21, 0x73, 0x64, 0xd8, 0x63, 0xec, 0x53,
-	0x1f, 0x8a, 0x1a, 0xfb, 0x42, 0xbf, 0x84, 0x8a, 0x3f, 0xde, 0x1b, 0xc5, 0xa6, 0x62, 0x44, 0xf3,
-	0xc1, 0x0b, 0xad, 0x2a, 0x3a, 0x12, 0x66, 0xb1, 0xaa, 0x4f, 0x20, 0x4d, 0xd7, 0x7b, 0xc9, 0xca,
-	0x6e, 0x41, 0x31, 0x70, 0x75, 0x7c, 0x3c, 0xb0, 0xc7, 0xbe, 0x75, 0x84, 0x69, 0x76, 0x14, 0xb5,
-	0x42, 0xe0, 0x2a, 0x5c, 0x84, 0x6e, 0x43, 0x79, 0xdf, 0x73, 0x87, 0xba, 0xe5, 0x70, 0xa5, 0x24,
-	0x55, 0x2a, 0x11, 0xa9, 0xca, 0x85, 0xb5, 0xff, 0xe5, 0xa0, 0x42, 0x33, 0x68, 0x2e, 0x66, 0xb8,
-	0x1d, 0x63, 0x86, 0x6b, 0x33, 0xcc, 0x10, 0xa5, 0x21, 0x21, 0x86, 0x9b, 0x90, 0x19, 0x3b, 0xd6,
-	0xd3, 0x71, 0x38, 0x67, 0x44, 0x7e, 0xa1, 0xec, 0x0c, 0x6d, 0xa4, 0xce, 0xd2, 0xc6, 0xfb, 0x80,
-	0x48, 0xcd, 0x60, 0x7d, 0x46, 0x31, 0x4d, 0x15, 0x45, 0x3a, 0xd2, 0xba, 0x90, 0x64, 0x32, 0x2f,
-	0x40, 0x32, 0xf7, 0x41, 0xc4, 0xc7, 0x81, 0x67, 0xe8, 0x31, 0xfb, 0x2c, 0xb5, 0x5f, 0x3a, 0x79,
-	0xbe, 0x5c, 0x56, 0xc8, 0xd8, 0xf9, 0x20, 0x65, 0x1c, 0x1b, 0x33, 0x49, 0x4e, 0x2c, 0x32, 0x0c,
-	0xd3, 0xf2, 0x30, 0x3d, 0x25, 0x7d, 0x29, 0xb7, 0x92, 0x5c, 0x2d, 0xaf, 0xdf, 0xb9, 0x90, 0x4c,
-	0x66, 0xc2, 0x5e, 0x97, 0xb9, 0xa1, 0x26, 0x86, 0x50, 0x91, 0xc0, 0x47, 0x0f, 0xa1, 0xb0, 0x1f,
-	0x1e, 0xd4, 0xfa, 0x13, 0x3c, 0x91, 0xf2, 0x34, 0xdd, 0xde, 0x9d, 0xff, 0x48, 0xe7, 0xf5, 0xb9,
-	0x1f, 0x0d, 0xa1, 0x1d, 0x28, 0x79, 0x7c, 0xd8, 0xd4, 0xf7, 0x26, 0xf4, 0xfc, 0x79, 0x19, 0xd0,
-	0xe2, 0x14, 0xa6, 0x39, 0x41, 0x0f, 0x01, 0xac, 0x88, 0x25, 0xe9, 0x21, 0x55, 0x58, 0x7f, 0xef,
-	0x05, 0xe8, 0x94, 0xaf, 0x74, 0x0a, 0x82, 0x1e, 0x41, 0x79, 0xfa, 0x45, 0x97, 0x5a, 0x7c, 0xc9,
-	0xa5, 0x96, 0x62, 0x38, 0xcd, 0x09, 0xea, 0xc3, 0x55, 0x72, 0x7c, 0xba, 0xbe, 0x15, 0xe0, 0x78,
-	0x0a, 0x94, 0x68, 0x0a, 0xd4, 0x4e, 0x9e, 0x2f, 0xa3, 0x16, 0x1f, 0x3f, 0x3f, 0x0d, 0xd0, 0xe0,
-	0xd4, 0x78, 0x98, 0x54, 0x33, 0xc9, 0x4b, 0x10, 0xcb, 0xd3, 0xa4, 0xea, 0x4d, 0xd3, 0xf7, 0x4c,
-	0x52, 0xc5, 0x52, 0x9b, 0x20, 0x3d, 0x82, 0xe2, 0x0c, 0xcb, 0x54, 0x5e, 0x9e, 0x65, 0x66, 0x80,
-	0x90, 0xc2, 0xfa, 0x23, 0x91, 0xb6, 0x86, 0xef, 0xcd, 0x99, 0xa0, 0xa7, 0x3b, 0xa5, 0xda, 0x12,
-	0xe4, 0xa3, 0x1c, 0x25, 0x2d, 0x7f, 0xa3, 0xd7, 0x12, 0x17, 0xe8, 0xdd, 0x48, 0xe9, 0xb5, 0x44,
-	0xa1, 0x76, 0x0b, 0x52, 0xf4, 0xfa, 0x50, 0x80, 0xec, 0x46, 0x57, 0x7b, 0xd4, 0xd0, 0xe4, 0xb0,
-	0x59, 0x54, 0x3b, 0xbb, 0x8a, 0xd6, 0x57, 0x64, 0x51, 0xa8, 0x7d, 0x97, 0x02, 0x34, 0x9d, 0x62,
-	0x6b, 0x1c, 0x18, 0x14, 0xac, 0x01, 0x99, 0x30, 0x7a, 0x94, 0x84, 0x0a, 0xeb, 0x3f, 0xba, 0xb4,
-	0x85, 0x9b, 0x02, 0xdc, 0x5f, 0xd0, 0x98, 0x21, 0xfa, 0x34, 0x7e, 0x33, 0x28, 0xac, 0xbf, 0x3d,
-	0x9f, 0x93, 0xf7, 0x17, 0xf8, 0x95, 0xe1, 0x01, 0xa4, 0xfd, 0x80, 0xf4, 0xcf, 0x49, 0x1a, 0xa4,
-	0xb5, 0x0b, 0xec, 0xcf, 0x2e, 0xbe, 0xde, 0x23, 0x66, 0xfc, 0xb4, 0xa1, 0x18, 0xe8, 0x11, 0xe4,
-	0x23, 0x5e, 0x60, 0xd7, 0x8c, 0xbb, 0xf3, 0x03, 0x46, 0x41, 0xe6, 0x2d, 0x46, 0x84, 0x85, 0x1a,
-	0x50, 0x18, 0x32, 0xb5, 0x69, 0x83, 0xb4, 0xc2, 0xa8, 0x19, 0x38, 0x02, 0xa5, 0xe8, 0xd8, 0x97,
-	0x06, 0xdc, 0x48, 0x35, 0x49, 0xbf, 0xeb, 0xb9, 0xb6, 0xbd, 0x67, 0x0c, 0x9e, 0xd0, 0xbb, 0x42,
-	0xd4, 0xef, 0x72, 0x69, 0xed, 0x17, 0x90, 0xa6, 0x3e, 0x91, 0x8d, 0xdc, 0xe9, 0x3c, 0xe8, 0x74,
-	0x1f, 0x91, 0xae, 0xbf, 0x02, 0x05, 0x59, 0x69, 0x2b, 0x7d, 0x45, 0xef, 0x76, 0xda, 0x8f, 0x45,
-	0x01, 0xdd, 0x80, 0x6b, 0x4c, 0xd0, 0xe8, 0xc8, 0xfa, 0x23, 0x4d, 0xe5, 0x43, 0x89, 0xda, 0x6a,
-	0x3c, 0x53, 0xa6, 0xb7, 0x49, 0x92, 0x33, 0xb2, 0x2c, 0x0a, 0x34, 0x67, 0xb4, 0xee, 0xb6, 0x98,
-	0x68, 0x16, 0x01, 0xcc, 0x28, 0x02, 0x9b, 0xa9, 0x5c, 0x46, 0xcc, 0xd6, 0xfe, 0x2c, 0x41, 0x85,
-	0xf6, 0x48, 0x73, 0x1d, 0x52, 0x2b, 0xf4, 0x90, 0x0a, 0x1b, 0x1e, 0x71, 0xe6, 0x90, 0x4a, 0xb0,
-	0xf3, 0xe9, 0x2e, 0xe4, 0x47, 0x86, 0x87, 0x9d, 0x80, 0x84, 0x2c, 0x35, 0xd3, 0xe7, 0xe6, 0xb6,
-	0xe9, 0x40, 0xa4, 0x9e, 0x0b, 0x15, 0x55, 0x62, 0x94, 0x3d, 0xc2, 0x1e, 0x7d, 0x42, 0x09, 0xa3,
-	0x7c, 0x83, 0xdd, 0x35, 0x17, 0xa7, 0xab, 0xda, 0x0d, 0x15, 0x34, 0xae, 0x89, 0xde, 0x04, 0x18,
-	0x8f, 0x74, 0x6e, 0x17, 0xbf, 0x0a, 0xe4, 0xc7, 0x23, 0xa6, 0x8d, 0xb6, 0x61, 0x71, 0xe8, 0x9a,
-	0xd6, 0xbe, 0x35, 0x08, 0xf7, 0x31, 0xb0, 0x86, 0xe1, 0xad, 0xad, 0xb0, 0xfe, 0x46, 0x2c, 0x49,
-	0xc6, 0x81, 0x65, 0xd7, 0x0f, 0xed, 0x41, 0xbd, 0xcf, 0xdf, 0xa5, 0x18, 0x94, 0x18, 0xb7, 0x26,
-	0x83, 0xe8, 0x1e, 0x64, 0x79, 0x7b, 0x96, 0xa3, 0x54, 0x39, 0x6f, 0xfd, 0x30, 0x44, 0x6e, 0x8d,
-	0x36, 0xa0, 0xec, 0xe0, 0xe3, 0x78, 0x0b, 0x9e, 0x9f, 0xc9, 0xb0, 0x62, 0x07, 0x1f, 0x9f, 0xdf,
-	0x7f, 0x17, 0x9d, 0xe9, 0x88, 0x89, 0x1e, 0x42, 0x69, 0xe4, 0x59, 0x43, 0xc3, 0x9b, 0xe8, 0x61,
-	0x51, 0xc2, 0x8b, 0x14, 0x65, 0xc4, 0x61, 0x21, 0x04, 0x1d, 0x45, 0x1b, 0x10, 0x76, 0xbc, 0xd8,
-	0x97, 0x0a, 0xd4, 0xc7, 0x17, 0x03, 0xe3, 0xc6, 0xa8, 0x09, 0x25, 0xea, 0x62, 0xd4, 0x6a, 0x17,
-	0xa9, 0x87, 0x4b, 0xcc, 0xc3, 0x02, 0xf1, 0xf0, 0x9c, 0x76, 0xbb, 0xe0, 0x44, 0x72, 0x13, 0x6d,
-	0x02, 0x44, 0xef, 0x81, 0xe4, 0xf8, 0xb8, 0xec, 0x74, 0xde, 0xe6, 0x8a, 0xd3, 0x25, 0x69, 0x31,
-	0x6b, 0xb4, 0x05, 0x79, 0x5e, 0x9c, 0xe1, 0xb9, 0x51, 0xb8, 0xf0, 0x45, 0xe2, 0x2c, 0x55, 0xf0,
-	0xe4, 0x8a, 0x10, 0x50, 0x07, 0xd2, 0x36, 0x36, 0x7c, 0xcc, 0x0e, 0x8f, 0x8f, 0x2f, 0x80, 0x3a,
-	0x55, 0x5e, 0xf5, 0xde, 0xe0, 0x10, 0x0f, 0x8d, 0xd6, 0x21, 0x69, 0x44, 0xdb, 0xc4, 0x5e, 0x0b,
-	0x61, 0x50, 0x07, 0x44, 0x1a, 0xae, 0x38, 0xeb, 0x88, 0x34, 0x62, 0x6f, 0xb1, 0x88, 0x95, 0x49,
-	0xc4, 0x2e, 0x64, 0x1e, 0x9a, 0x4f, 0x5b, 0x53, 0xf6, 0xf9, 0x39, 0x94, 0xf7, 0x5d, 0x6f, 0x68,
-	0x04, 0x51, 0x95, 0x2c, 0x4e, 0xdb, 0xcb, 0xef, 0x9f, 0x2f, 0x97, 0x36, 0xe8, 0x28, 0xaf, 0xac,
-	0xd2, 0x7e, 0xfc, 0x13, 0xdd, 0xe7, 0x24, 0x7d, 0x85, 0x72, 0xea, 0xfb, 0xf3, 0x7a, 0x77, 0x96,
-	0xa1, 0x3b, 0x90, 0x19, 0x1c, 0xe2, 0xc1, 0x13, 0x5f, 0xba, 0x4a, 0x63, 0xfe, 0x93, 0x39, 0xa1,
-	0x5a, 0xc4, 0x68, 0xfa, 0x34, 0xa4, 0x31, 0x14, 0xf4, 0x05, 0x94, 0x4d, 0x22, 0xb1, 0x9c, 0x03,
-	0xd6, 0xbe, 0x5e, 0xa3, 0xb8, 0x6b, 0x73, 0xe2, 0x92, 0xd6, 0x56, 0x75, 0xf6, 0x5d, 0xde, 0xb9,
-	0x70, 0xb0, 0xb0, 0xe5, 0xed, 0x42, 0x6e, 0x9f, 0x5c, 0xc5, 0x2d, 0xec, 0x4b, 0xd7, 0x29, 0xee,
-	0xe5, 0xcf, 0xac, 0xa7, 0x6f, 0xff, 0x9c, 0xe2, 0x39, 0x48, 0x54, 0xe8, 0x54, 0x30, 0x21, 0x9b,
-	0xfa, 0xda, 0xd9, 0x42, 0xe7, 0xb7, 0xff, 0x99, 0x97, 0x00, 0x5a, 0xe8, 0xec, 0xcb, 0x24, 0x84,
-	0x77, 0x64, 0xe1, 0xaf, 0xf4, 0xa7, 0x63, 0xec, 0x4d, 0x24, 0x29, 0x46, 0xce, 0x79, 0x22, 0x7f,
-	0x48, 0xc4, 0xe8, 0x43, 0xc8, 0x9b, 0x78, 0x84, 0x1d, 0xd3, 0xef, 0x3a, 0xd2, 0x0d, 0xda, 0x1a,
-	0x5d, 0x21, 0xfd, 0xba, 0xcc, 0x85, 0x8c, 0x7c, 0xa7, 0x5a, 0xe8, 0x4b, 0x28, 0x86, 0x1f, 0xd8,
-	0xec, 0x3a, 0xcd, 0x89, 0x54, 0xa5, 0x4e, 0xdf, 0x99, 0x33, 0x98, 0xd3, 0x3e, 0xf0, 0x2a, 0xf7,
-	0x47, 0x8e, 0xa1, 0x69, 0x33, 0xd8, 0xe8, 0x0b, 0x28, 0xf2, 0xec, 0xde, 0x74, 0xf7, 0x7c, 0xe9,
-	0xf5, 0x4b, 0x6f, 0xb0, 0xa7, 0xe7, 0xda, 0x9a, 0x9a, 0x72, 0xde, 0x8a, 0xa3, 0xa1, 0xcf, 0xa0,
-	0x14, 0x3d, 0xfb, 0xb8, 0xa3, 0xc0, 0x97, 0x6e, 0xd2, 0xc2, 0xbc, 0x3b, 0x6f, 0xea, 0x32, 0xdb,
-	0xee, 0x28, 0xf0, 0xb5, 0xa2, 0x1f, 0xfb, 0x42, 0xb7, 0x20, 0x6f, 0x7a, 0xee, 0x28, 0x3c, 0x3f,
-	0xde, 0x58, 0x11, 0x56, 0x93, 0x7c, 0x9b, 0x89, 0x98, 0x1e, 0x0c, 0x3a, 0x94, 0x3d, 0x3c, 0xb2,
-	0x8d, 0x01, 0x1e, 0x92, 0xe3, 0xcf, 0xdd, 0x97, 0x96, 0xe8, 0xec, 0xeb, 0x73, 0x07, 0x32, 0x32,
-	0xe6, 0x89, 0x19, 0xc3, 0xeb, 0xee, 0xa3, 0x1d, 0x00, 0x63, 0x6c, 0x5a, 0x81, 0x3e, 0x74, 0x4d,
-	0x2c, 0x2d, 0xd3, 0xaa, 0x9c, 0x77, 0x97, 0x1a, 0xc4, 0x70, 0xcb, 0x35, 0x71, 0xf4, 0x92, 0xc2,
-	0x05, 0xd5, 0xef, 0x04, 0x58, 0x3c, 0x43, 0x49, 0xe8, 0x57, 0x90, 0x75, 0x5c, 0x33, 0xf6, 0xa2,
-	0xa2, 0xb0, 0xdd, 0xcd, 0x74, 0x5c, 0x33, 0x7c, 0x50, 0xb9, 0x7b, 0x60, 0x05, 0x87, 0xe3, 0xbd,
-	0xfa, 0xc0, 0x1d, 0xae, 0x45, 0xab, 0x30, 0xf7, 0xa6, 0xbf, 0xd7, 0x46, 0x4f, 0x0e, 0xd6, 0xe8,
-	0xaf, 0xd1, 0x5e, 0x3d, 0x34, 0xd3, 0x32, 0x04, 0x55, 0x35, 0xd1, 0x07, 0x50, 0xc1, 0xc7, 0x23,
-	0xcb, 0x8b, 0x1d, 0xcb, 0x89, 0x58, 0x58, 0xcb, 0xd3, 0x41, 0x12, 0xdc, 0xea, 0x5f, 0x05, 0xa8,
-	0x9c, 0xa2, 0x03, 0xd2, 0xa6, 0xd0, 0xd7, 0xba, 0x99, 0x36, 0x85, 0x48, 0xa2, 0x06, 0x26, 0x71,
-	0xe9, 0x93, 0x74, 0xf2, 0x55, 0x9f, 0xa4, 0x67, 0x2f, 0xc7, 0xe9, 0xf9, 0x2f, 0xc7, 0x9b, 0xa9,
-	0x5c, 0x4a, 0x4c, 0x57, 0x1f, 0x43, 0x8e, 0x53, 0xd1, 0x6c, 0xdf, 0x24, 0xcc, 0xd9, 0x37, 0x5d,
-	0xe8, 0x67, 0xf5, 0x1b, 0x01, 0xf2, 0xf1, 0xb7, 0xfe, 0x44, 0x84, 0x7a, 0x7e, 0xdb, 0xf6, 0x92,
-	0xef, 0x61, 0xb3, 0x11, 0x48, 0xce, 0x1f, 0x81, 0xea, 0x11, 0x14, 0x62, 0xd5, 0x7c, 0xba, 0xd7,
-	0x16, 0x5e, 0xa2, 0xd7, 0x7e, 0x0b, 0x32, 0x5f, 0xba, 0x7b, 0xdc, 0x81, 0x64, 0xb3, 0xc4, 0xac,
-	0xd3, 0x9b, 0xee, 0x9e, 0x2a, 0x6b, 0xe9, 0x2f, 0xdd, 0x3d, 0xd5, 0xac, 0xfe, 0x46, 0x80, 0x62,
-	0xbc, 0xce, 0x51, 0x0d, 0xf2, 0x96, 0x33, 0xf0, 0x68, 0x91, 0xd1, 0x79, 0x79, 0x0a, 0x4e, 0xc5,
-	0xa4, 0xfa, 0x87, 0x96, 0xa3, 0xd3, 0x37, 0xaa, 0x99, 0x34, 0xcd, 0x0d, 0x2d, 0x67, 0x97, 0x48,
-	0xa9, 0x8a, 0x71, 0xcc, 0x54, 0x92, 0x33, 0x2a, 0xc6, 0x71, 0xa8, 0x52, 0xa5, 0x07, 0xaa, 0x17,
-	0xd0, 0xb6, 0x38, 0x19, 0x3b, 0x22, 0xbd, 0xa0, 0x7a, 0x08, 0x85, 0x58, 0xfd, 0xcf, 0xb1, 0x61,
-	0x3f, 0x85, 0x54, 0x54, 0x34, 0x73, 0xf6, 0xb2, 0xd4, 0xa0, 0xf6, 0x36, 0xbf, 0x70, 0x00, 0x64,
-	0xb6, 0x77, 0x9a, 0x6d, 0xb5, 0x75, 0xee, 0x65, 0x81, 0x5c, 0x2b, 0x22, 0xd2, 0x20, 0x17, 0x4b,
-	0x59, 0xed, 0x35, 0x9a, 0x6d, 0x85, 0x5c, 0x33, 0x4b, 0x90, 0xd7, 0x94, 0x86, 0x4c, 0x6f, 0x21,
-	0xa2, 0xf0, 0x49, 0xea, 0xeb, 0x6f, 0x97, 0x85, 0xcd, 0x54, 0x0e, 0x89, 0x57, 0x6a, 0xdf, 0x09,
-	0x80, 0x64, 0x23, 0x30, 0x48, 0x09, 0xbd, 0xc0, 0x8d, 0x22, 0x71, 0x89, 0xa7, 0xb3, 0x0d, 0x60,
-	0xf2, 0x55, 0x1a, 0xc0, 0x70, 0xa9, 0xb5, 0x6f, 0x04, 0x80, 0xd8, 0xe2, 0x3e, 0x8d, 0xff, 0x13,
-	0x76, 0x71, 0xaf, 0x7b, 0x8a, 0x52, 0xc9, 0x6d, 0x36, 0xfc, 0x9f, 0xec, 0x1e, 0xe4, 0x4c, 0xe6,
-	0x32, 0xdb, 0x8e, 0x0b, 0x9b, 0xca, 0x33, 0x91, 0xb9, 0x4f, 0x4e, 0x10, 0x26, 0x6d, 0x66, 0x21,
-	0x3d, 0x76, 0x2c, 0xd7, 0x79, 0xf7, 0x23, 0x40, 0x67, 0xe9, 0x87, 0x84, 0x9d, 0xfe, 0x36, 0x02,
-	0x6c, 0x86, 0x77, 0xc4, 0x1d, 0xe7, 0x28, 0x12, 0x08, 0xcd, 0x5b, 0xcf, 0xfe, 0xb9, 0xb4, 0xf0,
-	0xec, 0x64, 0x49, 0xf8, 0xcb, 0xc9, 0x92, 0xf0, 0xb7, 0x93, 0x25, 0xe1, 0x1f, 0x27, 0x4b, 0xc2,
-	0xaf, 0xff, 0xb5, 0xb4, 0xf0, 0x79, 0x96, 0x2d, 0xe0, 0xff, 0x01, 0x00, 0x00, 0xff, 0xff, 0x24,
-	0xd0, 0xcb, 0x1e, 0xb6, 0x1f, 0x00, 0x00,
+var fileDescriptor_structured_5011444cd75c25b7 = []byte{
+	// 3361 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xb4, 0x5a, 0xcd, 0x6f, 0x23, 0xc7,
+	0x95, 0x57, 0xf3, 0x9b, 0x8f, 0x5f, 0xad, 0xd2, 0xcc, 0x98, 0x23, 0x8f, 0x45, 0x0e, 0xc7, 0x63,
+	0xcb, 0x5f, 0xd2, 0x58, 0xb3, 0x1f, 0xb3, 0xde, 0x85, 0x77, 0x29, 0x92, 0x1a, 0x51, 0xd2, 0x90,
+	0x72, 0x4b, 0x1a, 0x79, 0x17, 0xde, 0xed, 0x6d, 0x75, 0x17, 0xa9, 0xf6, 0x34, 0xbb, 0x39, 0xdd,
+	0x4d, 0xad, 0x04, 0xec, 0x69, 0xb1, 0xc0, 0xee, 0x21, 0x08, 0x02, 0xe4, 0x98, 0x04, 0xf0, 0xc1,
+	0x08, 0xfc, 0x1f, 0x04, 0xc8, 0x21, 0x40, 0x6e, 0x3e, 0xfa, 0xe8, 0xe4, 0x20, 0x24, 0xf2, 0x25,
+	0x7f, 0x40, 0x82, 0x00, 0x3e, 0x05, 0xf5, 0xd5, 0xdd, 0x94, 0x28, 0x99, 0x9a, 0x71, 0x6e, 0xea,
+	0x57, 0xf5, 0x7e, 0x55, 0xf5, 0xea, 0xbd, 0xdf, 0x7b, 0xaf, 0x28, 0xb8, 0xe3, 0x3d, 0xb7, 0x96,
+	0xbd, 0xe7, 0xd6, 0x81, 0xe6, 0xe1, 0x65, 0xcf, 0x77, 0x47, 0xba, 0x3f, 0x72, 0xb1, 0xb1, 0x34,
+	0x74, 0x1d, 0xdf, 0x41, 0x37, 0x75, 0x47, 0x7f, 0xe6, 0x3a, 0x9a, 0x7e, 0xb8, 0xe4, 0x3d, 0xb7,
+	0x96, 0xf8, 0xbc, 0xf9, 0xf2, 0xc8, 0x37, 0xad, 0xe5, 0x43, 0x4b, 0x5f, 0xf6, 0xcd, 0x01, 0xf6,
+	0x7c, 0x6d, 0x30, 0x64, 0x0a, 0xf3, 0xaf, 0x46, 0xe1, 0x86, 0xae, 0x79, 0x64, 0x5a, 0xb8, 0x8f,
+	0xf9, 0xe0, 0x8d, 0xbe, 0xd3, 0x77, 0xe8, 0x9f, 0xcb, 0xe4, 0x2f, 0x26, 0xad, 0xfd, 0x4f, 0x12,
+	0xe6, 0xd6, 0x1c, 0x17, 0x9b, 0x7d, 0x7b, 0x13, 0x9f, 0x28, 0xb8, 0x87, 0x5d, 0x6c, 0xeb, 0x18,
+	0x55, 0x21, 0xe9, 0x6b, 0x07, 0x16, 0x2e, 0x4b, 0x55, 0x69, 0xb1, 0xb0, 0x0a, 0x5f, 0x9e, 0x56,
+	0x66, 0xbe, 0x3d, 0xad, 0xc4, 0xda, 0x4d, 0x85, 0x0d, 0xa0, 0xfb, 0x90, 0x34, 0x6d, 0x03, 0x1f,
+	0x97, 0x63, 0x74, 0x46, 0x89, 0xcf, 0x48, 0xb7, 0x89, 0x90, 0x4c, 0xa3, 0xa3, 0xa8, 0x0c, 0x09,
+	0x5b, 0x1b, 0xe0, 0x72, 0xbc, 0x2a, 0x2d, 0x66, 0x57, 0x13, 0x64, 0x96, 0x42, 0x25, 0x68, 0x13,
+	0x32, 0x47, 0x9a, 0x65, 0x1a, 0xa6, 0x7f, 0x52, 0x4e, 0x54, 0xa5, 0xc5, 0xe2, 0xca, 0x5b, 0x4b,
+	0x13, 0x4f, 0xbc, 0xd4, 0x70, 0x6c, 0xcf, 0x77, 0x35, 0xd3, 0xf6, 0x9f, 0x72, 0x05, 0x0e, 0x14,
+	0x00, 0xa0, 0x07, 0x30, 0xeb, 0x1d, 0x6a, 0x2e, 0x36, 0xd4, 0xa1, 0x8b, 0x7b, 0xe6, 0xb1, 0x6a,
+	0x61, 0xbb, 0x9c, 0xac, 0x4a, 0x8b, 0x49, 0x3e, 0xb5, 0xc4, 0x86, 0xb7, 0xe9, 0xe8, 0x16, 0xb6,
+	0xd1, 0x2e, 0x64, 0x1d, 0x5b, 0x35, 0xb0, 0x85, 0x7d, 0x5c, 0x4e, 0xd1, 0xf5, 0xdf, 0xbf, 0x64,
+	0xfd, 0x09, 0x06, 0x5a, 0xaa, 0xeb, 0xbe, 0xe9, 0xd8, 0x62, 0x1f, 0x8e, 0xdd, 0xa4, 0x40, 0x1c,
+	0x75, 0x34, 0x34, 0x34, 0x1f, 0x97, 0xd3, 0x2f, 0x8d, 0xba, 0x47, 0x81, 0xd0, 0x16, 0x24, 0x07,
+	0x9a, 0xaf, 0x1f, 0x96, 0x33, 0x14, 0xf1, 0xc1, 0x35, 0x10, 0x9f, 0x10, 0x3d, 0x0e, 0xc8, 0x40,
+	0x6a, 0xfb, 0x90, 0x62, 0xeb, 0xa0, 0x02, 0x64, 0x3b, 0x5d, 0xb5, 0xde, 0xd8, 0x6d, 0x77, 0x3b,
+	0xf2, 0x0c, 0xca, 0x43, 0x46, 0x69, 0xed, 0xec, 0x2a, 0xed, 0xc6, 0xae, 0x2c, 0x91, 0xaf, 0x9d,
+	0xd6, 0xae, 0xda, 0xd9, 0xdb, 0xda, 0x92, 0x63, 0xa8, 0x04, 0x39, 0xf2, 0xd5, 0x6c, 0xad, 0xd5,
+	0xf7, 0xb6, 0x76, 0xe5, 0x38, 0xca, 0x41, 0xba, 0x51, 0xdf, 0x69, 0xd4, 0x9b, 0x2d, 0x39, 0x31,
+	0x9f, 0xf8, 0xe2, 0xf3, 0x85, 0x99, 0xda, 0x03, 0x48, 0xd2, 0xe5, 0x10, 0x40, 0x6a, 0xa7, 0xfd,
+	0x64, 0x7b, 0xab, 0x25, 0xcf, 0xa0, 0x0c, 0x24, 0xd6, 0x08, 0x84, 0x44, 0x34, 0xb6, 0xeb, 0xca,
+	0x6e, 0xbb, 0xbe, 0x25, 0xc7, 0x98, 0xc6, 0x07, 0x89, 0x3f, 0x7c, 0x56, 0x91, 0x6a, 0xbf, 0xc9,
+	0xc0, 0x8d, 0x70, 0xef, 0xe1, 0x6d, 0xa3, 0x06, 0x94, 0x1c, 0xd7, 0xec, 0x9b, 0xb6, 0x4a, 0x7d,
+	0x4e, 0x35, 0x0d, 0xee, 0x8f, 0xaf, 0x92, 0xf3, 0x9c, 0x9d, 0x56, 0x0a, 0x5d, 0x3a, 0xbc, 0x4b,
+	0x46, 0xdb, 0x4d, 0xee, 0xa0, 0x05, 0x27, 0x22, 0x34, 0xd0, 0x26, 0xcc, 0x72, 0x10, 0xdd, 0xb1,
+	0x46, 0x03, 0x5b, 0x35, 0x0d, 0xaf, 0x1c, 0xab, 0xc6, 0x17, 0x0b, 0xab, 0x95, 0xb3, 0xd3, 0x4a,
+	0x89, 0x41, 0x34, 0xe8, 0x58, 0xbb, 0xe9, 0x7d, 0x7b, 0x5a, 0xc9, 0x88, 0x0f, 0x85, 0x2f, 0xcf,
+	0xbf, 0x0d, 0x0f, 0xed, 0xc3, 0x4d, 0x57, 0xd8, 0xd6, 0x88, 0x02, 0xc6, 0x29, 0xe0, 0xbd, 0xb3,
+	0xd3, 0xca, 0x5c, 0x60, 0x7c, 0x63, 0x32, 0xe8, 0x9c, 0x7b, 0x7e, 0x82, 0xe1, 0xa1, 0x2e, 0x44,
+	0xc4, 0xe1, 0x71, 0x13, 0xf4, 0xb8, 0x15, 0x7e, 0xdc, 0xd9, 0x10, 0x7a, 0xfc, 0xc8, 0xb3, 0xee,
+	0xb9, 0x01, 0x23, 0x08, 0xbc, 0xe4, 0x95, 0x81, 0x97, 0x7a, 0xd9, 0xc0, 0x1b, 0x0b, 0xa3, 0xf4,
+	0x5f, 0x25, 0x8c, 0x32, 0xdf, 0x7b, 0x18, 0x65, 0xbf, 0x87, 0x30, 0x42, 0xff, 0x0c, 0x73, 0x16,
+	0xee, 0x6b, 0xfa, 0x89, 0xca, 0xdd, 0x8b, 0xd1, 0x21, 0x4c, 0xa6, 0xc3, 0x59, 0x36, 0x97, 0x39,
+	0x1b, 0x15, 0xa2, 0xc7, 0xf0, 0x0a, 0x07, 0x88, 0xdc, 0x3c, 0x03, 0xc9, 0x4d, 0x06, 0xb9, 0xc9,
+	0xe6, 0x87, 0x5e, 0xc0, 0x80, 0xfe, 0x57, 0x82, 0xfb, 0x1c, 0x69, 0x34, 0xec, 0xbb, 0x9a, 0x81,
+	0x0d, 0xb5, 0xe7, 0x3a, 0x03, 0xb1, 0xb1, 0x00, 0xbe, 0x9c, 0xaf, 0x4a, 0x8b, 0xb9, 0x95, 0xb7,
+	0xa7, 0x3f, 0xf8, 0x6a, 0x8a, 0xec, 0xa1, 0x2c, 0x29, 0x77, 0xd9, 0x02, 0x7b, 0x1c, 0x7f, 0xcd,
+	0x75, 0x06, 0xec, 0x2c, 0x61, 0xce, 0xf8, 0x81, 0x04, 0x6f, 0x4d, 0xdc, 0x46, 0xe4, 0x78, 0xe1,
+	0x56, 0x0a, 0x2f, 0xbc, 0x95, 0xfb, 0x17, 0xb7, 0x12, 0x5a, 0x24, 0xf8, 0x8b, 0x73, 0xcb, 0x1f,
+	0x63, 0x20, 0xb3, 0x28, 0x6b, 0x62, 0x4f, 0x77, 0xcd, 0xa1, 0xef, 0xb8, 0x41, 0x6c, 0x48, 0x17,
+	0x62, 0xe3, 0x0d, 0x88, 0x99, 0x06, 0x4f, 0x69, 0xb7, 0x78, 0xd4, 0xc5, 0x68, 0x98, 0x85, 0xf1,
+	0x1b, 0x33, 0x0d, 0xb4, 0x05, 0x09, 0xff, 0x64, 0xc8, 0xd2, 0x5a, 0x7e, 0xf5, 0x11, 0x99, 0xf9,
+	0xdb, 0xd3, 0xca, 0x83, 0xbe, 0xe9, 0x1f, 0x8e, 0x0e, 0x96, 0x74, 0x67, 0xb0, 0x1c, 0x9c, 0xcb,
+	0x38, 0x08, 0xff, 0x5e, 0x1e, 0x3e, 0xeb, 0x93, 0x0c, 0xbd, 0x4c, 0x94, 0xbd, 0xa5, 0x5d, 0x85,
+	0xa2, 0xa0, 0x2a, 0x64, 0xec, 0x91, 0x65, 0xd1, 0x84, 0x4b, 0x22, 0x3e, 0x23, 0x5c, 0x57, 0x48,
+	0xd1, 0x5d, 0xc8, 0x1b, 0xb8, 0xa7, 0x8d, 0x2c, 0x5f, 0xc5, 0xc7, 0x43, 0x97, 0x45, 0xb5, 0x92,
+	0xe3, 0xb2, 0xd6, 0xf1, 0xd0, 0x45, 0x77, 0x20, 0x75, 0x68, 0x1a, 0x06, 0xb6, 0x69, 0x50, 0x0b,
+	0x08, 0x2e, 0x43, 0x2b, 0x30, 0x3b, 0xf2, 0xb0, 0xa7, 0x7a, 0xf8, 0xf9, 0x88, 0x98, 0x87, 0x92,
+	0x16, 0x50, 0xd2, 0x4a, 0x71, 0x12, 0x29, 0x91, 0x09, 0x3b, 0x7c, 0x9c, 0x70, 0xd2, 0x5d, 0xc8,
+	0xeb, 0xce, 0x60, 0x38, 0xf2, 0x31, 0x5b, 0x34, 0xc7, 0x16, 0xe5, 0x32, 0xb2, 0x28, 0x33, 0xf2,
+	0x46, 0x22, 0x93, 0x91, 0xb3, 0x1b, 0x89, 0x4c, 0x56, 0x86, 0x8d, 0x44, 0x26, 0x2d, 0x67, 0x6a,
+	0x3f, 0x8c, 0xc1, 0x2d, 0x66, 0xb0, 0x35, 0x6d, 0x60, 0x5a, 0x27, 0x2f, 0x6b, 0x7c, 0x86, 0xc2,
+	0x8d, 0x4f, 0xf7, 0x45, 0x99, 0x97, 0xa8, 0x31, 0xee, 0xa5, 0xfb, 0x22, 0xb2, 0x0e, 0x11, 0xa1,
+	0x47, 0x00, 0x11, 0x72, 0x4e, 0xd0, 0x73, 0xde, 0x3e, 0x3b, 0xad, 0x64, 0x27, 0x53, 0x72, 0x56,
+	0x8f, 0x10, 0xf1, 0xac, 0xb0, 0x74, 0x80, 0x40, 0xcd, 0x5d, 0x58, 0xbd, 0xc7, 0xf7, 0x54, 0x6a,
+	0xb2, 0x09, 0x42, 0x7d, 0x3c, 0x65, 0x18, 0x63, 0x83, 0x06, 0xf7, 0xc3, 0x5f, 0xc4, 0xe0, 0x46,
+	0xdb, 0xf6, 0xb1, 0x6b, 0x61, 0xed, 0x08, 0x47, 0xcc, 0xf1, 0x31, 0x64, 0x35, 0x5b, 0xc7, 0x9e,
+	0xef, 0xb8, 0x5e, 0x59, 0xaa, 0xc6, 0x17, 0x73, 0x2b, 0x7f, 0x73, 0x49, 0x50, 0x4c, 0xd2, 0x5f,
+	0xaa, 0x73, 0x65, 0x6e, 0xc9, 0x10, 0x6c, 0xfe, 0x57, 0x12, 0x64, 0xc4, 0x28, 0x7a, 0x00, 0x99,
+	0x73, 0x39, 0xf4, 0x26, 0x3f, 0x4d, 0x7a, 0x3c, 0x95, 0xa4, 0x7d, 0x9e, 0x40, 0xfe, 0x16, 0x32,
+	0x94, 0x8c, 0xd4, 0xe0, 0x4e, 0xe6, 0x85, 0x06, 0xe7, 0xa3, 0x28, 0x35, 0xa5, 0xe9, 0xdc, 0xb6,
+	0x81, 0x1a, 0x93, 0x2a, 0xb1, 0x38, 0xd5, 0x7f, 0x45, 0xd8, 0x6f, 0x67, 0xbc, 0x16, 0xbb, 0x50,
+	0x9c, 0x31, 0x9b, 0x71, 0xcb, 0xfd, 0x39, 0x0e, 0xb7, 0xb6, 0x35, 0xd7, 0x37, 0x09, 0xa7, 0x9b,
+	0x76, 0x3f, 0x62, 0xbb, 0xfb, 0x90, 0xb3, 0x47, 0x03, 0x7e, 0x4f, 0x1e, 0x3f, 0x17, 0xb3, 0x03,
+	0xd8, 0xa3, 0x01, 0xbb, 0x02, 0x8f, 0x04, 0xab, 0x65, 0x7a, 0x3e, 0x4d, 0xfa, 0xb9, 0x95, 0x95,
+	0x4b, 0xac, 0x3b, 0x79, 0x8d, 0xa5, 0x2d, 0xd3, 0xf3, 0x85, 0x97, 0x12, 0x14, 0xd4, 0x85, 0xa4,
+	0xab, 0xd9, 0x7d, 0x4c, 0xdd, 0x2e, 0xb7, 0xf2, 0xf0, 0x7a, 0x70, 0x0a, 0x51, 0x15, 0x89, 0x84,
+	0xe2, 0xcc, 0xff, 0x4c, 0x82, 0x04, 0x59, 0xe5, 0x8a, 0xc8, 0xb8, 0x05, 0xa9, 0x23, 0xcd, 0x1a,
+	0x61, 0x56, 0xb8, 0xe4, 0x15, 0xfe, 0x85, 0xfe, 0x1d, 0x4a, 0xde, 0xe8, 0x60, 0x18, 0x59, 0x8a,
+	0x9a, 0x3a, 0xb7, 0xf2, 0xde, 0xb5, 0x76, 0x15, 0xd4, 0xc8, 0xe3, 0x58, 0xec, 0x02, 0xe6, 0x9f,
+	0x43, 0x92, 0xee, 0xfa, 0x8a, 0xfd, 0xdd, 0x85, 0xbc, 0xef, 0xa8, 0xf8, 0x58, 0xb7, 0x46, 0x9e,
+	0x79, 0x84, 0xa9, 0xbf, 0xe4, 0x95, 0x9c, 0xef, 0xb4, 0x84, 0x08, 0xdd, 0x87, 0x22, 0x4d, 0x06,
+	0xa6, 0x2d, 0x26, 0x51, 0xee, 0x54, 0x0a, 0x44, 0xda, 0x16, 0xc2, 0xb1, 0x9b, 0xff, 0xbf, 0x2c,
+	0x94, 0xa8, 0x7f, 0x4d, 0xc5, 0x1e, 0xf7, 0x23, 0xec, 0x71, 0x73, 0x8c, 0x3d, 0x02, 0x27, 0x25,
+	0xe4, 0x71, 0x07, 0x52, 0x23, 0xdb, 0x7c, 0x3e, 0x62, 0xeb, 0x07, 0x34, 0xc9, 0x64, 0x17, 0xa8,
+	0x25, 0x71, 0x91, 0x5a, 0xde, 0x05, 0x44, 0x22, 0x0a, 0xab, 0x63, 0x13, 0x93, 0x74, 0xa2, 0x4c,
+	0x47, 0x1a, 0x97, 0x12, 0x51, 0xea, 0x1a, 0x44, 0xb4, 0x0e, 0x32, 0x3e, 0xf6, 0x5d, 0x2d, 0x5a,
+	0x65, 0xa6, 0xa9, 0xfe, 0xc2, 0xd9, 0x69, 0xa5, 0xd8, 0x22, 0x63, 0x93, 0x41, 0x8a, 0x38, 0x32,
+	0x66, 0x10, 0x2f, 0x99, 0xe5, 0x18, 0x86, 0xe9, 0x62, 0x5a, 0x1b, 0x79, 0xe5, 0x4c, 0x35, 0x7e,
+	0x45, 0x0d, 0x74, 0xce, 0xec, 0x4b, 0x4d, 0xa1, 0xa8, 0xc8, 0x0c, 0x2a, 0x10, 0x78, 0x68, 0x07,
+	0x72, 0x3d, 0x96, 0xae, 0xd5, 0x67, 0xf8, 0x84, 0x16, 0x57, 0x2f, 0x96, 0xd8, 0xa1, 0x17, 0x0c,
+	0xa2, 0x7d, 0x28, 0x44, 0xca, 0x86, 0x83, 0x13, 0x9a, 0xab, 0x5e, 0x0c, 0x36, 0x1f, 0x02, 0xad,
+	0x9e, 0xa0, 0x8f, 0x00, 0xcc, 0x80, 0x47, 0x69, 0x4a, 0xcb, 0xad, 0xbc, 0x73, 0x0d, 0xc2, 0x15,
+	0xfc, 0x12, 0x82, 0xa0, 0x7d, 0x28, 0x86, 0x5f, 0x74, 0xb3, 0xf9, 0x6b, 0x6f, 0x96, 0xa1, 0x16,
+	0x22, 0x38, 0xab, 0xa4, 0xb8, 0xbe, 0x41, 0x92, 0xad, 0xe3, 0x99, 0x3e, 0x8e, 0xba, 0x41, 0x81,
+	0xba, 0x41, 0xed, 0xec, 0xb4, 0x82, 0x1a, 0x62, 0x7c, 0xb2, 0x2b, 0x20, 0xfd, 0xdc, 0x38, 0x73,
+	0xac, 0x31, 0x07, 0x26, 0x88, 0xc5, 0xd0, 0xb1, 0x76, 0x42, 0x17, 0xbe, 0xe0, 0x58, 0x11, 0xf7,
+	0x66, 0xdd, 0x50, 0x7e, 0x8c, 0x7b, 0x4a, 0x2f, 0xce, 0x3d, 0x63, 0x40, 0xa8, 0xc5, 0xcb, 0x2b,
+	0x99, 0x16, 0xea, 0xef, 0x4c, 0xe9, 0xa4, 0xbb, 0x27, 0x43, 0x61, 0x48, 0xaa, 0x5e, 0x5b, 0x80,
+	0x6c, 0xe0, 0xa7, 0x28, 0x0d, 0xf1, 0xfa, 0x4e, 0x83, 0x75, 0xa4, 0xcd, 0xd6, 0x4e, 0x43, 0x96,
+	0x6a, 0x77, 0x21, 0x41, 0x74, 0x48, 0x67, 0xba, 0xd6, 0x55, 0xf6, 0xeb, 0x4a, 0x93, 0x75, 0xc1,
+	0xed, 0xce, 0xd3, 0x96, 0xb2, 0xdb, 0x6a, 0xca, 0x82, 0x89, 0x7e, 0x1d, 0x07, 0x14, 0x36, 0x43,
+	0xbb, 0x0e, 0x6f, 0x28, 0xfa, 0x50, 0xd2, 0x03, 0xa9, 0x4a, 0x77, 0x2c, 0x55, 0x63, 0x8b, 0xc5,
+	0x95, 0x47, 0xdf, 0xd9, 0x50, 0x09, 0x8c, 0xa8, 0x28, 0xdc, 0x7e, 0x51, 0x1f, 0x93, 0x06, 0xac,
+	0x17, 0xab, 0xc6, 0xce, 0xb1, 0x9e, 0x02, 0x49, 0xfd, 0x10, 0xeb, 0xcf, 0x38, 0xef, 0xff, 0xdd,
+	0x25, 0x0b, 0xd3, 0x1c, 0x1f, 0x31, 0x55, 0x83, 0xe8, 0x84, 0x4b, 0x8b, 0x84, 0x44, 0xa1, 0x90,
+	0x32, 0x1e, 0xd0, 0x89, 0x2b, 0x63, 0x64, 0x52, 0xe3, 0x2e, 0x62, 0x24, 0x12, 0xcf, 0x8f, 0xa0,
+	0x64, 0x3b, 0xbe, 0x4a, 0x0a, 0x5a, 0xee, 0x77, 0xb4, 0x4c, 0x2d, 0xac, 0xca, 0xbc, 0xc9, 0x09,
+	0xbd, 0xac, 0x60, 0x3b, 0x7e, 0x67, 0x64, 0x59, 0x4c, 0x50, 0xfb, 0x00, 0x8a, 0xe3, 0x36, 0x42,
+	0x59, 0x48, 0x36, 0xd6, 0x5b, 0x8d, 0x4d, 0x79, 0x06, 0x95, 0x20, 0xb7, 0xd6, 0x55, 0x5a, 0xed,
+	0xc7, 0x1d, 0x75, 0xb3, 0xf5, 0xaf, 0xec, 0xd5, 0xa2, 0xd3, 0x15, 0xaf, 0x16, 0x41, 0x79, 0x9a,
+	0x94, 0x53, 0xb5, 0x3f, 0x25, 0x00, 0x85, 0x16, 0x78, 0x32, 0xf2, 0x35, 0xea, 0x16, 0x75, 0x48,
+	0xf1, 0xfd, 0x48, 0xf4, 0x9c, 0x6f, 0x5e, 0x7a, 0x75, 0xe3, 0x4d, 0xc4, 0xfa, 0x8c, 0xc2, 0x15,
+	0xd1, 0x87, 0xd1, 0xa7, 0xb0, 0xdc, 0xca, 0x1b, 0xd3, 0xb9, 0xeb, 0xfa, 0x8c, 0x78, 0x23, 0xdb,
+	0x84, 0xa4, 0xe7, 0x93, 0x4e, 0x37, 0x4e, 0xdd, 0x7d, 0xf9, 0x12, 0xfd, 0x8b, 0x9b, 0x5f, 0xda,
+	0x21, 0x6a, 0xe2, 0xf2, 0x28, 0x06, 0xda, 0x87, 0x6c, 0xc0, 0xf2, 0xfc, 0x5d, 0xed, 0xe1, 0xf4,
+	0x80, 0x41, 0xb8, 0x88, 0x72, 0x32, 0xc0, 0x42, 0x75, 0xc8, 0x0d, 0xf8, 0xb4, 0xb0, 0x24, 0xae,
+	0xf2, 0x44, 0x0b, 0x02, 0x81, 0x26, 0xdc, 0xc8, 0x97, 0x02, 0x42, 0xa9, 0x6d, 0x90, 0x3e, 0xc7,
+	0x75, 0x2c, 0xeb, 0x40, 0xd3, 0x9f, 0xd1, 0xb7, 0x82, 0xa0, 0xcf, 0x11, 0x52, 0xb4, 0x49, 0xd2,
+	0xa5, 0xb8, 0x6c, 0xda, 0xf9, 0xe7, 0xa6, 0x78, 0x9d, 0x10, 0xc1, 0xb4, 0x3e, 0xa3, 0x44, 0xd4,
+	0x6b, 0xff, 0x02, 0x49, 0x6a, 0x20, 0x12, 0xdf, 0x7b, 0x9d, 0xcd, 0x4e, 0x77, 0xbf, 0xc3, 0x5c,
+	0xa6, 0xd9, 0xda, 0x6a, 0xed, 0xb6, 0xd4, 0x6e, 0x67, 0x8b, 0xb8, 0xcc, 0x6d, 0xb8, 0xc9, 0x05,
+	0xf5, 0x4e, 0x53, 0xdd, 0x57, 0xda, 0x62, 0x28, 0x56, 0x5b, 0x8c, 0x12, 0x48, 0x06, 0x12, 0x9d,
+	0x6e, 0xa7, 0x25, 0xcf, 0x50, 0x2a, 0x69, 0x36, 0x65, 0x89, 0x52, 0x89, 0xd2, 0xdd, 0x16, 0x9e,
+	0xb6, 0x9a, 0x07, 0x30, 0x02, 0xa3, 0x6e, 0x24, 0x32, 0x29, 0x39, 0x5d, 0xfb, 0x49, 0x05, 0x4a,
+	0xe7, 0xc2, 0xef, 0x8a, 0x2a, 0xa6, 0x4a, 0xab, 0x98, 0x78, 0x18, 0x1a, 0x41, 0x15, 0x13, 0xe3,
+	0x05, 0xcc, 0x43, 0xc8, 0x0e, 0x35, 0x17, 0xdb, 0x7e, 0xf8, 0x3e, 0x24, 0x9a, 0xa5, 0xcc, 0x36,
+	0x1d, 0x08, 0xa6, 0x67, 0xd8, 0xc4, 0x36, 0x51, 0x4a, 0x1f, 0x61, 0xd7, 0x23, 0x3e, 0xc1, 0x2e,
+	0xee, 0x36, 0x0f, 0xbb, 0xd9, 0x70, 0x57, 0x4f, 0xd9, 0x04, 0x45, 0xcc, 0x44, 0xdb, 0x30, 0x3b,
+	0x70, 0x0c, 0xb3, 0x67, 0xea, 0xec, 0xd6, 0x7d, 0x73, 0xc0, 0xde, 0x78, 0x72, 0x2b, 0xaf, 0x45,
+	0xee, 0x64, 0xe4, 0x9b, 0xd6, 0xd2, 0xa1, 0xa5, 0x2f, 0xed, 0x8a, 0xf7, 0x68, 0x7e, 0x22, 0x39,
+	0xaa, 0x4d, 0x06, 0xd1, 0x63, 0x48, 0x8b, 0x62, 0x3d, 0x43, 0x53, 0xe4, 0xb4, 0xd1, 0xc6, 0x11,
+	0x85, 0x36, 0x5a, 0x83, 0xa2, 0x8d, 0x8f, 0xa3, 0x2d, 0x5a, 0x76, 0xcc, 0x1f, 0xf3, 0x1d, 0x7c,
+	0x3c, 0xb9, 0x3f, 0xcb, 0xdb, 0xe1, 0x88, 0x81, 0x3e, 0x82, 0xc2, 0xd0, 0x35, 0x07, 0x9a, 0x7b,
+	0x12, 0x79, 0xbe, 0x99, 0x3a, 0x84, 0x83, 0xdc, 0xc5, 0x20, 0xd8, 0x6b, 0xcc, 0x1a, 0xb0, 0x5e,
+	0x08, 0x7b, 0xe5, 0x1c, 0x3d, 0xe3, 0xf5, 0xc0, 0x84, 0x32, 0x5a, 0x85, 0x02, 0x3d, 0x62, 0xd0,
+	0x84, 0xe5, 0xe9, 0x09, 0x17, 0xf8, 0x09, 0x73, 0xe4, 0x84, 0x13, 0x1a, 0xb1, 0x9c, 0x1d, 0xc8,
+	0x0d, 0xb4, 0x01, 0x10, 0xfc, 0x0e, 0xe0, 0x7d, 0xc7, 0x93, 0xcb, 0xb6, 0x98, 0x18, 0x6e, 0x49,
+	0x89, 0x68, 0xa3, 0x27, 0x90, 0x15, 0xa1, 0xcc, 0xea, 0x85, 0xcb, 0x23, 0xf3, 0x22, 0xb1, 0x08,
+	0x3a, 0x09, 0x10, 0x50, 0x07, 0x92, 0x16, 0xd6, 0x3c, 0xcc, 0x8b, 0x86, 0x47, 0x53, 0x26, 0xae,
+	0x1d, 0xfd, 0x10, 0x0f, 0xb4, 0xc6, 0x21, 0x69, 0x48, 0xb6, 0x88, 0xbe, 0xc2, 0x60, 0x50, 0x07,
+	0x64, 0x6a, 0xae, 0x28, 0x47, 0xc9, 0xd4, 0x62, 0xaf, 0x73, 0x8b, 0x15, 0x89, 0xc5, 0x2e, 0xe5,
+	0x29, 0xea, 0x4f, 0x4f, 0x42, 0xae, 0xfa, 0x27, 0x28, 0xf6, 0x1c, 0x77, 0xa0, 0xf9, 0xaa, 0x08,
+	0x9c, 0xd9, 0xb0, 0xb5, 0xf8, 0xf6, 0xb4, 0x52, 0x58, 0xa3, 0xa3, 0x22, 0x68, 0x0a, 0xbd, 0xe8,
+	0x27, 0x5a, 0x17, 0x94, 0x3e, 0x47, 0x19, 0xf8, 0xdd, 0x69, 0x4f, 0x77, 0x91, 0xcf, 0x3b, 0x90,
+	0xa2, 0x59, 0xd9, 0x2b, 0xdf, 0xa0, 0x36, 0x7f, 0xc1, 0x0c, 0xaf, 0x70, 0x14, 0xf4, 0x09, 0x14,
+	0x0d, 0x22, 0x31, 0xed, 0x3e, 0x6f, 0x5d, 0x6e, 0x52, 0xdc, 0xe5, 0x29, 0x71, 0x49, 0x5b, 0xd3,
+	0xb6, 0x7b, 0x8e, 0xa8, 0x58, 0x05, 0x18, 0x6b, 0x77, 0xba, 0x90, 0xe9, 0x69, 0x03, 0xd3, 0x32,
+	0xb1, 0x57, 0xbe, 0x45, 0x71, 0xdf, 0xbb, 0x32, 0xc2, 0xcf, 0xbf, 0x0e, 0x89, 0x84, 0x20, 0x40,
+	0x82, 0x40, 0xa7, 0x82, 0x13, 0x72, 0xa9, 0xaf, 0x5c, 0x0c, 0x74, 0xf1, 0x3a, 0x34, 0xf6, 0x52,
+	0x44, 0x03, 0x9d, 0x7f, 0x19, 0xe8, 0x1e, 0xc0, 0x91, 0x89, 0xff, 0x4b, 0x7d, 0x3e, 0xc2, 0xee,
+	0x49, 0xb9, 0x1c, 0xe1, 0xdd, 0x2c, 0x91, 0x7f, 0x44, 0xc4, 0xe8, 0x7d, 0xc8, 0x1a, 0x78, 0x88,
+	0x6d, 0xc3, 0xeb, 0xda, 0xe5, 0xdb, 0xb4, 0x24, 0x9e, 0x23, 0xbd, 0x5a, 0x53, 0x08, 0x39, 0xaf,
+	0x86, 0xb3, 0xd0, 0xa7, 0x90, 0x67, 0x1f, 0xd8, 0xe8, 0xda, 0xab, 0x27, 0xe5, 0x79, 0x7a, 0xe8,
+	0x07, 0x53, 0x1a, 0x33, 0xac, 0xff, 0x6f, 0x88, 0xf3, 0x34, 0x23, 0x68, 0xca, 0x18, 0x36, 0xfa,
+	0x04, 0xf2, 0xc2, 0xbb, 0x37, 0x9c, 0x03, 0xaf, 0xfc, 0xea, 0x95, 0xef, 0x19, 0xe7, 0xd7, 0x7a,
+	0x12, 0xaa, 0x0a, 0xde, 0x8a, 0xa2, 0xa1, 0x8f, 0xa1, 0x10, 0x3c, 0x0e, 0x3a, 0x43, 0xdf, 0x2b,
+	0xdf, 0xa1, 0x81, 0xf9, 0x70, 0x5a, 0xd7, 0xe5, 0xba, 0xdd, 0xa1, 0xef, 0x29, 0x79, 0x2f, 0xf2,
+	0x85, 0xee, 0x42, 0xd6, 0x70, 0x9d, 0x21, 0xcb, 0x1f, 0xaf, 0x55, 0xa5, 0xc5, 0xb8, 0xb8, 0x66,
+	0x22, 0xa6, 0x89, 0x41, 0x85, 0xa2, 0x8b, 0x87, 0x96, 0xa6, 0xe3, 0x01, 0xc9, 0x6c, 0x4e, 0xaf,
+	0xbc, 0x40, 0x57, 0x5f, 0x99, 0xda, 0x90, 0x81, 0xb2, 0x70, 0xcc, 0x08, 0x5e, 0xb7, 0x87, 0xf6,
+	0x00, 0xb4, 0x91, 0x61, 0xfa, 0xea, 0xc0, 0x31, 0x70, 0xb9, 0x72, 0xe5, 0x0f, 0x00, 0xe7, 0xc1,
+	0xeb, 0x44, 0xf1, 0x89, 0x63, 0xe0, 0xe0, 0x8d, 0x4d, 0x08, 0xd0, 0xfb, 0x90, 0xa3, 0x47, 0xfb,
+	0xd4, 0x39, 0x20, 0xbe, 0x59, 0xa5, 0x87, 0x9b, 0xe5, 0x77, 0x99, 0x6d, 0xba, 0xce, 0x70, 0xc3,
+	0x39, 0xa0, 0x1e, 0xc3, 0xff, 0x34, 0x90, 0x07, 0xf9, 0xbe, 0xae, 0x86, 0x54, 0x7a, 0x97, 0xde,
+	0xe2, 0x3f, 0x4e, 0xb9, 0x97, 0xc7, 0x8d, 0x09, 0xe4, 0x3a, 0x27, 0x72, 0xc2, 0xe3, 0x86, 0x90,
+	0x79, 0x4a, 0xae, 0xaf, 0x07, 0x1f, 0xe8, 0x4d, 0xc8, 0xeb, 0x2e, 0xd6, 0x7c, 0xcc, 0x03, 0xa0,
+	0x16, 0x09, 0x80, 0x1c, 0x1b, 0x61, 0x21, 0xd0, 0x81, 0x59, 0x3e, 0x51, 0xf3, 0x54, 0xa7, 0xc7,
+	0xee, 0xec, 0xde, 0xf4, 0x39, 0xbf, 0xc8, 0xb4, 0xeb, 0x5e, 0xb7, 0x47, 0x2f, 0x56, 0x87, 0xbc,
+	0x33, 0xf2, 0x0f, 0x9c, 0x91, 0x6d, 0xa8, 0xbd, 0x67, 0x5e, 0xf9, 0x75, 0x7a, 0xda, 0x6b, 0x35,
+	0x13, 0xc1, 0xe9, 0xba, 0x1c, 0x68, 0x6d, 0xd3, 0x53, 0x72, 0x02, 0x75, 0xed, 0x99, 0x87, 0xfe,
+	0x13, 0x72, 0xa6, 0x1d, 0xae, 0x71, 0xff, 0xfa, 0x6b, 0x20, 0x51, 0xc7, 0xb6, 0xed, 0x60, 0x09,
+	0xe0, 0x98, 0x64, 0x85, 0x77, 0xa0, 0xe8, 0xf4, 0x7a, 0x96, 0x69, 0x63, 0xd5, 0xc5, 0x9a, 0xe7,
+	0xd8, 0xe5, 0x37, 0x22, 0x16, 0x2c, 0xf0, 0x31, 0x85, 0x0e, 0xa1, 0x1a, 0x64, 0x7d, 0x3c, 0x18,
+	0x3a, 0xae, 0xe6, 0x9e, 0x94, 0xdf, 0x8c, 0xd4, 0xb9, 0xa1, 0x78, 0xfe, 0x0b, 0x09, 0x66, 0x2f,
+	0xe4, 0x32, 0xf4, 0x1f, 0x90, 0xb6, 0x1d, 0x23, 0xf2, 0x48, 0xdb, 0xe2, 0xfb, 0x4a, 0x75, 0x1c,
+	0x83, 0xbd, 0xd1, 0x3e, 0x9c, 0xea, 0x37, 0x06, 0xfa, 0xd7, 0xf0, 0x60, 0x89, 0xa9, 0x29, 0x29,
+	0x82, 0xda, 0x36, 0xd0, 0x7b, 0x50, 0xc2, 0xc7, 0x43, 0xd3, 0x8d, 0xd4, 0x73, 0xb1, 0x48, 0x3c,
+	0x16, 0xc3, 0x41, 0x72, 0x79, 0xfc, 0xfd, 0xef, 0xc7, 0x31, 0x28, 0x9d, 0xcb, 0x26, 0xa4, 0x80,
+	0xa5, 0x3f, 0x09, 0x8c, 0x15, 0xb0, 0x44, 0x12, 0x69, 0x55, 0xaf, 0xfa, 0xdd, 0x31, 0xfe, 0xb2,
+	0xbf, 0x3b, 0x8e, 0xbf, 0xab, 0x25, 0xaf, 0xf1, 0xae, 0xf6, 0x0f, 0x70, 0xcb, 0xf4, 0x54, 0xdb,
+	0xb1, 0x45, 0x33, 0x1a, 0xb4, 0x1b, 0xd1, 0xdf, 0x4d, 0xe6, 0x4c, 0xaf, 0xe3, 0xd8, 0xac, 0x0d,
+	0x15, 0x13, 0x82, 0x76, 0x32, 0x21, 0x27, 0xe7, 0x55, 0xc8, 0x88, 0x54, 0x38, 0x5e, 0x92, 0x4b,
+	0x53, 0x96, 0xe4, 0x97, 0x1a, 0x8a, 0x9b, 0xfd, 0x73, 0x09, 0xb2, 0xd1, 0x7f, 0xc8, 0x88, 0x05,
+	0xd8, 0x93, 0xfb, 0x82, 0x17, 0x7c, 0xaf, 0x1f, 0x37, 0x64, 0x7c, 0x7a, 0x43, 0xf2, 0x6d, 0xfe,
+	0x37, 0xe4, 0x22, 0x99, 0xe5, 0x7c, 0x97, 0x28, 0xbd, 0x40, 0x97, 0xf8, 0x3a, 0xa4, 0x38, 0x9d,
+	0x32, 0xdf, 0x2c, 0x70, 0xed, 0x24, 0xa3, 0xd2, 0xe4, 0xa7, 0x84, 0x46, 0xf9, 0xea, 0xbf, 0x94,
+	0x20, 0x1f, 0xcd, 0x3c, 0x24, 0xf6, 0x4c, 0x5b, 0x77, 0x29, 0xed, 0xd3, 0xd5, 0x85, 0x6f, 0x87,
+	0x62, 0x92, 0x8f, 0x06, 0xa6, 0xad, 0xd2, 0x37, 0xf4, 0x31, 0xff, 0xcf, 0x0c, 0x4c, 0xfb, 0x29,
+	0x91, 0xd2, 0x29, 0xda, 0x31, 0x9f, 0x12, 0x1f, 0x9b, 0xa2, 0x1d, 0xb3, 0x29, 0xf3, 0xb4, 0xc4,
+	0x73, 0x7d, 0xda, 0x83, 0xc5, 0x23, 0x45, 0x9b, 0xeb, 0xa3, 0x05, 0x48, 0x1f, 0x99, 0xae, 0x3f,
+	0xd2, 0x2c, 0xda, 0x6e, 0x09, 0xa7, 0x12, 0x42, 0xbe, 0x79, 0x1b, 0x72, 0x91, 0xbc, 0x35, 0xc5,
+	0x15, 0xff, 0x3d, 0x24, 0x82, 0x98, 0x9d, 0x92, 0x8f, 0xa9, 0x02, 0x5f, 0xef, 0xa7, 0x12, 0xdc,
+	0x98, 0x94, 0x3f, 0xc6, 0x5c, 0x87, 0xd9, 0x6c, 0x2a, 0xd7, 0x19, 0xcb, 0xeb, 0xb1, 0x89, 0x79,
+	0x3d, 0xbc, 0xcb, 0xf8, 0x77, 0xdd, 0x65, 0xed, 0xa1, 0x68, 0xd7, 0x01, 0x52, 0xdb, 0x7b, 0xab,
+	0x5b, 0xed, 0xc6, 0xc4, 0x56, 0x9b, 0x74, 0xf3, 0xdd, 0xb5, 0xb5, 0xad, 0x76, 0xa7, 0x25, 0xc7,
+	0x49, 0x87, 0x1e, 0xa4, 0x67, 0x94, 0x87, 0x4c, 0xb3, 0xbd, 0x53, 0x5f, 0xdd, 0x6a, 0x35, 0xe5,
+	0x19, 0x54, 0x80, 0xac, 0xd2, 0xaa, 0x37, 0x69, 0x43, 0x2f, 0x4b, 0x1f, 0x64, 0xfe, 0xff, 0xb3,
+	0x8a, 0xc4, 0x03, 0x38, 0x25, 0xa7, 0x37, 0x12, 0x19, 0x24, 0xcf, 0xd5, 0x7e, 0x2e, 0x01, 0x6a,
+	0x6a, 0xbe, 0x46, 0x78, 0xe7, 0x1a, 0x0d, 0x7a, 0xec, 0x8a, 0x5b, 0x1a, 0x6f, 0xba, 0xe2, 0x2f,
+	0xd3, 0x74, 0x85, 0x9b, 0xae, 0x7d, 0x2e, 0x01, 0x44, 0x36, 0xf8, 0x61, 0xf4, 0x1f, 0xb4, 0x2e,
+	0xef, 0x31, 0xcf, 0x95, 0x0f, 0xeb, 0x33, 0xe2, 0xdf, 0xb7, 0x1e, 0x43, 0xc6, 0xe0, 0xc7, 0xe6,
+	0xee, 0x74, 0x69, 0x33, 0x77, 0xc1, 0x3a, 0xeb, 0xe4, 0x86, 0xb9, 0x94, 0x3f, 0x7c, 0xa4, 0x21,
+	0x39, 0xb2, 0x4d, 0xc7, 0x7e, 0x5b, 0x89, 0x3e, 0x94, 0x0a, 0xf6, 0x26, 0x57, 0x41, 0xff, 0xd6,
+	0x7c, 0x6c, 0xb0, 0x27, 0x98, 0x3d, 0xfb, 0x28, 0x10, 0x48, 0xa8, 0x08, 0xc0, 0xc7, 0x4d, 0xbb,
+	0x2f, 0xc7, 0xe8, 0x45, 0xba, 0xce, 0x70, 0x48, 0xbe, 0xe2, 0xab, 0x6f, 0x7d, 0xf9, 0xfb, 0x85,
+	0x99, 0x2f, 0xcf, 0x16, 0xa4, 0xaf, 0xce, 0x16, 0xa4, 0xaf, 0xcf, 0x16, 0xa4, 0xdf, 0x9d, 0x2d,
+	0x48, 0x3f, 0xfa, 0x66, 0x61, 0xe6, 0xab, 0x6f, 0x16, 0x66, 0xbe, 0xfe, 0x66, 0x61, 0xe6, 0xdf,
+	0xd2, 0x7c, 0xb3, 0x7f, 0x09, 0x00, 0x00, 0xff, 0xff, 0x10, 0x82, 0xd3, 0xa4, 0x52, 0x27, 0x00,
+	0x00,
 }

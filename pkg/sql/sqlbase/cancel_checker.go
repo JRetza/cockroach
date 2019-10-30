@@ -1,20 +1,19 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sqlbase
 
-import "context"
+import (
+	"context"
+	"sync/atomic"
+)
 
 // CancelChecker is a helper object for repeatedly checking whether the associated context
 // has been canceled or not. Encapsulates all logic for waiting for cancelCheckInterval
@@ -25,7 +24,7 @@ type CancelChecker struct {
 	ctx context.Context
 
 	// Number of times Check() has been called since last context cancellation check.
-	callsSinceLastCheck int32
+	callsSinceLastCheck uint32
 }
 
 // NewCancelChecker returns a new CancelChecker.
@@ -42,7 +41,7 @@ func (c *CancelChecker) Check() error {
 	// bitwise AND instead of division.
 	const cancelCheckInterval = 1024
 
-	if c.callsSinceLastCheck%cancelCheckInterval == 0 {
+	if atomic.LoadUint32(&c.callsSinceLastCheck)%cancelCheckInterval == 0 {
 		select {
 		case <-c.ctx.Done():
 			// Once the context is canceled, we no longer increment
@@ -52,6 +51,16 @@ func (c *CancelChecker) Check() error {
 		default:
 		}
 	}
-	c.callsSinceLastCheck++
+
+	// Increment. This may rollover when the 32-bit capacity is reached,
+	// but that's all right.
+	atomic.AddUint32(&c.callsSinceLastCheck, 1)
 	return nil
+}
+
+// Reset resets this cancel checker with a fresh context.
+func (c *CancelChecker) Reset(ctx context.Context) {
+	*c = CancelChecker{
+		ctx: ctx,
+	}
 }

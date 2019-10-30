@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import _ from "lodash";
 import React from "react";
 import { connect } from "react-redux";
@@ -14,6 +24,7 @@ import {
 } from "src/redux/apiReducers";
 
 import { Bytes } from "src/util/format";
+import { trustIcon } from "src/util/trust";
 
 import { TableInfo } from "src/views/databases/data/tableInfo";
 
@@ -21,11 +32,54 @@ import {
     DatabaseSummaryBase, DatabaseSummaryExplicitData, databaseDetails, tableInfos as selectTableInfos, grants,
 } from "src/views/databases/containers/databaseSummary";
 
+import tableIcon from "!!raw-loader!assets/tableIcon.svg";
+import "./databaseTables.styl";
+
 const databaseTablesSortSetting = new LocalSetting<AdminUIState, SortSetting>(
   "databases/sort_setting/tables", (s) => s.localSettings,
 );
 
 class DatabaseTableListSortedTable extends SortedTable<TableInfo> {}
+
+class DatabaseTableListEmpty extends React.Component {
+  render() {
+    return (
+      <table className="sort-table">
+        <thead>
+          <tr className="sort-table__row sort-table__row--header">
+            <th className="sort-table__cell sort-table__cell--sortable">
+              Table Name
+            </th>
+            <th className="sort-table__cell sort-table__cell--sortable">
+              Size
+            </th>
+            <th className="sort-table__cell sort-table__cell--sortable">
+              Ranges
+            </th>
+            <th className="sort-table__cell sort-table__cell--sortable">
+              # of Columns
+            </th>
+            <th className="sort-table__cell sort-table__cell--sortable">
+              # of Indices
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr className="sort-table__row sort-table__row--body">
+            <td className="sort-table__cell" colSpan={5}>
+              <div className="empty-state">
+                <div className="empty-state__line">
+                  <span className="table-icon" dangerouslySetInnerHTML={trustIcon(tableIcon)} />
+                  This database has no tables.
+                </div>
+              </div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    );
+  }
+}
 
 // DatabaseSummaryTables displays a summary section describing the tables
 // contained in a single database.
@@ -55,7 +109,7 @@ class DatabaseSummaryTables extends DatabaseSummaryBase {
           <div className="l-columns__left">
             <div className="database-summary-table sql-table">
               {
-                (numTables === 0) ? "" :
+                (numTables === 0) ? <DatabaseTableListEmpty /> :
                   <DatabaseTableListSortedTable
                     data={tableInfos}
                     sortSetting={sortSetting}

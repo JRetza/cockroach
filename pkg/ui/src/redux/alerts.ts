@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 /**
  * Alerts is a collection of selectors which determine if there are any Alerts
  * to display based on the current redux state.
@@ -18,6 +28,7 @@ import {
 import { refreshCluster, refreshNodes, refreshVersion, refreshHealth } from "./apiReducers";
 import { nodeStatusesSelector, livenessByNodeIDSelector } from "./nodes";
 import { AdminUIState } from "./state";
+import * as docsURL from "src/util/docs";
 
 export enum AlertLevel {
   NOTIFICATION,
@@ -201,10 +212,7 @@ export const newVersionNotificationSelector = createSelector(
       level: AlertLevel.NOTIFICATION,
       title: "New Version Available",
       text: "A new version of CockroachDB is available.",
-      // Note that this explicitly does not use util/docs to create the link,
-      // since we want to link to the updated version, not the version currently
-      // running on the cluster.
-      link: "https://www.cockroachlabs.com/docs/stable/upgrade-cockroach-version.html",
+      link: docsURL.upgradeCockroachVersion,
       dismiss: (dispatch) => {
         const dismissedAt = moment();
         // Dismiss locally.
@@ -241,7 +249,7 @@ export const disconnectedAlertSelector = createSelector(
 
     return {
       level: AlertLevel.CRITICAL,
-      title: "Connection to CockroachDB node lost.",
+      title: "We're currently having some trouble fetching updated data. If this persists, it might be a good idea to check your network connection to the CockroachDB cluster.",
       dismiss: (dispatch) => {
         dispatch(disconnectedDismissedLocalSetting.set(moment()));
         return Promise.resolve();

@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import React from "react";
 import { Link } from "react-router";
 import { connect } from "react-redux";
@@ -6,7 +16,12 @@ import { createSelector } from "reselect";
 import _ from "lodash";
 
 import {
-  livenessNomenclature, LivenessStatus, NodesSummary, nodesSummarySelector, selectNodesSummaryValid,
+  livenessNomenclature,
+  LivenessStatus,
+  nodeCapacityStats,
+  NodesSummary,
+  nodesSummarySelector,
+  selectNodesSummaryValid,
 } from "src/redux/nodes";
 import { AdminUIState } from "src/redux/state";
 import { refreshNodes, refreshLiveness } from "src/redux/apiReducers";
@@ -14,8 +29,11 @@ import { LocalSetting } from "src/redux/localsettings";
 import { SortSetting } from "src/views/shared/components/sortabletable";
 import { SortedTable } from "src/views/shared/components/sortedtable";
 import { LongToMoment } from "src/util/convert";
-import { Bytes } from "src/util/format";
-import { NodeStatus$Properties, MetricConstants, BytesUsed } from "src/util/proto";
+import { INodeStatus, MetricConstants, BytesUsed } from "src/util/proto";
+import { FixLong } from "src/util/fixLong";
+
+import { BytesBarChart } from "./barChart";
+import "./nodes.styl";
 
 const liveNodesSortSetting = new LocalSetting<AdminUIState, SortSetting>(
   "nodes/live_sort_setting", (s) => s.localSettings,
@@ -29,7 +47,7 @@ const decommissionedNodesSortSetting = new LocalSetting<AdminUIState, SortSettin
   "nodes/decommissioned_sort_setting", (s) => s.localSettings,
 );
 
-class NodeSortedTable extends SortedTable<NodeStatus$Properties> {}
+class NodeSortedTable extends SortedTable<INodeStatus> {}
 
 /**
  * NodeCategoryListProps are the properties shared by both LiveNodeList and
@@ -38,7 +56,7 @@ class NodeSortedTable extends SortedTable<NodeStatus$Properties> {}
 interface NodeCategoryListProps {
   sortSetting: SortSetting;
   setSort: typeof liveNodesSortSetting.set;
-  statuses: NodeStatus$Properties[];
+  statuses: INodeStatus[];
   nodesSummary: NodesSummary;
 }
 
@@ -54,11 +72,11 @@ class LiveNodeList extends React.Component<NodeCategoryListProps, {}> {
       return null;
     }
 
-    return <div>
-      <section className="section section--heading">
-        <h2>Live Nodes</h2>
-      </section>
-      <section className="section">
+    return (
+      <div className="embedded-table">
+        <section className="section section--heading">
+          <h2>Live Nodes</h2>
+        </section>
         <NodeSortedTable
           data={statuses}
           sortSetting={sortSetting}
@@ -91,7 +109,7 @@ class LiveNodeList extends React.Component<NodeCategoryListProps, {}> {
                 }
                 return (
                   <div className="sort-table__unbounded-column">
-                    <div className={"icon-circle-filled node-status-icon node-status-icon--" + s} title={tooltip} />
+                    <div className={"node-status-icon node-status-icon--" + s} title={tooltip} />
                     <Link to={`/node/${ns.desc.node_id}`}>{ns.desc.address.address_field}</Link>
                   </div>
                 );
@@ -111,24 +129,40 @@ class LiveNodeList extends React.Component<NodeCategoryListProps, {}> {
                 return moment.duration(startTime.diff(moment())).humanize();
               },
               sort: (ns) => ns.started_at,
-            },
-            // Used Capacity - displays the total persisted bytes maintained by the node.
-            {
-              title: "Used Capacity",
-              cell: (ns) => Bytes(BytesUsed(ns)),
-              sort: (ns) => BytesUsed(ns),
+              className: "sort-table__cell--right-aligned-stats",
             },
             // Replicas - displays the total number of replicas on the node.
             {
               title: "Replicas",
               cell: (ns) => ns.metrics[MetricConstants.replicas].toString(),
               sort: (ns) => ns.metrics[MetricConstants.replicas],
+              className: "sort-table__cell--right-aligned-stat",
+            },
+            // CPUs - the number of CPUs on this node
+            {
+              title: "CPUs",
+              cell: (ns) => ns.num_cpus,
+              className: "sort-table__cell--right-aligned-stat",
+            },
+            // Used Capacity - displays the total persisted bytes maintained by the node.
+            {
+              title: "Capacity Usage",
+              cell: (ns) => {
+                const { usable } = nodeCapacityStats(ns);
+                const used = BytesUsed(ns);
+                return <BytesBarChart used={used} usable={usable} />;
+              },
+              sort: (ns) => BytesUsed(ns) / nodeCapacityStats(ns).usable,
             },
             // Mem Usage - total memory being used on this node.
             {
               title: "Mem Usage",
-              cell: (ns) => Bytes(ns.metrics[MetricConstants.rss]),
-              sort: (ns) => ns.metrics[MetricConstants.rss],
+              cell: (ns) => {
+                const used = ns.metrics[MetricConstants.rss];
+                const available = FixLong(ns.total_system_memory).toNumber();
+                return <BytesBarChart used={used} usable={available} />;
+              },
+              sort: (ns) => ns.metrics[MetricConstants.rss] / FixLong(ns.total_system_memory).toNumber(),
             },
             // Version - the currently running version of cockroach.
             {
@@ -143,8 +177,8 @@ class LiveNodeList extends React.Component<NodeCategoryListProps, {}> {
               className: "expand-link",
             },
           ]} />
-      </section>
-    </div>;
+      </div>
+    );
   }
 }
 
@@ -168,11 +202,11 @@ class NotLiveNodeList extends React.Component<NotLiveNodeListProps, {}> {
 
     const statusName = _.capitalize(LivenessStatus[status]);
 
-    return <div>
-      <section className="section section--heading">
-        <h2>{`${statusName} Nodes`}</h2>
-      </section>
-      <section className="section">
+    return (
+      <div className="embedded-table">
+        <section className="section section--heading">
+          <h2>{`${statusName} Nodes`}</h2>
+        </section>
         <NodeSortedTable
           data={statuses}
           sortSetting={sortSetting}
@@ -230,8 +264,8 @@ class NotLiveNodeList extends React.Component<NotLiveNodeListProps, {}> {
               },
             },
           ]} />
-      </section>
-    </div>;
+      </div>
+    );
   }
 }
 
@@ -349,11 +383,13 @@ class NodesMain extends React.Component<NodesMainProps, {}> {
   }
 
   render() {
-    return <div>
-      <DeadNodesConnected />
-      <LiveNodesConnected />
-      <DecommissionedNodesConnected />
-    </div>;
+    return (
+      <div>
+        <DeadNodesConnected />
+        <LiveNodesConnected />
+        <DecommissionedNodesConnected />
+      </div>
+    );
   }
 }
 

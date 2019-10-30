@@ -1,24 +1,19 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package spanset
 
 import (
-	"bytes"
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -36,6 +31,18 @@ const (
 	NumSpanAccess
 )
 
+// String returns a string representation of the SpanAccess.
+func (a SpanAccess) String() string {
+	switch a {
+	case SpanReadOnly:
+		return "read"
+	case SpanReadWrite:
+		return "write"
+	default:
+		panic("unreachable")
+	}
+}
+
 // SpanScope divides access types into local and global keys.
 type SpanScope int
 
@@ -46,21 +53,33 @@ const (
 	NumSpanScope
 )
 
+// String returns a string representation of the SpanScope.
+func (a SpanScope) String() string {
+	switch a {
+	case SpanGlobal:
+		return "global"
+	case SpanLocal:
+		return "local"
+	default:
+		panic("unreachable")
+	}
+}
+
 // SpanSet tracks the set of key spans touched by a command. The set
 // is divided into subsets for access type (read-only or read/write)
 // and key scope (local or global; used to facilitate use by the
-// separate local and global command queues).
+// separate local and global latches).
 type SpanSet struct {
 	spans [NumSpanAccess][NumSpanScope][]roachpb.Span
 }
 
 // String prints a string representation of the span set.
 func (ss *SpanSet) String() string {
-	var buf bytes.Buffer
+	var buf strings.Builder
 	for i := SpanAccess(0); i < NumSpanAccess; i++ {
 		for j := SpanScope(0); j < NumSpanScope; j++ {
 			for _, span := range ss.GetSpans(i, j) {
-				fmt.Fprintf(&buf, "%d %d: %s\n", i, j, span)
+				fmt.Fprintf(&buf, "%s %s: %s\n", i, j, span)
 			}
 		}
 	}
@@ -94,9 +113,33 @@ func (ss *SpanSet) Add(access SpanAccess, span roachpb.Span) {
 	ss.spans[access][scope] = append(ss.spans[access][scope], span)
 }
 
+// SortAndDedup sorts the spans in the SpanSet and removes any duplicates.
+func (ss *SpanSet) SortAndDedup() {
+	for i := SpanAccess(0); i < NumSpanAccess; i++ {
+		for j := SpanScope(0); j < NumSpanScope; j++ {
+			ss.spans[i][j], _ /* distinct */ = roachpb.MergeSpans(ss.spans[i][j])
+		}
+	}
+}
+
 // GetSpans returns a slice of spans with the given parameters.
 func (ss *SpanSet) GetSpans(access SpanAccess, scope SpanScope) []roachpb.Span {
 	return ss.spans[access][scope]
+}
+
+// BoundarySpan returns a span containing all the spans with the given params.
+func (ss *SpanSet) BoundarySpan(scope SpanScope) roachpb.Span {
+	var boundary roachpb.Span
+	for i := SpanAccess(0); i < NumSpanAccess; i++ {
+		for _, span := range ss.spans[i][scope] {
+			if !boundary.Valid() {
+				boundary = span
+				continue
+			}
+			boundary = boundary.Combine(span)
+		}
+	}
+	return boundary
 }
 
 // AssertAllowed calls checkAllowed and fatals if the access is not allowed.
@@ -107,6 +150,13 @@ func (ss *SpanSet) AssertAllowed(access SpanAccess, span roachpb.Span) {
 }
 
 // CheckAllowed returns an error if the access is not allowed.
+//
+// TODO(irfansharif): This does not currently work for spans that straddle
+// across multiple added spans. Specifically a spanset with spans [a-c) and
+// [b-d) added under read only and read write access modes respectively would
+// fail at checking if read only access over the span [a-d) was requested. This
+// is also a problem if the added spans were read only and the spanset wasn't
+// already SortAndDedup-ed.
 func (ss *SpanSet) CheckAllowed(access SpanAccess, span roachpb.Span) error {
 	scope := SpanGlobal
 	if keys.IsLocal(span.Key) {
@@ -119,12 +169,8 @@ func (ss *SpanSet) CheckAllowed(access SpanAccess, span roachpb.Span) error {
 			}
 		}
 	}
-	action := "read"
-	if access == SpanReadWrite {
-		action = "write"
-	}
 
-	return errors.Errorf("cannot %s undeclared span %s\ndeclared:\n%s", action, span, ss)
+	return errors.Errorf("cannot %s undeclared span %s\ndeclared:\n%s", access, span, ss)
 }
 
 // Validate returns an error if any spans that have been added to the set

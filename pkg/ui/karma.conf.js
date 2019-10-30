@@ -1,9 +1,19 @@
+// Copyright 2019 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 // Karma configuration
 // Generated on Wed Mar 22 2017 16:39:26 GMT-0400 (EDT)
 
 "use strict";
 
-const webpackConfig = require("./webpack.ccl");
+const webpackConfig = require("./webpack.app")({dist: "ccl"});
 
 module.exports = function(config) {
   config.set({
@@ -34,8 +44,8 @@ module.exports = function(config) {
 
     // list of files / patterns to load in the browser
     files: [
-      "dist/protos.dll.js",
-      "dist/vendor.dll.js",
+      "dist/protos.ccl.dll.js",
+      "dist/vendor.oss.dll.js",
       "src/polyfills.ts",
       "src/**/*.spec.*",
       "ccl/src/**/*.spec.*",

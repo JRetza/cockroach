@@ -1,20 +1,29 @@
 required = [
  "github.com/client9/misspell/cmd/misspell",
+ "github.com/cockroachdb/errors",
  "github.com/cockroachdb/crlfmt",
+ "github.com/cockroachdb/gostdlib/cmd/gofmt",
+ "github.com/cockroachdb/gostdlib/x/tools/cmd/goimports",
  "github.com/cockroachdb/stress",
  "github.com/golang/dep/cmd/dep",
- "github.com/golang/lint/golint",
- "github.com/google/pprof",
  "github.com/grpc-ecosystem/grpc-gateway/protoc-gen-grpc-gateway",
- "github.com/jteeuwen/go-bindata/go-bindata",
+ "github.com/kevinburke/go-bindata/go-bindata",
  "github.com/kisielk/errcheck",
  "github.com/mattn/goveralls",
  "github.com/mibk/dupl",
  "github.com/wadey/gocovmerge",
+ "golang.org/x/lint/golint",
  "golang.org/x/perf/cmd/benchstat",
- "golang.org/x/tools/cmd/goimports",
  "golang.org/x/tools/cmd/goyacc",
  "golang.org/x/tools/cmd/stringer",
+ "golang.org/x/tools/go/analysis/passes/shadow/cmd/shadow",
+ "honnef.co/go/tools/cmd/staticcheck",
+]
+
+noverify = [
+  # We generate Go code with cgo configuration flags into go-libedit in order
+   # to link against our own version of libedit.
+  "github.com/knz/go-libedit"
 ]
 
 ignored = [
@@ -27,17 +36,23 @@ ignored = [
   name = "golang.org/x/text"
   revision = "470f45bf29f4147d6fbd7dfd0a02a848e49f5bf4"
 
-# https://github.com/coreos/etcd/commit/f03ed33
-#
-# https://github.com/coreos/etcd/commit/ce0ad377
 [[constraint]]
-  name = "github.com/coreos/etcd"
-  branch = "master"
+  name = "go.etcd.io/etcd"
+  # The last time this was bumped forward, it was for a targeted fix of #40207,
+  # which temporarily prevented us from being compatible with etcd's HEAD. The
+  # PR fixing 40207 bumped it forward exactly one commit to minimize unrelated
+  # fallout. Feel free to move this back to `branch = "master"` at any time.
+  # branch = "master"
+  revision = "4a2b4c8f7e0a3754fdd5a3341a27c2431c2a5385"
 
 # Used for the API client; we want the latest.
 [[constraint]]
   name = "github.com/docker/docker"
   branch = "master"
+
+[[constraint]]
+  name = "github.com/maruel/panicparse"
+  revision = "f20d4c4d746f810c9110e21928d4135e1f2a3efa"
 
 # https://github.com/getsentry/raven-go/pull/139
 [[constraint]]
@@ -49,42 +64,84 @@ ignored = [
   name = "github.com/go-sql-driver/mysql"
   branch = "master"
 
-# https://github.com/jteeuwen/go-bindata/pull/158
-[[constraint]]
-  name = "github.com/jteeuwen/go-bindata"
-  source = "https://github.com/dim13/go-bindata"
-  branch = "master"
-
 # https://github.com/montanaflynn/stats/releases (latest is 2015-10-14)
 [[constraint]]
   name = "github.com/montanaflynn/stats"
   branch = "master"
 
-# https://github.com/rubyist/circuitbreaker/commit/af95830
+# https://github.com/cockroachdb/circuitbreaker/commit/4f5b168
 [[constraint]]
-  name = "github.com/rubyist/circuitbreaker"
+  name = "github.com/cockroachdb/circuitbreaker"
   branch = "master"
 
-# https://github.com/GoogleCloudPlatform/google-cloud-go/issues/784
-# Remove this when that commit is in a tagged release.
 [[constraint]]
-  name = "cloud.google.com/go"
-  revision = "094187a3a68a589c8217a46b90af0efae38542b9"
+  name = "vitess.io/vitess"
+  source = "https://github.com/cockroachdb/vitess"
+  branch = "no-flag-names-parens"
 
-# https://github.com/xwb1989/sqlparser/issues/31
-# https://github.com/xwb1989/sqlparser/issues/32
+# We want https://github.com/go-yaml/yaml/pull/381
 [[constraint]]
-  name = "github.com/xwb1989/sqlparser"
-  source = "https://github.com/dt/sqlparser"
+  name = "gopkg.in/yaml.v2"
+  source = "https://github.com/cockroachdb/yaml"
+  branch = "v2-encoding-style"
 
-# github.com/docker/docker depends on a few functions not included in the
-# latest release: reference.{FamiliarName,ParseNormalizedNamed,TagNameOnly}.
-#
-# https://github.com/docker/distribution/commit/429c75f
-# https://github.com/docker/distribution/commit/2caeb61
+[[constraint]]
+  name = "github.com/abourget/teamcity"
+  source = "https://github.com/cockroachdb/teamcity"
+
+# https://github.com/golang/dep/pull/2003
+[[constraint]]
+  name = "github.com/golang/dep"
+  branch = "master"
+
+[[constraint]]
+  name = "golang.org/x/crypto"
+  branch = "master"
+
+[[constraint]]
+  name = "github.com/gogo/protobuf"
+  source = "https://github.com/cockroachdb/gogoproto"
+  branch = "v1.2.0-with-clone-fix"
+
+# Pin to v1.1.0 because of https://github.com/kisielk/errcheck/issues/162.
+[[constraint]]
+  name = "github.com/kisielk/errcheck"
+  version = "=v1.1.0"
+
+# Pin to 2017.2.2 because of https://github.com/cockroachdb/cockroach/issues/33669.
+[[constraint]]
+  name = "honnef.co/go/tools"
+  revision = "1f0868a609b73436e79b066f93c7f1a28c5dbae2"
+
+# Test util - don't need to pin.
+[[constraint]]
+  name = "github.com/leanovate/gopter"
+  branch = "master"
+
+[[constraint]]
+  name = "github.com/cockroachdb/pebble"
+  branch = "master"
+
+# github.com/openzipkin-contrib/zipkin-go-opentracing requires a newer
+# version of thrift than is currently present in a release.
 [[override]]
-  name = "github.com/docker/distribution"
+  name = "github.com/apache/thrift"
+  revision = "2b7365c54f823013cc6a4760798051b22743c103"
+
+# This repository has no releases (as of Jan 2019).
+[[override]]
+  name = "google.golang.org/genproto"
   branch = "master"
+
+[[constraint]]
+  name = "google.golang.org/grpc"
+  version = "=v1.21.2"
+
+# Pin until 48c3df3f8bccdfa2bed83f6e4936cdf9e4c68d15 is in a release.
+# Also investigate switching to v4 branch.
+[[constraint]]
+  name = "github.com/jackc/pgx"
+  revision = "23388fecf653ddfce2a4149acf71313b87d64e3d"
 
 [prune]
   go-tests = true
@@ -100,7 +157,15 @@ ignored = [
     name = "github.com/grpc-ecosystem/grpc-gateway"
     unused-packages = false
 
+  [[prune.project]]
+    name = "github.com/prometheus/client_model"
+    unused-packages = false
+
   # Contains packages with used C files.
   [[prune.project]]
     name = "github.com/knz/go-libedit"
     unused-packages = false
+
+[[constraint]]
+  name = "github.com/Azure/azure-sdk-for-go"
+  version = "33.0.0"

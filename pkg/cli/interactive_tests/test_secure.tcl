@@ -4,6 +4,7 @@ source [file join [file dirname $argv0] common.tcl]
 
 set certs_dir "/certs"
 set ::env(COCKROACH_INSECURE) "false"
+set ::env(COCKROACH_HOST) "localhost"
 
 spawn /bin/bash
 send "PS1=':''/# '\r"
@@ -12,7 +13,7 @@ set prompt ":/# "
 eexpect $prompt
 
 start_test "Check that --insecure reports that the server is really insecure"
-send "$argv start --insecure\r"
+send "$argv start-single-node --insecure\r"
 eexpect "WARNING: RUNNING IN INSECURE MODE"
 eexpect "node starting"
 interrupt
@@ -22,7 +23,8 @@ end_test
 
 proc start_secure_server {argv certs_dir} {
     report "BEGIN START SECURE SERVER"
-    system "mkfifo pid_fifo || true; $argv start --certs-dir=$certs_dir --pid-file=pid_fifo -s=path=logs/db >>expect-cmd.log 2>&1 & cat pid_fifo > server_pid"
+    system "$argv start-single-node --certs-dir=$certs_dir --pid-file=server_pid -s=path=logs/db --background >>expect-cmd.log 2>&1;
+            $argv sql --certs-dir=$certs_dir -e 'select 1'"
     report "END START SECURE SERVER"
 }
 
@@ -50,13 +52,19 @@ eexpect "empty passwords are not permitted"
 eexpect $prompt
 end_test
 
+start_test "Make the user without password."
+send "$argv user set carl --certs-dir=$certs_dir\r"
+eexpect "CREATE USER"
+eexpect $prompt
+end_test
+
 start_test "Check a password can be changed."
 send "$argv user set carl --password --certs-dir=$certs_dir\r"
 eexpect "Enter password:"
 send "woof\r"
 eexpect "Confirm password:"
 send "woof\r"
-eexpect "CREATE USER"
+eexpect "ALTER USER"
 eexpect $prompt
 end_test
 
@@ -83,7 +91,7 @@ end_test
 
 start_test "Check that root cannot use password."
 # Run as root but with a non-existent certs directory.
-send "$argv sql --url='postgresql://root@localhost:26257?sslmode=verify-full'\r"
+send "$argv sql --url='postgresql://root@localhost:26257?sslmode=verify-full&sslrootcert=$certs_dir/ca.crt'\r"
 eexpect "Error: connections with user root must use a client certificate"
 eexpect "Failed running \"sql\""
 end_test
@@ -111,7 +119,7 @@ eexpect $prompt
 send "$argv sql --certs-dir=$certs_dir --user=eisen\r"
 eexpect "Enter password:"
 send "*****\r"
-eexpect "Error: pq: invalid password"
+eexpect "Error: pq: password authentication failed for user eisen"
 eexpect "Failed running \"sql\""
 # Check that history is scrubbed.
 send "$argv sql --certs-dir=$certs_dir\r"

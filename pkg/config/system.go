@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package config
 
@@ -23,11 +19,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
 
 type zoneConfigHook func(
-	sysCfg SystemConfig, objectID uint32, keySuffix []byte,
-) (zoneCfg ZoneConfig, found bool, err error)
+	sysCfg *SystemConfig, objectID uint32,
+) (zone *ZoneConfig, placeholder *ZoneConfig, cache bool, err error)
 
 var (
 	// ZoneConfigHook is a function used to lookup a zone config given a table
@@ -38,12 +35,59 @@ var (
 	// testingLargestIDHook is a function used to bypass GetLargestObjectID
 	// in tests.
 	testingLargestIDHook func(uint32) uint32
+
+	// SplitAtIDHook is a function that is used to check if a given
+	// descriptor comes from a database or a table view.
+	SplitAtIDHook func(uint32, *SystemConfig) bool
 )
+
+type zoneEntry struct {
+	zone        *ZoneConfig
+	placeholder *ZoneConfig
+
+	// combined merges the zone and placeholder configs into a combined config.
+	// If both have subzone information, the placeholder information is preferred.
+	// This may never happen, but while the existing code gives preference to the
+	// placeholder, there appear to be no guarantees that there can be no overlap.
+	//
+	// TODO(andyk): Use the combined value everywhere early in 19.2, so there's
+	// enough bake time to ensure this is OK to do. Until then, only use the
+	// combined value in GetZoneConfigForObject, which is only used by the
+	// optimizer.
+	combined *ZoneConfig
+}
+
+// SystemConfig embeds a SystemConfigEntries message which contains an
+// entry for every system descriptor (e.g. databases, tables, zone
+// configs). It also has a map from object ID to unmarshaled zone
+// config for caching.
+// The shouldSplitCache caches information about the descriptor ID,
+// saying whether or not it should be considered for splitting at all.
+// A database descriptor or a table view descriptor are examples of IDs
+// that should not be considered for splits.
+type SystemConfig struct {
+	SystemConfigEntries
+	DefaultZoneConfig *ZoneConfig
+	mu                struct {
+		syncutil.RWMutex
+		zoneCache        map[uint32]zoneEntry
+		shouldSplitCache map[uint32]bool
+	}
+}
+
+// NewSystemConfig returns an initialized instance of SystemConfig.
+func NewSystemConfig(defaultZoneConfig *ZoneConfig) *SystemConfig {
+	sc := &SystemConfig{}
+	sc.DefaultZoneConfig = defaultZoneConfig
+	sc.mu.zoneCache = map[uint32]zoneEntry{}
+	sc.mu.shouldSplitCache = map[uint32]bool{}
+	return sc
+}
 
 // Equal checks for equality.
 //
 // It assumes that s.Values and other.Values are sorted in key order.
-func (s SystemConfig) Equal(other SystemConfig) bool {
+func (s *SystemConfig) Equal(other *SystemConfigEntries) bool {
 	if len(s.Values) != len(other.Values) {
 		return false
 	}
@@ -63,9 +107,41 @@ func (s SystemConfig) Equal(other SystemConfig) bool {
 	return true
 }
 
+// GetDesc looks for the descriptor value given a key, if a zone is created in
+// a test without creating a Descriptor, a dummy descriptor is returned.
+// If the key is invalid in decoding an ID, GetDesc panics.
+func (s *SystemConfig) GetDesc(key roachpb.Key) *roachpb.Value {
+	if getVal := s.GetValue(key); getVal != nil {
+		return getVal
+	}
+
+	id, err := keys.DecodeDescMetadataID(key)
+	if err != nil {
+		// No ID found for key. No roachpb.Value corresponds to this key.
+		panic(err)
+	}
+
+	testingLock.Lock()
+	_, ok := testingZoneConfig[uint32(id)]
+	testingLock.Unlock()
+
+	if ok {
+		// A test installed a zone config for this ID, but no descriptor.
+		// Synthesize an empty descriptor to force split to occur, or else the
+		// zone config won't apply to any ranges. Most tests that use
+		// TestingSetZoneConfig are too low-level to create tables and zone
+		// configs through proper channels.
+		//
+		// Getting here outside tests is impossible.
+		val := roachpb.MakeValueFromBytes(nil)
+		return &val
+	}
+	return nil
+}
+
 // GetValue searches the kv list for 'key' and returns its
 // roachpb.Value if found.
-func (s SystemConfig) GetValue(key roachpb.Key) *roachpb.Value {
+func (s *SystemConfig) GetValue(key roachpb.Key) *roachpb.Value {
 	if kv := s.get(key); kv != nil {
 		return &kv.Value
 	}
@@ -74,7 +150,7 @@ func (s SystemConfig) GetValue(key roachpb.Key) *roachpb.Value {
 
 // get searches the kv list for 'key' and returns its roachpb.KeyValue
 // if found.
-func (s SystemConfig) get(key roachpb.Key) *roachpb.KeyValue {
+func (s *SystemConfig) get(key roachpb.Key) *roachpb.KeyValue {
 	if index, found := s.GetIndex(key); found {
 		// TODO(marc): I'm pretty sure a Value returned by MVCCScan can
 		// never be nil. Should check.
@@ -84,7 +160,7 @@ func (s SystemConfig) get(key roachpb.Key) *roachpb.KeyValue {
 }
 
 // GetIndex searches the kv list for 'key' and returns its index if found.
-func (s SystemConfig) GetIndex(key roachpb.Key) (int, bool) {
+func (s *SystemConfig) GetIndex(key roachpb.Key) (int, bool) {
 	l := len(s.Values)
 	index := sort.Search(l, func(i int) bool {
 		return bytes.Compare(s.Values[i].Key, key) >= 0
@@ -98,7 +174,7 @@ func (s SystemConfig) GetIndex(key roachpb.Key) (int, bool) {
 // GetLargestObjectID returns the largest object ID found in the config which is
 // less than or equal to maxID. If maxID is 0, returns the largest ID in the
 // config.
-func (s SystemConfig) GetLargestObjectID(maxID uint32) (uint32, error) {
+func (s *SystemConfig) GetLargestObjectID(maxID uint32) (uint32, error) {
 	testingLock.Lock()
 	hook := testingLargestIDHook
 	testingLock.Unlock()
@@ -171,18 +247,27 @@ func (s SystemConfig) GetLargestObjectID(maxID uint32) (uint32, error) {
 	return uint32(id), nil
 }
 
-// GetZoneConfigForKey looks up the zone config for the range containing 'key'.
-// It is the caller's responsibility to ensure that the range does not need to be split.
-func (s SystemConfig) GetZoneConfigForKey(key roachpb.RKey) (ZoneConfig, error) {
+// GetZoneConfigForKey looks up the zone config for the object (table
+// or database, specified by key.id). It is the caller's
+// responsibility to ensure that the range does not need to be split.
+func (s *SystemConfig) GetZoneConfigForKey(key roachpb.RKey) (*ZoneConfig, error) {
+	return s.getZoneConfigForKey(DecodeKeyIntoZoneIDAndSuffix(key))
+}
+
+// DecodeKeyIntoZoneIDAndSuffix figures out the zone that the key belongs to.
+func DecodeKeyIntoZoneIDAndSuffix(key roachpb.RKey) (id uint32, keySuffix []byte) {
 	objectID, keySuffix, ok := DecodeObjectID(key)
 	if !ok {
 		// Not in the structured data namespace.
 		objectID = keys.RootNamespaceID
-	} else if objectID <= keys.MaxReservedDescID {
-		// For now, you can only set a zone config on the system database as a whole,
-		// not on any of its constituent tables. This is largely because all the
+	} else if objectID <= keys.MaxSystemConfigDescID || isPseudoTableID(objectID) {
+		// For now, you cannot set the zone config on gossiped tables. The only
+		// way to set a zone config on these tables is to modify config for the
+		// system database as a whole. This is largely because all the
 		// "system config" tables are colocated in the same range by default and
 		// thus couldn't be managed separately.
+		// Furthermore pseudo-table ids should be considered to be a part of the
+		// system database as they aren't real tables.
 		objectID = keys.SystemDatabaseID
 	}
 
@@ -198,25 +283,98 @@ func (s SystemConfig) GetZoneConfigForKey(key roachpb.RKey) (ZoneConfig, error) 
 			objectID = keys.SystemRangesID
 		}
 	}
-
-	return s.getZoneConfigForID(objectID, keySuffix)
+	return objectID, keySuffix
 }
 
-// getZoneConfigForID looks up the zone config for the object (table or database)
-// with 'id'.
-func (s SystemConfig) getZoneConfigForID(id uint32, keySuffix []byte) (ZoneConfig, error) {
+// isPseudoTableID returns true if id is in keys.PseudoTableIDs.
+func isPseudoTableID(id uint32) bool {
+	for _, pseudoTableID := range keys.PseudoTableIDs {
+		if id == pseudoTableID {
+			return true
+		}
+	}
+	return false
+}
+
+// GetZoneConfigForObject returns the combined zone config for the given object
+// identifier.
+// NOTE: any subzones from the zone placeholder will be automatically merged
+// into the cached zone so the caller doesn't need special-case handling code.
+func (s *SystemConfig) GetZoneConfigForObject(id uint32) (*ZoneConfig, error) {
+	entry, err := s.getZoneEntry(id)
+	if err != nil {
+		return nil, err
+	}
+	return entry.combined, nil
+}
+
+// getZoneEntry returns the zone entry for the given object ID. In the fast
+// path, the zone is already in the cache, and is directly returned. Otherwise,
+// getZoneEntry will hydrate new ZoneConfig(s) from the SystemConfig and install
+// them as an entry in the cache.
+func (s *SystemConfig) getZoneEntry(id uint32) (zoneEntry, error) {
+	s.mu.RLock()
+	entry, ok := s.mu.zoneCache[id]
+	s.mu.RUnlock()
+	if ok {
+		return entry, nil
+	}
 	testingLock.Lock()
 	hook := ZoneConfigHook
 	testingLock.Unlock()
-	if cfg, found, err := hook(s, id, keySuffix); err != nil || found {
-		return cfg, err
+	zone, placeholder, cache, err := hook(s, id)
+	if err != nil {
+		return zoneEntry{}, err
 	}
-	return DefaultZoneConfig(), nil
+	if zone != nil {
+		entry := zoneEntry{zone: zone, placeholder: placeholder, combined: zone}
+		if placeholder != nil {
+			// Merge placeholder with zone by copying over subzone information.
+			// Placeholders should only define the Subzones and SubzoneSpans fields.
+			combined := *zone
+			combined.Subzones = placeholder.Subzones
+			combined.SubzoneSpans = placeholder.SubzoneSpans
+			entry.combined = &combined
+		}
+
+		if cache {
+			s.mu.Lock()
+			s.mu.zoneCache[id] = entry
+			s.mu.Unlock()
+		}
+		return entry, nil
+	}
+	return zoneEntry{}, nil
+}
+
+func (s *SystemConfig) getZoneConfigForKey(id uint32, keySuffix []byte) (*ZoneConfig, error) {
+	entry, err := s.getZoneEntry(id)
+	if err != nil {
+		return nil, err
+	}
+	if entry.zone != nil {
+		if entry.placeholder != nil {
+			if subzone, _ := entry.placeholder.GetSubzoneForKeySuffix(keySuffix); subzone != nil {
+				if indexSubzone := entry.placeholder.GetSubzone(subzone.IndexID, ""); indexSubzone != nil {
+					subzone.Config.InheritFromParent(&indexSubzone.Config)
+				}
+				subzone.Config.InheritFromParent(entry.zone)
+				return &subzone.Config, nil
+			}
+		} else if subzone, _ := entry.zone.GetSubzoneForKeySuffix(keySuffix); subzone != nil {
+			if indexSubzone := entry.zone.GetSubzone(subzone.IndexID, ""); indexSubzone != nil {
+				subzone.Config.InheritFromParent(&indexSubzone.Config)
+			}
+			subzone.Config.InheritFromParent(entry.zone)
+			return &subzone.Config, nil
+		}
+		return entry.zone, nil
+	}
+	return s.DefaultZoneConfig, nil
 }
 
 var staticSplits = []roachpb.RKey{
-	roachpb.RKey(keys.SystemPrefix),                 // end of meta records / start of system ranges
-	roachpb.RKey(keys.NodeLivenessPrefix),           // start of node liveness span
+	roachpb.RKey(keys.NodeLivenessPrefix),           // end of meta records / start of node liveness span
 	roachpb.RKey(keys.NodeLivenessKeyMax),           // end of node liveness span
 	roachpb.RKey(keys.TimeseriesPrefix),             // start of timeseries span
 	roachpb.RKey(keys.TimeseriesPrefix.PrefixEnd()), // end of timeseries span
@@ -224,6 +382,7 @@ var staticSplits = []roachpb.RKey{
 }
 
 // StaticSplits are predefined split points in the system keyspace.
+// Corresponding ranges are created at cluster bootstrap time.
 //
 // There are two reasons for a static split. First, spans that are critical to
 // cluster stability, like the node liveness span, are split into their own
@@ -231,6 +390,9 @@ var staticSplits = []roachpb.RKey{
 // that can be targeted by zone configs, like the meta span and the timeseries
 // span, are split off into their own ranges because zone configs cannot apply
 // to fractions of a range.
+//
+// Note that these are not the only splits created at cluster bootstrap; splits
+// between various system tables are also created.
 func StaticSplits() []roachpb.RKey {
 	return staticSplits
 }
@@ -243,10 +405,14 @@ func StaticSplits() []roachpb.RKey {
 // system ranges that come before the system tables. The system-config range is
 // somewhat special in that it can contain multiple SQL tables
 // (/table/0-/table/<max-system-config-desc>) within a single range.
-func (s SystemConfig) ComputeSplitKey(startKey, endKey roachpb.RKey) roachpb.RKey {
+func (s *SystemConfig) ComputeSplitKey(startKey, endKey roachpb.RKey) (rr roachpb.RKey) {
 	// Before dealing with splits necessitated by SQL tables, handle all of the
 	// static splits earlier in the keyspace. Note that this list must be kept in
 	// the proper order (ascending in the keyspace) for the logic below to work.
+	//
+	// For new clusters, the static splits correspond to ranges created at
+	// bootstrap time. Older stores might be used with a version with more
+	// staticSplits though, in which case this code is useful.
 	for _, split := range staticSplits {
 		if startKey.Less(split) {
 			if split.Less(endKey) {
@@ -285,7 +451,7 @@ func (s SystemConfig) ComputeSplitKey(startKey, endKey roachpb.RKey) roachpb.RKe
 		for id := startID; id <= endID; id++ {
 			tableKey := roachpb.RKey(keys.MakeTablePrefix(id))
 			// This logic is analogous to the well-commented static split logic above.
-			if startKey.Less(tableKey) {
+			if startKey.Less(tableKey) && s.shouldSplit(id) {
 				if tableKey.Less(endKey) {
 					return tableKey
 				}
@@ -342,6 +508,27 @@ func (s SystemConfig) ComputeSplitKey(startKey, endKey roachpb.RKey) roachpb.RKe
 
 // NeedsSplit returns whether the range [startKey, endKey) needs a split due
 // to zone configs.
-func (s SystemConfig) NeedsSplit(startKey, endKey roachpb.RKey) bool {
+func (s *SystemConfig) NeedsSplit(startKey, endKey roachpb.RKey) bool {
 	return len(s.ComputeSplitKey(startKey, endKey)) > 0
+}
+
+// shouldSplit checks if the ID is eligible for a split at all.
+// It uses the internal cache to find a value, and tries to find
+// it using the hook if ID isn't found in the cache.
+func (s *SystemConfig) shouldSplit(ID uint32) bool {
+	s.mu.RLock()
+	shouldSplit, ok := s.mu.shouldSplitCache[ID]
+	s.mu.RUnlock()
+	if !ok {
+		// Check if the descriptor ID is not one of the reserved
+		// IDs that refer to ranges but not any actual descriptors.
+		shouldSplit = true
+		if ID >= keys.MinUserDescID {
+			shouldSplit = SplitAtIDHook(ID, s)
+		}
+		s.mu.Lock()
+		s.mu.shouldSplitCache[ID] = shouldSplit
+		s.mu.Unlock()
+	}
+	return shouldSplit
 }

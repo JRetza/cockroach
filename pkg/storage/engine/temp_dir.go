@@ -1,31 +1,25 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package engine
 
 import (
-	"C"
 	"bufio"
 	"context"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 
-	"github.com/pkg/errors"
-
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/pkg/errors"
 )
 
 const lockFilename = `TEMP_DIR.LOCK`
@@ -38,6 +32,12 @@ func CreateTempDir(parentDir, prefix string, stopper *stop.Stopper) (string, err
 	// We generate a unique temporary directory with the specified prefix.
 	tempPath, err := ioutil.TempDir(parentDir, prefix)
 	if err != nil {
+		return "", err
+	}
+
+	// TempDir creates a directory with permissions 0700. Manually change the
+	// permissions to be 0755 like every other directory created by cockroach.
+	if err := os.Chmod(tempPath, 0755); err != nil {
 		return "", err
 	}
 

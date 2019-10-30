@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree
 
@@ -19,19 +15,113 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
+
+// SpecializedVectorizedBuiltin is used to map overloads
+// to the vectorized operator that is specific to
+// that implementation of the builtin function.
+type SpecializedVectorizedBuiltin int
+
+// TODO (rohany): What is the best place to put this list?
+// I want to put it in builtins or exec, but those create an import
+// cycle with exec. tree is imported by both of them, so
+// this package seems like a good place to do it.
+
+// Keep this list alphabetized so that it is easy to manage.
+const (
+	_ SpecializedVectorizedBuiltin = iota
+	SubstringStringIntInt
+)
+
+// Overload is one of the overloads of a built-in function.
+// Each FunctionDefinition may contain one or more overloads.
+type Overload struct {
+	Types      TypeList
+	ReturnType ReturnTyper
+
+	// PreferredOverload determines overload resolution as follows.
+	// When multiple overloads are eligible based on types even after all of of
+	// the heuristics to pick one have been used, if one of the overloads is a
+	// Overload with the `PreferredOverload` flag set to true it can be selected
+	// rather than returning a no-such-method error.
+	// This should generally be avoided -- avoiding introducing ambiguous
+	// overloads in the first place is a much better solution -- and only done
+	// after consultation with @knz @nvanbenschoten.
+	PreferredOverload bool
+
+	// Info is a description of the function, which is surfaced on the CockroachDB
+	// docs site on the "Functions and Operators" page. Descriptions typically use
+	// third-person with the function as an implicit subject (e.g. "Calculates
+	// infinity"), but should focus more on ease of understanding so other structures
+	// might be more appropriate.
+	Info string
+
+	AggregateFunc func([]*types.T, *EvalContext, Datums) AggregateFunc
+	WindowFunc    func([]*types.T, *EvalContext) WindowFunc
+	Fn            func(*EvalContext, Datums) (Datum, error)
+	Generator     GeneratorFactory
+
+	// counter, if non-nil, should be incremented upon successful
+	// type check of expressions using this overload.
+	counter telemetry.Counter
+
+	// SpecializedVecBuiltin is used to let the vectorized engine
+	// know when an Overload has a specialized vectorized operator.
+	SpecializedVecBuiltin SpecializedVectorizedBuiltin
+}
+
+// params implements the overloadImpl interface.
+func (b Overload) params() TypeList { return b.Types }
+
+// returnType implements the overloadImpl interface.
+func (b Overload) returnType() ReturnTyper { return b.ReturnType }
+
+// preferred implements the overloadImpl interface.
+func (b Overload) preferred() bool { return b.PreferredOverload }
+
+// FixedReturnType returns a fixed type that the function returns, returning Any
+// if the return type is based on the function's arguments.
+func (b Overload) FixedReturnType() *types.T {
+	if b.ReturnType == nil {
+		return nil
+	}
+	return returnTypeToFixedType(b.ReturnType)
+}
+
+// Signature returns a human-readable signature.
+// If simplify is bool, tuple-returning functions with just
+// 1 tuple element unwrap the return type in the signature.
+func (b Overload) Signature(simplify bool) string {
+	retType := b.FixedReturnType()
+	if simplify {
+		if retType.Family() == types.TupleFamily && len(retType.TupleContents()) == 1 {
+			retType = &retType.TupleContents()[0]
+		}
+	}
+	return fmt.Sprintf("(%s) -> %s", b.Types.String(), retType)
+}
 
 // overloadImpl is an implementation of an overloaded function. It provides
 // access to the parameter type list  and the return type of the implementation.
+//
+// This is a more general type than Overload defined above, because it also
+// works with the built-in binary and unary operators.
 type overloadImpl interface {
 	params() TypeList
 	returnType() ReturnTyper
 	// allows manually resolving preference between multiple compatible overloads
 	preferred() bool
 }
+
+var _ overloadImpl = &Overload{}
+var _ overloadImpl = &UnaryOp{}
+var _ overloadImpl = &BinOp{}
 
 // GetParamsAndReturnType gets the parameters and return type of an
 // overloadImpl.
@@ -42,20 +132,20 @@ func GetParamsAndReturnType(impl overloadImpl) (TypeList, ReturnTyper) {
 // TypeList is a list of types representing a function parameter list.
 type TypeList interface {
 	// Match checks if all types in the TypeList match the corresponding elements in types.
-	Match(types []types.T) bool
+	Match(types []*types.T) bool
 	// MatchAt checks if the parameter type at index i of the TypeList matches type typ.
 	// In all implementations, types.Null will match with each parameter type, allowing
 	// NULL values to be used as arguments.
-	MatchAt(typ types.T, i int) bool
+	MatchAt(typ *types.T, i int) bool
 	// matchLen checks that the TypeList can support l parameters.
 	MatchLen(l int) bool
 	// getAt returns the type at the given index in the TypeList, or nil if the TypeList
 	// cannot have a parameter at index i.
-	GetAt(i int) types.T
+	GetAt(i int) *types.T
 	// Length returns the number of types in the list
 	Length() int
 	// Types returns a realized copy of the list. variadic lists return a list of size one.
-	Types() []types.T
+	Types() []*types.T
 	// String returns a human readable signature
 	String() string
 }
@@ -69,11 +159,11 @@ var _ TypeList = VariadicType{}
 // human-readable signature.
 type ArgTypes []struct {
 	Name string
-	Typ  types.T
+	Typ  *types.T
 }
 
 // Match is part of the TypeList interface.
-func (a ArgTypes) Match(types []types.T) bool {
+func (a ArgTypes) Match(types []*types.T) bool {
 	if len(types) != len(a) {
 		return false
 	}
@@ -86,16 +176,16 @@ func (a ArgTypes) Match(types []types.T) bool {
 }
 
 // MatchAt is part of the TypeList interface.
-func (a ArgTypes) MatchAt(typ types.T, i int) bool {
+func (a ArgTypes) MatchAt(typ *types.T, i int) bool {
 	// The parameterized types for Tuples are checked in the type checking
 	// routines before getting here, so we only need to check if the argument
-	// type is a types.FamTuple below. This allows us to avoid defining overloads
-	// for types.FamTuple{}, types.FamTuple{types.Any}, types.FamTuple{types.Any, types.Any}, etc.
-	// for Tuple operators.
-	if typ.FamilyEqual(types.FamTuple) {
-		typ = types.FamTuple
+	// type is a types.TUPLE below. This allows us to avoid defining overloads
+	// for types.Tuple{}, types.Tuple{types.Any}, types.Tuple{types.Any, types.Any},
+	// etc. for Tuple operators.
+	if typ.Family() == types.TupleFamily {
+		typ = types.AnyTuple
 	}
-	return i < len(a) && (typ == types.Unknown || a[i].Typ.Equivalent(typ))
+	return i < len(a) && (typ.Family() == types.UnknownFamily || a[i].Typ.Equivalent(typ))
 }
 
 // MatchLen is part of the TypeList interface.
@@ -104,7 +194,7 @@ func (a ArgTypes) MatchLen(l int) bool {
 }
 
 // GetAt is part of the TypeList interface.
-func (a ArgTypes) GetAt(i int) types.T {
+func (a ArgTypes) GetAt(i int) *types.T {
 	return a[i].Typ
 }
 
@@ -114,9 +204,9 @@ func (a ArgTypes) Length() int {
 }
 
 // Types is part of the TypeList interface.
-func (a ArgTypes) Types() []types.T {
+func (a ArgTypes) Types() []*types.T {
 	n := len(a)
-	ret := make([]types.T, n)
+	ret := make([]*types.T, n)
 	for i, s := range a {
 		ret[i] = s.Typ
 	}
@@ -142,12 +232,12 @@ func (a ArgTypes) String() string {
 type HomogeneousType struct{}
 
 // Match is part of the TypeList interface.
-func (HomogeneousType) Match(types []types.T) bool {
+func (HomogeneousType) Match(types []*types.T) bool {
 	return true
 }
 
 // MatchAt is part of the TypeList interface.
-func (HomogeneousType) MatchAt(typ types.T, i int) bool {
+func (HomogeneousType) MatchAt(typ *types.T, i int) bool {
 	return true
 }
 
@@ -157,7 +247,7 @@ func (HomogeneousType) MatchLen(l int) bool {
 }
 
 // GetAt is part of the TypeList interface.
-func (HomogeneousType) GetAt(i int) types.T {
+func (HomogeneousType) GetAt(i int) *types.T {
 	return types.Any
 }
 
@@ -167,8 +257,8 @@ func (HomogeneousType) Length() int {
 }
 
 // Types is part of the TypeList interface.
-func (HomogeneousType) Types() []types.T {
-	return []types.T{types.Any}
+func (HomogeneousType) Types() []*types.T {
+	return []*types.T{types.Any}
 }
 
 func (HomogeneousType) String() string {
@@ -179,12 +269,12 @@ func (HomogeneousType) String() string {
 // arguments at the beginning and an arbitrary number of homogenous arguments
 // at the end.
 type VariadicType struct {
-	FixedTypes []types.T
-	VarType    types.T
+	FixedTypes []*types.T
+	VarType    *types.T
 }
 
 // Match is part of the TypeList interface.
-func (v VariadicType) Match(types []types.T) bool {
+func (v VariadicType) Match(types []*types.T) bool {
 	for i := range types {
 		if !v.MatchAt(types[i], i) {
 			return false
@@ -194,11 +284,11 @@ func (v VariadicType) Match(types []types.T) bool {
 }
 
 // MatchAt is part of the TypeList interface.
-func (v VariadicType) MatchAt(typ types.T, i int) bool {
+func (v VariadicType) MatchAt(typ *types.T, i int) bool {
 	if i < len(v.FixedTypes) {
-		return typ == types.Unknown || v.FixedTypes[i].Equivalent(typ)
+		return typ.Family() == types.UnknownFamily || v.FixedTypes[i].Equivalent(typ)
 	}
-	return typ == types.Unknown || v.VarType.Equivalent(typ)
+	return typ.Family() == types.UnknownFamily || v.VarType.Equivalent(typ)
 }
 
 // MatchLen is part of the TypeList interface.
@@ -207,7 +297,7 @@ func (v VariadicType) MatchLen(l int) bool {
 }
 
 // GetAt is part of the TypeList interface.
-func (v VariadicType) GetAt(i int) types.T {
+func (v VariadicType) GetAt(i int) *types.T {
 	if i < len(v.FixedTypes) {
 		return v.FixedTypes[i]
 	}
@@ -220,8 +310,8 @@ func (v VariadicType) Length() int {
 }
 
 // Types is part of the TypeList interface.
-func (v VariadicType) Types() []types.T {
-	result := make([]types.T, len(v.FixedTypes)+1)
+func (v VariadicType) Types() []*types.T {
+	result := make([]*types.T, len(v.FixedTypes)+1)
 	for i := range v.FixedTypes {
 		result[i] = v.FixedTypes[i]
 	}
@@ -251,21 +341,21 @@ func (v VariadicType) String() string {
 // then the candidate function set cannot be refined. This means that only ReturnTypers
 // that never return unknownReturnType, like those created with FixedReturnType, can
 // help reduce overload ambiguity.
-var UnknownReturnType types.T
+var UnknownReturnType *types.T
 
 // ReturnTyper defines the type-level function in which a builtin function's return type
 // is determined. ReturnTypers should make sure to return unknownReturnType when necessary.
-type ReturnTyper func(args []TypedExpr) types.T
+type ReturnTyper func(args []TypedExpr) *types.T
 
 // FixedReturnType functions simply return a fixed type, independent of argument types.
-func FixedReturnType(typ types.T) ReturnTyper {
-	return func(args []TypedExpr) types.T { return typ }
+func FixedReturnType(typ *types.T) ReturnTyper {
+	return func(args []TypedExpr) *types.T { return typ }
 }
 
 // IdentityReturnType creates a returnType that is a projection of the idx'th
 // argument type.
 func IdentityReturnType(idx int) ReturnTyper {
-	return func(args []TypedExpr) types.T {
+	return func(args []TypedExpr) *types.T {
 		if len(args) == 0 {
 			return UnknownReturnType
 		}
@@ -279,12 +369,12 @@ func IdentityReturnType(idx int) ReturnTyper {
 // with HomogeneousType functions, in which all arguments have been checked to
 // have the same type (or be null).
 func FirstNonNullReturnType() ReturnTyper {
-	return func(args []TypedExpr) types.T {
+	return func(args []TypedExpr) *types.T {
 		if len(args) == 0 {
 			return UnknownReturnType
 		}
 		for _, arg := range args {
-			if t := arg.ResolvedType(); t != types.Unknown {
+			if t := arg.ResolvedType(); t.Family() != types.UnknownFamily {
 				return t
 			}
 		}
@@ -292,7 +382,7 @@ func FirstNonNullReturnType() ReturnTyper {
 	}
 }
 
-func returnTypeToFixedType(s ReturnTyper) types.T {
+func returnTypeToFixedType(s ReturnTyper) *types.T {
 	if t := s(nil); t != UnknownReturnType {
 		return t
 	}
@@ -320,10 +410,10 @@ type typeCheckOverloadState struct {
 // in which case we may need to make a guess that the two parameters are of the same type if one
 // of them is NULL.
 func typeCheckOverloadedExprs(
-	ctx *SemaContext, desired types.T, overloads []overloadImpl, inBinOp bool, exprs ...Expr,
+	ctx *SemaContext, desired *types.T, overloads []overloadImpl, inBinOp bool, exprs ...Expr,
 ) ([]TypedExpr, []overloadImpl, error) {
 	if len(overloads) > math.MaxUint8 {
-		return nil, nil, pgerror.NewErrorf(pgerror.CodeInternalError, "too many overloads (%d > 255)", len(overloads))
+		return nil, nil, errors.AssertionFailedf("too many overloads (%d > 255)", len(overloads))
 	}
 
 	var s typeCheckOverloadState
@@ -336,7 +426,8 @@ func typeCheckOverloadedExprs(
 		// Only one overload can be provided if it has parameters with HomogeneousType.
 		if _, ok := overload.params().(HomogeneousType); ok {
 			if len(overloads) > 1 {
-				panic("only one overload can have HomogeneousType parameters")
+				return nil, nil, errors.AssertionFailedf(
+					"only one overload can have HomogeneousType parameters")
 			}
 			typedExprs, _, err := TypeCheckSameTypedExprs(ctx, desired, exprs...)
 			if err != nil {
@@ -355,12 +446,12 @@ func typeCheckOverloadedExprs(
 		for _, i := range s.resolvableIdxs {
 			typ, err := exprs[i].TypeCheck(ctx, types.Any)
 			if err != nil {
-				return nil, nil, errors.Wrap(err, "error type checking resolved expression:")
+				return nil, nil, pgerror.Wrapf(err, pgcode.InvalidParameterValue,
+					"error type checking resolved expression:")
 			}
 			s.typedExprs[i] = typ
 		}
-		var err error
-		if s, err = defaultTypeCheck(ctx, s, false); err != nil {
+		if err := defaultTypeCheck(ctx, &s, false); err != nil {
 			return nil, nil, err
 		}
 		return s.typedExprs, nil, nil
@@ -413,12 +504,12 @@ func typeCheckOverloadedExprs(
 	// so we begin checking for a single remaining candidate implementation to choose.
 	// In case there is more than one candidate remaining, the following code uses
 	// heuristics to find a most preferable candidate.
-	if types, fns, ok, err := checkReturn(ctx, s); ok {
-		return types, fns, err
+	if ok, typedExprs, fns, err := checkReturn(ctx, &s); ok {
+		return typedExprs, fns, err
 	}
 
 	// The first heuristic is to prefer candidates that return the desired type.
-	if desired != types.Any {
+	if desired.Family() != types.AnyFamily {
 		s.overloadIdxs = filterOverloads(s.overloads, s.overloadIdxs,
 			func(o overloadImpl) bool {
 				// For now, we only filter on the return type for overloads with
@@ -430,12 +521,12 @@ func typeCheckOverloadedExprs(
 				}
 				return true
 			})
-		if types, fns, ok, err := checkReturn(ctx, s); ok {
-			return types, fns, err
+		if ok, typedExprs, fns, err := checkReturn(ctx, &s); ok {
+			return typedExprs, fns, err
 		}
 	}
 
-	var homogeneousTyp types.T
+	var homogeneousTyp *types.T
 	if len(s.resolvableIdxs) > 0 {
 		homogeneousTyp = s.typedExprs[s.resolvableIdxs[0]].ResolvedType()
 		for _, i := range s.resolvableIdxs[1:] {
@@ -447,7 +538,7 @@ func typeCheckOverloadedExprs(
 	}
 
 	if len(s.constIdxs) > 0 {
-		if ok, fns, err := filterAttempt(ctx, &s, func() {
+		if ok, typedExprs, fns, err := filterAttempt(ctx, &s, func() {
 			// The second heuristic is to prefer candidates where all constants can
 			// become a homogeneous type, if all resolvable expressions became one.
 			// This is only possible resolvable expressions were resolved
@@ -470,10 +561,10 @@ func typeCheckOverloadedExprs(
 				}
 			}
 		}); ok {
-			return s.typedExprs, fns, err
+			return typedExprs, fns, err
 		}
 
-		if ok, fns, err := filterAttempt(ctx, &s, func() {
+		if ok, typedExprs, fns, err := filterAttempt(ctx, &s, func() {
 			// The third heuristic is to prefer candidates where all constants can
 			// become their "natural" types.
 			for _, i := range s.constIdxs {
@@ -486,7 +577,7 @@ func typeCheckOverloadedExprs(
 				}
 			}
 		}); ok {
-			return s.typedExprs, fns, err
+			return typedExprs, fns, err
 		}
 
 		// At this point, it's worth seeing if we have constants that can't actually
@@ -509,8 +600,8 @@ func typeCheckOverloadedExprs(
 					return err == nil
 				})
 		}
-		if types, fn, ok, err := checkReturn(ctx, s); ok {
-			return types, fn, err
+		if ok, typedExprs, fn, err := checkReturn(ctx, &s); ok {
+			return typedExprs, fn, err
 		}
 
 		// The fourth heuristic is to prefer candidates that accepts the "best"
@@ -522,8 +613,8 @@ func typeCheckOverloadedExprs(
 						return o.params().GetAt(i).Equivalent(bestConstType)
 					})
 			}
-			if types, fns, ok, err := checkReturn(ctx, s); ok {
-				return types, fns, err
+			if ok, typedExprs, fns, err := checkReturn(ctx, &s); ok {
+				return typedExprs, fns, err
 			}
 			if homogeneousTyp != nil {
 				if !homogeneousTyp.Equivalent(bestConstType) {
@@ -553,8 +644,8 @@ func typeCheckOverloadedExprs(
 					return o.params().GetAt(i).Equivalent(homogeneousTyp)
 				})
 		}
-		if types, fns, ok, err := checkReturn(ctx, s); ok {
-			return types, fns, err
+		if ok, typedExprs, fns, err := checkReturn(ctx, &s); ok {
+			return typedExprs, fns, err
 		}
 	}
 
@@ -563,7 +654,7 @@ func typeCheckOverloadedExprs(
 	// other argument. This is used to differentiate the behavior of
 	// STRING[] || NULL and STRING || NULL.
 	if inBinOp && len(s.exprs) == 2 {
-		if ok, fns, err := filterAttempt(ctx, &s, func() {
+		if ok, typedExprs, fns, err := filterAttempt(ctx, &s, func() {
 			var err error
 			left := s.typedExprs[0]
 			if left == nil {
@@ -581,8 +672,8 @@ func typeCheckOverloadedExprs(
 			}
 			leftType := left.ResolvedType()
 			rightType := right.ResolvedType()
-			leftIsNull := leftType == types.Unknown
-			rightIsNull := rightType == types.Unknown
+			leftIsNull := leftType.Family() == types.UnknownFamily
+			rightIsNull := rightType.Family() == types.UnknownFamily
 			oneIsNull := (leftIsNull || rightIsNull) && !(leftIsNull && rightIsNull)
 			if oneIsNull {
 				if leftIsNull {
@@ -598,20 +689,20 @@ func typeCheckOverloadedExprs(
 					})
 			}
 		}); ok {
-			return s.typedExprs, fns, err
+			return typedExprs, fns, err
 		}
 	}
 
 	// The final heuristic is to defer to preferred candidates, if available.
-	if ok, fns, err := filterAttempt(ctx, &s, func() {
+	if ok, typedExprs, fns, err := filterAttempt(ctx, &s, func() {
 		s.overloadIdxs = filterOverloads(s.overloads, s.overloadIdxs, func(o overloadImpl) bool {
 			return o.preferred()
 		})
 	}); ok {
-		return s.typedExprs, fns, err
+		return typedExprs, fns, err
 	}
 
-	if _, err := defaultTypeCheck(ctx, s, len(s.overloads) > 0); err != nil {
+	if err := defaultTypeCheck(ctx, &s, len(s.overloads) > 0); err != nil {
 		return nil, nil, err
 	}
 
@@ -628,15 +719,20 @@ func typeCheckOverloadedExprs(
 // undo any filtering performed during the attempt.
 func filterAttempt(
 	ctx *SemaContext, s *typeCheckOverloadState, attempt func(),
-) (bool, []overloadImpl, error) {
+) (ok bool, _ []TypedExpr, _ []overloadImpl, _ error) {
 	before := s.overloadIdxs
 	attempt()
 	if len(s.overloadIdxs) == 1 {
-		_, fns, _, err := checkReturn(ctx, *s)
-		return true, fns, err
+		ok, typedExprs, fns, err := checkReturn(ctx, s)
+		if err != nil {
+			return false, nil, nil, err
+		}
+		if ok {
+			return true, typedExprs, fns, err
+		}
 	}
 	s.overloadIdxs = before
-	return false, nil, nil
+	return false, nil, nil, nil
 }
 
 // filterOverloads filters overloads which do not satisfy the predicate.
@@ -656,30 +752,29 @@ func filterOverloads(
 
 // defaultTypeCheck type checks the constant and placeholder expressions without a preference
 // and adds them to the type checked slice.
-func defaultTypeCheck(
-	ctx *SemaContext, s typeCheckOverloadState, errorOnPlaceholders bool,
-) (typeCheckOverloadState, error) {
+func defaultTypeCheck(ctx *SemaContext, s *typeCheckOverloadState, errorOnPlaceholders bool) error {
 	for _, i := range s.constIdxs {
 		typ, err := s.exprs[i].TypeCheck(ctx, types.Any)
 		if err != nil {
-			return s, errors.Wrap(err, "error type checking constant value")
+			return pgerror.Wrapf(err, pgcode.InvalidParameterValue,
+				"error type checking constant value")
 		}
 		s.typedExprs[i] = typ
 	}
 	for _, i := range s.placeholderIdxs {
 		if errorOnPlaceholders {
 			_, err := s.exprs[i].TypeCheck(ctx, types.Any)
-			return s, err
+			return err
 		}
 		// If we dont want to error on args, avoid type checking them without a desired type.
 		s.typedExprs[i] = StripParens(s.exprs[i]).(*Placeholder)
 	}
-	return s, nil
+	return nil
 }
 
 // checkReturn checks the number of remaining overloaded function
 // implementations.
-// Returns true if we should stop overload resolution, and returning either
+// Returns ok=true if we should stop overload resolution, and returning either
 // 1. the chosen overload in a slice, or
 // 2. nil,
 // along with the typed arguments.
@@ -687,15 +782,15 @@ func defaultTypeCheck(
 // it returns true, which signals to the calling function that it should
 // immediately return, so any mutations to s are irrelevant.
 func checkReturn(
-	ctx *SemaContext, s typeCheckOverloadState,
-) ([]TypedExpr, []overloadImpl, bool, error) {
+	ctx *SemaContext, s *typeCheckOverloadState,
+) (ok bool, _ []TypedExpr, _ []overloadImpl, _ error) {
 	switch len(s.overloadIdxs) {
 	case 0:
-		var err error
-		if s, err = defaultTypeCheck(ctx, s, false); err != nil {
-			return s.typedExprs, nil, true, err
+		if err := defaultTypeCheck(ctx, s, false); err != nil {
+			return false, nil, nil, err
 		}
-		return s.typedExprs, nil, true, nil
+		return true, s.typedExprs, nil, nil
+
 	case 1:
 		idx := s.overloadIdxs[0]
 		o := s.overloads[idx]
@@ -704,10 +799,16 @@ func checkReturn(
 			des := p.GetAt(i)
 			typ, err := s.exprs[i].TypeCheck(ctx, des)
 			if err != nil {
-				return s.typedExprs, nil, true, errors.Wrap(err, "error type checking constant value")
-			} else if des != nil && !typ.ResolvedType().Equivalent(des) {
-				panic(pgerror.NewErrorf(
-					pgerror.CodeInternalError, "desired constant value type %s but set type %s", des, typ.ResolvedType()))
+				return false, s.typedExprs, nil, pgerror.Wrapf(
+					err, pgcode.InvalidParameterValue,
+					"error type checking constant value",
+				)
+			}
+			if des != nil && !typ.ResolvedType().Equivalent(des) {
+				return false, nil, nil, errors.AssertionFailedf(
+					"desired constant value type %s but set type %s",
+					log.Safe(des), log.Safe(typ.ResolvedType()),
+				)
 			}
 			s.typedExprs[i] = typ
 		}
@@ -717,15 +818,16 @@ func checkReturn(
 			typ, err := s.exprs[i].TypeCheck(ctx, des)
 			if err != nil {
 				if des.IsAmbiguous() {
-					return nil, nil, false, nil
+					return false, nil, nil, nil
 				}
-				return s.typedExprs, nil, true, err
+				return false, nil, nil, err
 			}
 			s.typedExprs[i] = typ
 		}
-		return s.typedExprs, s.overloads[idx : idx+1], true, nil
+		return true, s.typedExprs, s.overloads[idx : idx+1], nil
+
 	default:
-		return nil, nil, false, nil
+		return false, nil, nil, nil
 	}
 }
 

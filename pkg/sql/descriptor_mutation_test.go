@@ -1,22 +1,19 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql_test
 
 import (
 	"context"
 	gosql "database/sql"
+	"fmt"
 	"math/rand"
 	"testing"
 
@@ -24,12 +21,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
-	"github.com/cockroachdb/cockroach/pkg/sqlmigrations"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -86,7 +81,8 @@ func (mt mutationTest) makeMutationsActive() {
 		}
 	}
 	mt.tableDesc.Mutations = nil
-	if err := mt.tableDesc.ValidateTable(cluster.MakeTestingClusterSettings()); err != nil {
+	mt.tableDesc.Version++
+	if err := mt.tableDesc.ValidateTable(); err != nil {
 		mt.Fatal(err)
 	}
 	if err := mt.kvDB.Put(
@@ -107,11 +103,13 @@ func (mt mutationTest) writeColumnMutation(column string, m sqlbase.DescriptorMu
 	}
 	for i := range mt.tableDesc.Columns {
 		if col.ID == mt.tableDesc.Columns[i].ID {
-			mt.tableDesc.Columns = append(mt.tableDesc.Columns[:i], mt.tableDesc.Columns[i+1:]...)
+			// Use [:i:i] to prevent reuse of existing slice, or outstanding refs
+			// to ColumnDescriptors may unexpectedly change.
+			mt.tableDesc.Columns = append(mt.tableDesc.Columns[:i:i], mt.tableDesc.Columns[i+1:]...)
 			break
 		}
 	}
-	m.Descriptor_ = &sqlbase.DescriptorMutation_Column{Column: &col}
+	m.Descriptor_ = &sqlbase.DescriptorMutation_Column{Column: col}
 	mt.writeMutation(m)
 }
 
@@ -141,7 +139,8 @@ func (mt mutationTest) writeMutation(m sqlbase.DescriptorMutation) {
 		}
 	}
 	mt.tableDesc.Mutations = append(mt.tableDesc.Mutations, m)
-	if err := mt.tableDesc.ValidateTable(cluster.MakeTestingClusterSettings()); err != nil {
+	mt.tableDesc.Version++
+	if err := mt.tableDesc.ValidateTable(); err != nil {
 		mt.Fatal(err)
 	}
 	if err := mt.kvDB.Put(
@@ -151,6 +150,63 @@ func (mt mutationTest) writeMutation(m sqlbase.DescriptorMutation) {
 	); err != nil {
 		mt.Fatal(err)
 	}
+}
+
+// Test that UPSERT with a column mutation that has a default value with a
+// NOT NULL constraint can handle the null input to its row fetcher, and
+// produces output rows of the correct shape.
+// Regression test for #29436.
+func TestUpsertWithColumnMutationAndNotNullDefault(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	// The descriptor changes made must have an immediate effect
+	// so disable leases on tables.
+	defer sql.TestDisableTableLeases()()
+	// Disable external processing of mutations.
+	params, _ := tests.CreateTestServerParams()
+	params.Knobs.SQLSchemaChanger = &sql.SchemaChangerTestingKnobs{
+		AsyncExecNotification: asyncSchemaChangerDisabled,
+	}
+	server, sqlDB, kvDB := serverutils.StartServer(t, params)
+	defer server.Stopper().Stop(context.TODO())
+
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.test (k VARCHAR PRIMARY KEY DEFAULT 'default', v VARCHAR);
+INSERT INTO t.test VALUES('a', 'foo');
+ALTER TABLE t.test ADD COLUMN i VARCHAR NOT NULL DEFAULT 'i';
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	// read table descriptor
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+
+	mTest := makeMutationTest(t, kvDB, sqlDB, tableDesc)
+	// Add column "i" as a mutation in delete/write.
+	mTest.writeColumnMutation("i", sqlbase.DescriptorMutation{State: sqlbase.DescriptorMutation_DELETE_AND_WRITE_ONLY})
+
+	// This row will conflict with the original row, and should insert an `i`
+	// into the new column.
+	mTest.Exec(t, `UPSERT INTO t.test VALUES('a', 'bar') RETURNING k`)
+
+	// These rows will not conflict.
+	mTest.Exec(t, `UPSERT INTO t.test VALUES('b', 'bar') RETURNING k`)
+	mTest.Exec(t, `INSERT INTO t.test VALUES('c', 'bar') RETURNING k, v`)
+	mTest.Exec(t, `INSERT INTO t.test VALUES('c', 'bar') ON CONFLICT(k) DO UPDATE SET v='qux' RETURNING k`)
+
+	mTest.CheckQueryResults(t, `SELECT * FROM t.test`, [][]string{
+		{"a", "bar"},
+		{"b", "bar"},
+		{"c", "qux"},
+	})
+
+	mTest.makeMutationsActive()
+
+	mTest.CheckQueryResults(t, `SELECT * FROM t.test`, [][]string{
+		{"a", "bar", "i"},
+		{"b", "bar", "i"},
+		{"c", "qux", "i"},
+	})
 }
 
 // Test INSERT, UPDATE, UPSERT, and DELETE operations with a column schema
@@ -173,7 +229,7 @@ func TestOperationsWithColumnMutation(t *testing.T) {
 	// Add an index so that we test adding a column when a table has an index.
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
-CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, i CHAR DEFAULT 'i', FAMILY (k), FAMILY (v), FAMILY (i));
+CREATE TABLE t.test (k VARCHAR PRIMARY KEY DEFAULT 'default', v VARCHAR, i VARCHAR DEFAULT 'i', FAMILY (k), FAMILY (v), FAMILY (i));
 CREATE INDEX allidx ON t.test (k, v);
 `); err != nil {
 		t.Fatal(err)
@@ -189,180 +245,214 @@ CREATE INDEX allidx ON t.test (k, v);
 		// Run the tests for both states.
 		for _, state := range []sqlbase.DescriptorMutation_State{sqlbase.DescriptorMutation_DELETE_ONLY,
 			sqlbase.DescriptorMutation_DELETE_AND_WRITE_ONLY} {
-			// Init table to start state.
-			mTest.Exec(t, `TRUNCATE TABLE t.test`)
-			// read table descriptor
-			mTest.tableDesc = sqlbase.GetTableDescriptor(kvDB, "t", "test")
+			t.Run(fmt.Sprintf("useUpsert=%t/state=%v", useUpsert, state),
+				func(t *testing.T) {
 
-			initRows := [][]string{{"a", "z", "q"}}
-			for _, row := range initRows {
-				if useUpsert {
-					mTest.Exec(t, `UPSERT INTO t.test VALUES ($1, $2, $3)`, row[0], row[1], row[2])
-				} else {
-					mTest.Exec(t, `INSERT INTO t.test VALUES ($1, $2, $3)`, row[0], row[1], row[2])
-				}
-			}
-			// Check that the table only contains the initRows.
-			mTest.CheckQueryResults(t, starQuery, initRows)
+					// Init table to start state.
+					mTest.Exec(t, `TRUNCATE TABLE t.test`)
+					// read table descriptor
+					mTest.tableDesc = sqlbase.GetTableDescriptor(kvDB, "t", "test")
 
-			// Add column "i" as a mutation.
-			mTest.writeColumnMutation("i", sqlbase.DescriptorMutation{State: state})
-			// A direct read of column "i" fails.
-			if _, err := sqlDB.Query(`SELECT i FROM t.test`); err == nil {
-				t.Fatalf("Read succeeded despite column being in %v state", sqlbase.DescriptorMutation{State: state})
-			}
-			// The table only contains columns "k" and "v".
-			mTest.CheckQueryResults(t, starQuery, [][]string{{"a", "z"}})
+					initRows := [][]string{{"a", "z", "q"}}
+					for _, row := range initRows {
+						if useUpsert {
+							mTest.Exec(t, `UPSERT INTO t.test VALUES ($1, $2, $3)`, row[0], row[1], row[2])
+						} else {
+							mTest.Exec(t, `INSERT INTO t.test VALUES ($1, $2, $3)`, row[0], row[1], row[2])
+						}
+					}
+					// Check that the table only contains the initRows.
+					mTest.CheckQueryResults(t, starQuery, initRows)
 
-			// The column backfill uses Put instead of CPut because it depends on
-			// an INSERT of a column in the DELETE_AND_WRITE_ONLY state failing. These two
-			// tests guarantee that.
+					// Add column "i" as a mutation.
+					mTest.writeColumnMutation("i", sqlbase.DescriptorMutation{State: state})
+					// A direct read of column "i" fails.
+					if _, err := sqlDB.Query(`SELECT i FROM t.test`); err == nil {
+						t.Fatalf("Read succeeded despite column being in %v state", sqlbase.DescriptorMutation{State: state})
+					}
+					// The table only contains columns "k" and "v".
+					mTest.CheckQueryResults(t, starQuery, [][]string{{"a", "z"}})
 
-			var err error
-			// Inserting a row into the table while specifying column "i" results in an error.
-			if useUpsert {
-				_, err = sqlDB.Exec(`UPSERT INTO t.test (k, v, i) VALUES ('b', 'y', 'i')`)
-			} else {
-				_, err = sqlDB.Exec(`INSERT INTO t.test (k, v, i) VALUES ('b', 'y', 'i')`)
-			}
-			if !testutils.IsError(err, `column "i" does not exist`) {
-				t.Fatal(err)
-			}
+					// The column backfill uses Put instead of CPut because it depends on
+					// an INSERT of a column in the DELETE_AND_WRITE_ONLY state failing. These two
+					// tests guarantee that.
 
-			// Repeating the same without specifying the columns results in a different error.
-			if useUpsert {
-				_, err = sqlDB.Exec(`UPSERT INTO t.test VALUES ('b', 'y', 'i')`)
-			} else {
-				_, err = sqlDB.Exec(`INSERT INTO t.test VALUES ('b', 'y', 'i')`)
-			}
-			if !testutils.IsError(err, "INSERT has more expressions than target columns, 3 expressions for 2 targets") {
-				t.Fatal(err)
-			}
+					var err error
+					// Inserting a row into the table while specifying column "i" results in an error.
+					if useUpsert {
+						_, err = sqlDB.Exec(`UPSERT INTO t.test (k, v, i) VALUES ('b', 'y', 'i')`)
+					} else {
+						_, err = sqlDB.Exec(`INSERT INTO t.test (k, v, i) VALUES ('b', 'y', 'i')`)
+					}
+					if !testutils.IsError(err, `column "i" does not exist`) &&
+						!testutils.IsError(err, `column "i" is being backfilled`) {
+						t.Fatal(err)
+					}
+					if useUpsert {
+						_, err = sqlDB.Exec(`UPSERT INTO t.test (k, v) VALUES ('b', 'y') RETURNING i`)
+					} else {
+						_, err = sqlDB.Exec(`INSERT INTO t.test (k, v) VALUES ('b', 'y') RETURNING i`)
+					}
+					if !testutils.IsError(err, `column "i" does not exist`) {
+						t.Fatal(err)
+					}
 
-			// Make column "i" live so that it is read.
-			mTest.makeMutationsActive()
-			// Check that we can read all the rows and columns.
-			mTest.CheckQueryResults(t, starQuery, initRows)
+					// Repeating the same without specifying the columns results in a different error.
+					if useUpsert {
+						_, err = sqlDB.Exec(`UPSERT INTO t.test VALUES ('b', 'y', 'i')`)
+					} else {
+						_, err = sqlDB.Exec(`INSERT INTO t.test VALUES ('b', 'y', 'i')`)
+					}
+					if !testutils.IsError(err, "(IN|UP)SERT has more expressions than target columns, 3 expressions for 2 targets") &&
+						!testutils.IsError(err, `column "i" is being backfilled`) {
+						t.Fatal(err)
+					}
 
-			var afterInsert, afterUpdate, afterPKUpdate, afterDelete [][]string
-			var afterDeleteKeys int
-			if state == sqlbase.DescriptorMutation_DELETE_ONLY {
-				// The default value of "i" for column "i" is not written.
-				afterInsert = [][]string{{"a", "z", "q"}, {"c", "x", "NULL"}}
-				// Update is a noop for column "i".
-				afterUpdate = [][]string{{"a", "u", "q"}, {"c", "x", "NULL"}}
-				// Update the pk of the second tuple from c to d
-				afterPKUpdate = [][]string{{"a", "u", "q"}, {"d", "x", "NULL"}}
-				// Delete also deletes column "i".
-				afterDelete = [][]string{{"d", "x", "NULL"}}
-				afterDeleteKeys = 3
-			} else {
-				// The default value of "i" for column "i" is written.
-				afterInsert = [][]string{{"a", "z", "q"}, {"c", "x", "i"}}
-				if useUpsert {
-					// Update is not a noop for column "i". Column "i" gets updated
-					// with its default value (#9474).
-					afterUpdate = [][]string{{"a", "u", "i"}, {"c", "x", "i"}}
-					afterPKUpdate = [][]string{{"a", "u", "i"}, {"d", "x", "i"}}
-				} else {
-					// Update is a noop for column "i".
-					afterUpdate = [][]string{{"a", "u", "q"}, {"c", "x", "i"}}
-					afterPKUpdate = [][]string{{"a", "u", "q"}, {"d", "x", "i"}}
-				}
-				// Delete also deletes column "i".
-				afterDelete = [][]string{{"d", "x", "i"}}
-				afterDeleteKeys = 4
-			}
-			// Make column "i" a mutation.
-			mTest.writeColumnMutation("i", sqlbase.DescriptorMutation{State: state})
-			// Insert a row into the table.
-			if useUpsert {
-				mTest.Exec(t, `UPSERT INTO t.test VALUES ('c', 'x')`)
-			} else {
-				mTest.Exec(t, `INSERT INTO t.test VALUES ('c', 'x')`)
-			}
-			// Make column "i" live so that it is read.
-			mTest.makeMutationsActive()
-			// Notice that the default value of "i" is only written when the
-			// descriptor is in the DELETE_AND_WRITE_ONLY state.
-			mTest.CheckQueryResults(t, starQuery, afterInsert)
+					// Make column "i" live so that it is read.
+					mTest.makeMutationsActive()
+					// Check that we can read all the rows and columns.
+					mTest.CheckQueryResults(t, starQuery, initRows)
 
-			// The column backfill uses Put instead of CPut because it depends on
-			// an UPDATE of a column in the DELETE_AND_WRITE_ONLY state failing. This test
-			// guarantees that.
+					var afterDefaultInsert, afterInsert, afterUpdate, afterPKUpdate, afterDelete [][]string
+					var afterDeleteKeys int
+					if state == sqlbase.DescriptorMutation_DELETE_ONLY {
+						// The default value of "i" for column "i" is not written.
+						afterDefaultInsert = [][]string{{"a", "z", "q"}, {"default", "NULL", "NULL"}}
+						// The default value of "i" for column "i" is not written.
+						afterInsert = [][]string{{"a", "z", "q"}, {"c", "x", "NULL"}}
+						// Update is a noop for column "i".
+						afterUpdate = [][]string{{"a", "u", "q"}, {"c", "x", "NULL"}}
+						// Update the pk of the second tuple from c to d
+						afterPKUpdate = [][]string{{"a", "u", "q"}, {"d", "x", "NULL"}}
+						// Delete also deletes column "i".
+						afterDelete = [][]string{{"d", "x", "NULL"}}
+						afterDeleteKeys = 3
+					} else {
+						// The default value of "i" for column "i" is written.
+						afterDefaultInsert = [][]string{{"a", "z", "q"}, {"default", "NULL", "i"}}
+						// The default value of "i" for column "i" is written.
+						afterInsert = [][]string{{"a", "z", "q"}, {"c", "x", "i"}}
+						if useUpsert {
+							// Update is not a noop for column "i".
+							afterUpdate = [][]string{{"a", "u", "q"}, {"c", "x", "i"}}
+							afterPKUpdate = [][]string{{"a", "u", "q"}, {"d", "x", "i"}}
+						} else {
+							// Update is a noop for column "i".
+							afterUpdate = [][]string{{"a", "u", "q"}, {"c", "x", "i"}}
+							afterPKUpdate = [][]string{{"a", "u", "q"}, {"d", "x", "i"}}
+						}
+						// Delete also deletes column "i".
+						afterDelete = [][]string{{"d", "x", "i"}}
+						afterDeleteKeys = 4
+					}
+					// Make column "i" a mutation.
+					mTest.writeColumnMutation("i", sqlbase.DescriptorMutation{State: state})
+					// Insert an all-defaults row into the table.
+					if useUpsert {
+						mTest.Exec(t, `UPSERT INTO t.test DEFAULT VALUES`)
+					} else {
+						mTest.Exec(t, `INSERT INTO t.test DEFAULT VALUES`)
+					}
+					// Make column "i" live so that it is read.
+					mTest.makeMutationsActive()
+					// Notice that the default value of "i" is only written when the
+					// descriptor is in the DELETE_AND_WRITE_ONLY state.
+					mTest.CheckQueryResults(t, starQuery, afterDefaultInsert)
+					// Clean up the all-defaults row
+					mTest.Exec(t, `DELETE FROM t.test WHERE k = 'default'`)
 
-			// Make column "i" a mutation.
-			mTest.writeColumnMutation("i", sqlbase.DescriptorMutation{State: state})
-			// Updating column "i" for a row fails.
-			if useUpsert {
-				_, err := sqlDB.Exec(`UPSERT INTO t.test VALUES ('a', 'u', 'u')`)
-				if !testutils.IsError(err, `INSERT has more expressions than target columns, 3 expressions for 2 targets`) {
-					t.Fatal(err)
-				}
-			} else {
-				_, err := sqlDB.Exec(`UPDATE t.test SET (v, i) = ('u', 'u') WHERE k = 'a'`)
-				if !testutils.IsError(err, `column "i" does not exist`) {
-					t.Fatal(err)
-				}
-			}
-			// Make column "i" live so that it is read.
-			mTest.makeMutationsActive()
-			// The above failed update was a noop.
-			mTest.CheckQueryResults(t, starQuery, afterInsert)
+					// Make column "i" a mutation.
+					mTest.writeColumnMutation("i", sqlbase.DescriptorMutation{State: state})
+					// Insert a row into the table.
+					if useUpsert {
+						mTest.Exec(t, `UPSERT INTO t.test VALUES ('c', 'x')`)
+					} else {
+						mTest.Exec(t, `INSERT INTO t.test VALUES ('c', 'x')`)
+					}
+					// Make column "i" live so that it is read.
+					mTest.makeMutationsActive()
+					// Notice that the default value of "i" is only written when the
+					// descriptor is in the DELETE_AND_WRITE_ONLY state.
+					mTest.CheckQueryResults(t, starQuery, afterInsert)
 
-			// Make column "i" a mutation.
-			mTest.writeColumnMutation("i", sqlbase.DescriptorMutation{State: state})
-			// Update a row without specifying  mutation column "i".
-			if useUpsert {
-				mTest.Exec(t, `UPSERT INTO t.test VALUES ('a', 'u')`)
-			} else {
-				mTest.Exec(t, `UPDATE t.test SET v = 'u' WHERE k = 'a'`)
-			}
-			// Make column "i" live so that it is read.
-			mTest.makeMutationsActive()
-			// The update to column "v" is seen; there is no effect on column "i".
-			mTest.CheckQueryResults(t, starQuery, afterUpdate)
+					// The column backfill uses Put instead of CPut because it depends on
+					// an UPDATE of a column in the DELETE_AND_WRITE_ONLY state failing. This test
+					// guarantees that.
 
-			// Make column "i" a mutation.
-			mTest.writeColumnMutation("i", sqlbase.DescriptorMutation{State: state})
-			// Update primary key of row "c" to be "d"
-			mTest.Exec(t, `UPDATE t.test SET k = 'd' WHERE v = 'x'`)
-			// Make column "i" live so that it is read.
-			mTest.makeMutationsActive()
-			mTest.CheckQueryResults(t, starQuery, afterPKUpdate)
+					// Make column "i" a mutation.
+					mTest.writeColumnMutation("i", sqlbase.DescriptorMutation{State: state})
+					// Updating column "i" for a row fails.
+					if useUpsert {
+						_, err := sqlDB.Exec(`UPSERT INTO t.test VALUES ('a', 'u', 'u')`)
+						if !testutils.IsError(err, `UPSERT has more expressions than target columns, 3 expressions for 2 targets`) {
+							t.Fatal(err)
+						}
+					} else {
+						_, err := sqlDB.Exec(`UPDATE t.test SET (v, i) = ('u', 'u') WHERE k = 'a'`)
+						if !testutils.IsError(err, `column "i" does not exist`) &&
+							!testutils.IsError(err, `column "i" is being backfilled`) {
+							t.Fatal(err)
+						}
+					}
+					// Make column "i" live so that it is read.
+					mTest.makeMutationsActive()
+					// The above failed update was a noop.
+					mTest.CheckQueryResults(t, starQuery, afterInsert)
 
-			// Make column "i" a mutation.
-			mTest.writeColumnMutation("i", sqlbase.DescriptorMutation{State: state})
-			// Delete row "a".
-			mTest.Exec(t, `DELETE FROM t.test WHERE k = 'a'`)
-			// Make column "i" live so that it is read.
-			mTest.makeMutationsActive()
-			// Row "a" is deleted.
-			mTest.CheckQueryResults(t, starQuery, afterDelete)
-			// Check that there are no hidden KV values for row "a",
-			// and column "i" for row "a" was deleted.
-			mTest.checkTableSize(afterDeleteKeys)
+					// Make column "i" a mutation.
+					mTest.writeColumnMutation("i", sqlbase.DescriptorMutation{State: state})
+					// Update a row without specifying  mutation column "i".
+					if useUpsert {
+						mTest.Exec(t, `UPSERT INTO t.test VALUES ('a', 'u')`)
+					} else {
+						mTest.Exec(t, `UPDATE t.test SET v = 'u' WHERE k = 'a'`)
+					}
+					// Make column "i" live so that it is read.
+					mTest.makeMutationsActive()
+					// The update to column "v" is seen; there is no effect on column "i".
+					mTest.CheckQueryResults(t, starQuery, afterUpdate)
+
+					// Make column "i" a mutation.
+					mTest.writeColumnMutation("i", sqlbase.DescriptorMutation{State: state})
+					// Update primary key of row "c" to be "d"
+					mTest.Exec(t, `UPDATE t.test SET k = 'd' WHERE v = 'x'`)
+					// Make column "i" live so that it is read.
+					mTest.makeMutationsActive()
+					mTest.CheckQueryResults(t, starQuery, afterPKUpdate)
+
+					// Make column "i" a mutation.
+					mTest.writeColumnMutation("i", sqlbase.DescriptorMutation{State: state})
+					// Delete row "a".
+					mTest.Exec(t, `DELETE FROM t.test WHERE k = 'a'`)
+					// Make column "i" live so that it is read.
+					mTest.makeMutationsActive()
+					// Row "a" is deleted.
+					mTest.CheckQueryResults(t, starQuery, afterDelete)
+					// Check that there are no hidden KV values for row "a",
+					// and column "i" for row "a" was deleted.
+					mTest.checkTableSize(afterDeleteKeys)
+				})
 		}
 	}
 
 	// Check that a mutation can only be inserted with an explicit mutation state, and direction.
 	tableDesc = mTest.tableDesc
 	tableDesc.Mutations = []sqlbase.DescriptorMutation{{}}
-	if err := tableDesc.ValidateTable(cluster.MakeTestingClusterSettings()); !testutils.IsError(err, "mutation in state UNKNOWN, direction NONE, and no column/index descriptor") {
+	if err := tableDesc.ValidateTable(); !testutils.IsError(err, "mutation in state UNKNOWN, direction NONE, and no column/index descriptor") {
 		t.Fatal(err)
 	}
 	tableDesc.Mutations = []sqlbase.DescriptorMutation{{Descriptor_: &sqlbase.DescriptorMutation_Column{Column: &tableDesc.Columns[len(tableDesc.Columns)-1]}}}
 	tableDesc.Columns = tableDesc.Columns[:len(tableDesc.Columns)-1]
-	if err := tableDesc.ValidateTable(cluster.MakeTestingClusterSettings()); !testutils.IsError(err, `mutation in state UNKNOWN, direction NONE, col "i", id 3`) {
+	if err := tableDesc.ValidateTable(); !testutils.IsError(err, `mutation in state UNKNOWN, direction NONE, col "i", id 3`) {
 		t.Fatal(err)
 	}
 	tableDesc.Mutations[0].State = sqlbase.DescriptorMutation_DELETE_ONLY
-	if err := tableDesc.ValidateTable(cluster.MakeTestingClusterSettings()); !testutils.IsError(err, `mutation in state DELETE_ONLY, direction NONE, col "i", id 3`) {
+	if err := tableDesc.ValidateTable(); !testutils.IsError(err, `mutation in state DELETE_ONLY, direction NONE, col "i", id 3`) {
 		t.Fatal(err)
 	}
 	tableDesc.Mutations[0].State = sqlbase.DescriptorMutation_UNKNOWN
 	tableDesc.Mutations[0].Direction = sqlbase.DescriptorMutation_DROP
-	if err := tableDesc.ValidateTable(cluster.MakeTestingClusterSettings()); !testutils.IsError(err, `mutation in state UNKNOWN, direction DROP, col "i", id 3`) {
+	if err := tableDesc.ValidateTable(); !testutils.IsError(err, `mutation in state UNKNOWN, direction DROP, col "i", id 3`) {
 		t.Fatal(err)
 	}
 }
@@ -375,14 +465,17 @@ func (mt mutationTest) writeIndexMutation(index string, m sqlbase.DescriptorMuta
 	if err != nil {
 		mt.Fatal(err)
 	}
+	// The rewrite below potentially invalidates the original object with an overwrite.
+	// Clarify what's going on.
+	idxCopy := *idx
 	for i := range tableDesc.Indexes {
-		if idx.ID == tableDesc.Indexes[i].ID {
+		if idxCopy.ID == tableDesc.Indexes[i].ID {
 			tableDesc.Indexes = append(tableDesc.Indexes[:i], tableDesc.Indexes[i+1:]...)
 			break
 		}
 	}
 
-	m.Descriptor_ = &sqlbase.DescriptorMutation_Index{Index: &idx}
+	m.Descriptor_ = &sqlbase.DescriptorMutation_Index{Index: &idxCopy}
 	mt.writeMutation(m)
 }
 
@@ -525,7 +618,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, INDEX foo (v));
 	tableDesc = mTest.tableDesc
 	tableDesc.Mutations = []sqlbase.DescriptorMutation{{Descriptor_: &sqlbase.DescriptorMutation_Index{Index: &tableDesc.Indexes[len(tableDesc.Indexes)-1]}}}
 	tableDesc.Indexes = tableDesc.Indexes[:len(tableDesc.Indexes)-1]
-	if err := tableDesc.ValidateTable(cluster.MakeTestingClusterSettings()); !testutils.IsError(err, "mutation in state UNKNOWN, direction NONE, index foo, id 2") {
+	if err := tableDesc.ValidateTable(); !testutils.IsError(err, "mutation in state UNKNOWN, direction NONE, index foo, id 2") {
 		t.Fatal(err)
 	}
 }
@@ -631,12 +724,13 @@ CREATE INDEX allidx ON t.test (k, v);
 				// Updating column "i" for a row fails.
 				if useUpsert {
 					_, err := sqlDB.Exec(`UPSERT INTO t.test VALUES ('a', 'u', 'u')`)
-					if !testutils.IsError(err, `INSERT has more expressions than target columns, 3 expressions for 2 targets`) {
+					if !testutils.IsError(err, `UPSERT has more expressions than target columns, 3 expressions for 2 targets`) {
 						t.Error(err)
 					}
 				} else {
 					_, err := sqlDB.Exec(`UPDATE t.test SET (v, i) = ('u', 'u') WHERE k = 'a'`)
-					if !testutils.IsError(err, `column "i" does not exist`) {
+					if !testutils.IsError(err, `column "i" does not exist`) &&
+						!testutils.IsError(err, `column "i" is being backfilled`) {
 						t.Error(err)
 					}
 				}
@@ -649,7 +743,8 @@ CREATE INDEX allidx ON t.test (k, v);
 				// TODO(vivek): Fix this error to return the same is being
 				// backfilled error.
 				_, err = sqlDB.Exec(`UPDATE t.test SET i = 'u' WHERE k = 'a'`)
-				if !testutils.IsError(err, `column "i" does not exist`) {
+				if !testutils.IsError(err, `column "i" does not exist`) &&
+					!testutils.IsError(err, `column "i" is being backfilled`) {
 					t.Error(err)
 				}
 				_, err = sqlDB.Exec(`DELETE FROM t.test WHERE i < 'a'`)
@@ -723,16 +818,13 @@ func TestSchemaChangeCommandsWithPendingMutations(t *testing.T) {
 			SyncFilter:            sql.TestingSchemaChangerCollection.ClearSchemaChangers,
 			AsyncExecNotification: asyncSchemaChangerDisabled,
 		},
-		SQLMigrationManager: &sqlmigrations.MigrationManagerTestingKnobs{
-			DisableMigrations: true,
-		},
 	}
 	server, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer server.Stopper().Stop(context.TODO())
 
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
-CREATE TABLE t.test (a CHAR PRIMARY KEY, b CHAR, c CHAR, INDEX foo (c));
+CREATE TABLE t.test (a STRING PRIMARY KEY, b STRING, c STRING, INDEX foo (c));
 `); err != nil {
 		t.Fatal(err)
 	}
@@ -876,9 +968,9 @@ CREATE TABLE t.test (a CHAR PRIMARY KEY, b CHAR, c CHAR, INDEX foo (c));
 	mt.CheckQueryResults(t,
 		"SHOW INDEXES FROM t.test",
 		[][]string{
-			{"test", "primary", "true", "1", "a", "ASC", "false", "false"},
-			{"test", "ufo", "false", "1", "d", "ASC", "false", "false"},
-			{"test", "ufo", "false", "2", "a", "ASC", "false", "true"},
+			{"test", "primary", "false", "1", "a", "ASC", "false", "false"},
+			{"test", "ufo", "true", "1", "d", "ASC", "false", "false"},
+			{"test", "ufo", "true", "2", "a", "ASC", "false", "true"},
 		},
 	)
 
@@ -900,9 +992,9 @@ CREATE TABLE t.test (a CHAR PRIMARY KEY, b CHAR, c CHAR, INDEX foo (c));
 	mt.CheckQueryResults(t,
 		"SHOW COLUMNS FROM t.test",
 		[][]string{
-			{"a", "STRING", "false", "NULL", "{\"primary\",\"ufo\"}"},
-			{"d", "STRING", "true", "NULL", "{\"ufo\"}"},
-			{"e", "STRING", "true", "NULL", "{}"},
+			{"a", "STRING", "false", "NULL", "", "{primary,ufo}", "false"},
+			{"e", "STRING", "true", "NULL", "", "{}", "false"},
+			{"d", "STRING", "true", "NULL", "", "{ufo}", "false"},
 		},
 	)
 
@@ -933,9 +1025,6 @@ func TestTableMutationQueue(t *testing.T) {
 				tscc.ClearSchemaChangers()
 			},
 			AsyncExecNotification: asyncSchemaChangerDisabled,
-		},
-		SQLMigrationManager: &sqlmigrations.MigrationManagerTestingKnobs{
-			DisableMigrations: true,
 		},
 	}
 	server, sqlDB, kvDB := serverutils.StartServer(t, params)
@@ -995,9 +1084,9 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR UNIQUE);
 		// Third.
 		{"idx_g", 3, sqlbase.DescriptorMutation_DELETE_ONLY},
 		// Drop mutations start off in the DELETE_AND_WRITE_ONLY state.
-		// UNIQUE column deletion gets split into two mutation ids.
+		// UNIQUE column deletion gets split into two mutations with the same ID.
 		{"test_v_key", 4, sqlbase.DescriptorMutation_DELETE_AND_WRITE_ONLY},
-		{"v", 5, sqlbase.DescriptorMutation_DELETE_AND_WRITE_ONLY},
+		{"v", 4, sqlbase.DescriptorMutation_DELETE_AND_WRITE_ONLY},
 	}
 
 	if len(tableDesc.Mutations) != len(expected) {

@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package localcluster
 
@@ -34,10 +30,6 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/pkg/errors"
-	// Import postgres driver.
-	_ "github.com/lib/pq"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -54,6 +46,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/gogo/protobuf/proto"
+	// Import postgres driver.
+	_ "github.com/lib/pq"
+	"github.com/pkg/errors"
 )
 
 func repoRoot() string {
@@ -89,6 +85,7 @@ type ClusterConfig struct {
 	PerNodeCfg  map[int]NodeConfig // optional map of nodeIndex -> configuration
 	DB          string             // database to configure DB connection for
 	NumWorkers  int                // SetMaxOpenConns to use for DB connection
+	NoWait      bool               // if set, return from Start before cluster ready
 }
 
 // NodeConfig is a configuration for a node in a Cluster. Options with the zero
@@ -199,7 +196,7 @@ func (c *Cluster) Start(ctx context.Context) {
 		}
 	}
 
-	if c.Cfg.NumNodes > 1 {
+	if !c.Cfg.NoWait {
 		for i := range chs {
 			if err := <-chs[i]; err != nil {
 				log.Fatalf(ctx, "node %d: %s", i+1, err)
@@ -209,7 +206,7 @@ func (c *Cluster) Start(ctx context.Context) {
 
 	log.Infof(context.Background(), "started %.3fs", timeutil.Since(c.started).Seconds())
 
-	if c.Cfg.NumNodes > 1 {
+	if c.Cfg.NumNodes > 1 || !c.Cfg.NoWait {
 		c.waitForFullReplication()
 	} else {
 		// NB: This is useful for TestRapidRestarts.
@@ -287,6 +284,9 @@ func (c *Cluster) makeNode(ctx context.Context, nodeIdx int, cfg NodeConfig) (*N
 		cfg.Binary,
 		"start",
 		"--insecure",
+		// Although --host/--port are deprecated, we cannot yet replace
+		// this here by --listen-addr/--listen-port, because
+		// TestVersionUpgrade will also try old binaries.
 		fmt.Sprintf("--host=%s", n.IPAddr()),
 		fmt.Sprintf("--port=%d", cfg.RPCPort),
 		fmt.Sprintf("--http-port=%d", cfg.HTTPPort),
@@ -315,18 +315,6 @@ func (c *Cluster) makeNode(ctx context.Context, nodeIdx int, cfg NodeConfig) (*N
 	return n, ch
 }
 
-// RemoveNodeData removes the given node's data directory.
-func (c *Cluster) RemoveNodeData(nodeIdx int) error {
-	dir := c.Cfg.PerNodeCfg[nodeIdx].DataDir
-	return os.RemoveAll(dir)
-}
-
-// ReplaceBinary replaces the binary that will be used for the specified node
-// after its next restart.
-func (c *Cluster) ReplaceBinary(nodeIdx int, bin string) {
-	c.Nodes[nodeIdx].Cfg.ExtraArgs[0] = bin
-}
-
 // waitForFullReplication waits for the cluster to be fully replicated.
 func (c *Cluster) waitForFullReplication() {
 	for i := 1; true; i++ {
@@ -346,7 +334,7 @@ func (c *Cluster) waitForFullReplication() {
 
 func (c *Cluster) isReplicated() (bool, string) {
 	db := c.Nodes[0].DB()
-	rows, err := db.Query(`SELECT range_id, start_key, end_key, ARRAY_LENGTH(replicas, 1) FROM crdb_internal.ranges`)
+	rows, err := db.Query(`SELECT range_id, start_key, end_key, array_length(replicas, 1) FROM crdb_internal.ranges`)
 	if err != nil {
 		// Versions <= 1.1 do not contain the crdb_internal table, which is what's used
 		// to determine whether a cluster has up-replicated. This is relevant for the
@@ -363,7 +351,7 @@ func (c *Cluster) isReplicated() (bool, string) {
 	done := true
 	for rows.Next() {
 		var rangeID int64
-		var startKey, endKey []byte
+		var startKey, endKey roachpb.Key
 		var numReplicas int
 		if err := rows.Scan(&rangeID, &startKey, &endKey, &numReplicas); err != nil {
 			log.Fatalf(context.Background(), "unable to scan range replicas: %s", err)
@@ -383,8 +371,8 @@ func (c *Cluster) isReplicated() (bool, string) {
 // UpdateZoneConfig updates the default zone config for the cluster.
 func (c *Cluster) UpdateZoneConfig(rangeMinBytes, rangeMaxBytes int64) {
 	zone := config.DefaultZoneConfig()
-	zone.RangeMinBytes = rangeMinBytes
-	zone.RangeMaxBytes = rangeMaxBytes
+	zone.RangeMinBytes = proto.Int64(rangeMinBytes)
+	zone.RangeMaxBytes = proto.Int64(rangeMaxBytes)
 
 	buf, err := protoutil.Marshal(&zone)
 	if err != nil {
@@ -547,6 +535,7 @@ func (n *Node) startAsyncInnerLocked(ctx context.Context, joins ...string) error
 	}
 	n.cmd = exec.Command(n.Cfg.ExtraArgs[0], args...)
 	n.cmd.Env = os.Environ()
+	n.cmd.Env = append(n.cmd.Env, "COCKROACH_SCAN_MAX_IDLE_TIME=5ms") // speed up rebalancing
 	n.cmd.Env = append(n.cmd.Env, n.Cfg.ExtraEnv...)
 
 	atomic.StoreInt32(&n.startSeq, n.seq.Next())
@@ -629,8 +618,9 @@ func (n *Node) StartAsync(ctx context.Context, joins ...string) <-chan error {
 	}
 
 	go func() {
-		n.waitUntilLive()
-		ch <- nil
+		// If the node does not become live within a minute, something is wrong and
+		// it's better not to hang indefinitely.
+		ch <- n.waitUntilLive(time.Minute)
 	}()
 
 	return ch
@@ -692,12 +682,15 @@ func (n *Node) AdvertiseAddr() (s string) {
 	return addr
 }
 
-func (n *Node) waitUntilLive() {
+func (n *Node) waitUntilLive(dur time.Duration) error {
 	ctx := context.Background()
+	closer := make(chan struct{})
+	defer time.AfterFunc(dur, func() { close(closer) }).Stop()
 	opts := retry.Options{
 		InitialBackoff: time.Millisecond,
 		MaxBackoff:     500 * time.Millisecond,
 		Multiplier:     2,
+		Closer:         closer,
 	}
 	for r := retry.Start(opts); r.Next(); {
 		var pid int
@@ -708,7 +701,7 @@ func (n *Node) waitUntilLive() {
 		n.Unlock()
 		if pid == 0 {
 			log.Info(ctx, "process already quit")
-			return
+			return nil
 		}
 
 		urlBytes, err := ioutil.ReadFile(n.listeningURLFile())
@@ -757,7 +750,7 @@ func (n *Node) waitUntilLive() {
 				`SELECT value FROM crdb_internal.node_runtime_info WHERE component='UI' AND field = 'URL'`,
 			).Scan(&uiStr); err != nil {
 				log.Info(ctx, err)
-				break
+				return nil
 			}
 
 			_, uiURL, err = portFromURL(uiStr)
@@ -766,8 +759,9 @@ func (n *Node) waitUntilLive() {
 				// TODO(tschottdorf): see above.
 			}
 		}
-		break
+		return nil
 	}
+	return errors.Errorf("node %+v was unable to join cluster within %s", n.Cfg, dur)
 }
 
 // Kill stops a node abruptly by sending it SIGKILL.
@@ -822,3 +816,6 @@ func (n *Node) Wait() *exec.ExitError {
 	ee, _ := n.waitErr.Load().(*exec.ExitError)
 	return ee
 }
+
+// Silence unused warning.
+var _ = (*Node)(nil).Wait

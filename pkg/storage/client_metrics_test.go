@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage_test
 
@@ -20,14 +16,17 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/pkg/errors"
-
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/pkg/errors"
+	"github.com/stretchr/testify/require"
 )
 
 func checkGauge(t *testing.T, id string, g *metric.Gauge, e int64) {
@@ -134,7 +133,7 @@ func verifyRocksDBStats(t *testing.T, s *storage.Store) {
 		gauge *metric.Gauge
 		min   int64
 	}{
-		{m.RdbBlockCacheHits, 4},
+		{m.RdbBlockCacheHits, 10},
 		{m.RdbBlockCacheMisses, 0},
 		{m.RdbBlockCacheUsage, 0},
 		{m.RdbBlockCachePinnedUsage, 0},
@@ -152,10 +151,96 @@ func verifyRocksDBStats(t *testing.T, s *storage.Store) {
 	}
 }
 
+// TestStoreResolveMetrics verifies that metrics related to intent resolution
+// are tracked properly.
+func TestStoreResolveMetrics(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	// First prevent rot that would result from adding fields without handling
+	// them everywhere.
+	{
+		act := fmt.Sprintf("%+v", result.Metrics{})
+		exp := "{LeaseRequestSuccess:0 LeaseRequestError:0 LeaseTransferSuccess:0 LeaseTransferError:0 ResolveCommit:0 ResolveAbort:0 ResolvePoison:0}"
+		if act != exp {
+			t.Errorf("need to update this test due to added fields: %v", act)
+		}
+	}
+
+	mtc := &multiTestContext{}
+	defer mtc.Stop()
+	mtc.Start(t, 1)
+
+	ctx := context.Background()
+
+	span := roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("b")}
+
+	txn := roachpb.MakeTransaction("foo", span.Key, roachpb.MinUserPriority, hlc.Timestamp{WallTime: 123}, 999)
+
+	const resolveCommitCount = int64(200)
+	const resolveAbortCount = int64(800)
+	const resolvePoisonCount = int64(2400)
+
+	var ba roachpb.BatchRequest
+	{
+		repl := mtc.stores[0].LookupReplica(keys.MustAddr(span.Key))
+		var err error
+		if ba.Replica, err = repl.GetReplicaDescriptor(); err != nil {
+			t.Fatal(err)
+		}
+		ba.RangeID = repl.RangeID
+	}
+
+	add := func(status roachpb.TransactionStatus, poison bool, n int64) {
+		for i := int64(0); i < n; i++ {
+			key := span.Key
+			endKey := span.EndKey
+			if i > n/2 {
+				req := &roachpb.ResolveIntentRangeRequest{
+					IntentTxn: txn.TxnMeta, Status: status, Poison: poison,
+				}
+				req.Key, req.EndKey = key, endKey
+				ba.Add(req)
+				continue
+			}
+			req := &roachpb.ResolveIntentRequest{
+				IntentTxn: txn.TxnMeta, Status: status, Poison: poison,
+			}
+			req.Key = key
+			ba.Add(req)
+		}
+	}
+
+	add(roachpb.COMMITTED, false, resolveCommitCount)
+	add(roachpb.ABORTED, false, resolveAbortCount)
+	add(roachpb.ABORTED, true, resolvePoisonCount)
+
+	if _, pErr := mtc.senders[0].Send(ctx, ba); pErr != nil {
+		t.Fatal(pErr)
+	}
+
+	if exp, act := resolveCommitCount, mtc.stores[0].Metrics().ResolveCommitCount.Count(); act < exp || act > exp+50 {
+		t.Errorf("expected around %d intent commits, saw %d", exp, act)
+	}
+	if exp, act := resolveAbortCount, mtc.stores[0].Metrics().ResolveAbortCount.Count(); act < exp || act > exp+50 {
+		t.Errorf("expected around %d intent aborts, saw %d", exp, act)
+	}
+	if exp, act := resolvePoisonCount, mtc.stores[0].Metrics().ResolvePoisonCount.Count(); act < exp || act > exp+50 {
+		t.Errorf("expected arounc %d abort span poisonings, saw %d", exp, act)
+	}
+}
+
 func TestStoreMetrics(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	mtc := &multiTestContext{}
+	storeCfg := storage.TestStoreConfig(nil /* clock */)
+	storeCfg.TestingKnobs.DisableMergeQueue = true
+	mtc := &multiTestContext{
+		storeConfig: &storeCfg,
+		// This test was written before the multiTestContext started creating many
+		// system ranges at startup, and hasn't been update to take that into
+		// account.
+		startWithSingleRange: true,
+	}
 	defer mtc.Stop()
 	mtc.Start(t, 3)
 
@@ -187,7 +272,7 @@ func TestStoreMetrics(t *testing.T) {
 	verifyStats(t, mtc, 0)
 
 	// Replicate the "right" range to the other stores.
-	replica := mtc.stores[0].LookupReplica(roachpb.RKey("z"), nil)
+	replica := mtc.stores[0].LookupReplica(roachpb.RKey("z"))
 	mtc.replicateRange(replica.RangeID, 1, 2)
 
 	// Verify stats on store1 after replication.
@@ -206,7 +291,9 @@ func TestStoreMetrics(t *testing.T) {
 	// Create a transaction statement that fails. Regression test for #4969.
 	if err := mtc.dbs[0].Txn(context.TODO(), func(ctx context.Context, txn *client.Txn) error {
 		b := txn.NewBatch()
-		b.CPut(dataKey, 7, 6)
+		var expVal roachpb.Value
+		expVal.SetInt(6)
+		b.CPut(dataKey, 7, &expVal)
 		return txn.Run(ctx, b)
 	}); err == nil {
 		t.Fatal("Expected transaction error, but none received")
@@ -227,8 +314,9 @@ func TestStoreMetrics(t *testing.T) {
 		return mtc.unreplicateRangeNonFatal(replica.RangeID, 0)
 	})
 
-	// Force GC Scan on store 0 in order to fully remove range.
-	mtc.stores[1].ForceReplicaGCScanAndProcess()
+	// Wait until we're sure that store 0 has successfully processed its removal.
+	require.NoError(t, mtc.waitForUnreplicated(replica.RangeID, 0))
+
 	mtc.waitForValues(roachpb.Key("z"), []int64{0, 5, 5})
 
 	// Verify range count is as expected.

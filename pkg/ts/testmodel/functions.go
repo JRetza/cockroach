@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package testmodel
 
@@ -31,11 +27,6 @@ func AggregateSum(data DataSeries) float64 {
 		total += dp.Value
 	}
 	return total
-}
-
-// AggregateLast returns the last value in the provided data series.
-func AggregateLast(data DataSeries) float64 {
-	return data[len(data)-1].Value
 }
 
 // AggregateAverage returns the average value of the points in the provided data
@@ -71,6 +62,34 @@ func AggregateMin(data DataSeries) float64 {
 	return min
 }
 
+// AggregateFirst returns the first value in the provided data series.
+func AggregateFirst(data DataSeries) float64 {
+	return data[0].Value
+}
+
+// AggregateLast returns the last value in the provided data series.
+func AggregateLast(data DataSeries) float64 {
+	return data[len(data)-1].Value
+}
+
+// AggregateVariance returns the variance of the provided data series. The returned
+// variance is the sample variance, not the population variance.
+func AggregateVariance(data DataSeries) float64 {
+	mean := 0.0
+	meanSquaredDist := 0.0
+	if len(data) < 2 {
+		return 0
+	}
+	for i, dp := range data {
+		// Welford's algorithm for computing variance.
+		delta := dp.Value - mean
+		mean += delta / float64(i+1)
+		delta2 := dp.Value - mean
+		meanSquaredDist += delta * delta2
+	}
+	return meanSquaredDist / float64(len(data))
+}
+
 // getAggFunction is a convenience method used to process an aggregator option
 // from our time series query protobuffer format.
 func getAggFunction(agg tspb.TimeSeriesQueryAggregator) aggFunc {
@@ -83,6 +102,12 @@ func getAggFunction(agg tspb.TimeSeriesQueryAggregator) aggFunc {
 		return AggregateMax
 	case tspb.TimeSeriesQueryAggregator_MIN:
 		return AggregateMin
+	case tspb.TimeSeriesQueryAggregator_FIRST:
+		return AggregateFirst
+	case tspb.TimeSeriesQueryAggregator_LAST:
+		return AggregateLast
+	case tspb.TimeSeriesQueryAggregator_VARIANCE:
+		return AggregateVariance
 	}
 
 	// The model should not be called with an invalid aggregator option.

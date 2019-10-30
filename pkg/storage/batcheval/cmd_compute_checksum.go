@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package batcheval
 
@@ -21,17 +17,27 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/storage/spanset"
+	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
 func init() {
-	RegisterCommand(roachpb.ComputeChecksum, DefaultDeclareKeys, ComputeChecksum)
+	RegisterCommand(roachpb.ComputeChecksum, declareKeysComputeChecksum, ComputeChecksum)
 }
 
-// Version numbers for Replica checksum computation. Requests fail unless the
-// versions are compatible.
+func declareKeysComputeChecksum(
+	*roachpb.RangeDescriptor, roachpb.Header, roachpb.Request, *spanset.SpanSet,
+) {
+	// Intentionally declare no keys, as ComputeChecksum does not need to be
+	// serialized with any other commands. It simply needs to be committed into
+	// the Raft log.
+}
+
+// Version numbers for Replica checksum computation. Requests silently no-op
+// unless the versions are compatible.
 const (
-	ReplicaChecksumVersion    = 2
+	ReplicaChecksumVersion    = 4
 	ReplicaChecksumGCInterval = time.Hour
 )
 
@@ -43,11 +49,17 @@ func ComputeChecksum(
 ) (result.Result, error) {
 	args := cArgs.Args.(*roachpb.ComputeChecksumRequest)
 
-	if args.Version != ReplicaChecksumVersion {
-		log.Errorf(ctx, "Incompatible versions: e=%d, v=%d", ReplicaChecksumVersion, args.Version)
-		return result.Result{}, nil
-	}
+	reply := resp.(*roachpb.ComputeChecksumResponse)
+	reply.ChecksumID = uuid.MakeV4()
+
 	var pd result.Result
-	pd.Replicated.ComputeChecksum = args
+	pd.Replicated.ComputeChecksum = &storagepb.ComputeChecksum{
+		Version:      args.Version,
+		ChecksumID:   reply.ChecksumID,
+		SaveSnapshot: args.Snapshot,
+		Mode:         args.Mode,
+		Checkpoint:   args.Checkpoint,
+		Terminate:    args.Terminate,
+	}
 	return pd, nil
 }

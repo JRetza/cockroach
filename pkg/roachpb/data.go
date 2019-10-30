@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package roachpb
 
@@ -26,14 +22,14 @@ import (
 	"math/rand"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
-	"unicode"
-
-	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -42,6 +38,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/pkg/errors"
+	"go.etcd.io/etcd/raft/raftpb"
 )
 
 var (
@@ -116,6 +114,11 @@ func (rk RKey) String() string {
 	return Key(rk).String()
 }
 
+// StringWithDirs - see Key.String.WithDirs.
+func (rk RKey) StringWithDirs(valDirs []encoding.Direction, maxLen int) string {
+	return Key(rk).StringWithDirs(valDirs, maxLen)
+}
+
 // Key is a custom type for a byte string in proto
 // messages which refer to Cockroach keys.
 type Key []byte
@@ -188,18 +191,28 @@ func (k Key) Compare(b Key) int {
 
 // String returns a string-formatted version of the key.
 func (k Key) String() string {
-	// Leave valDirs unspecified such that values are pretty-printed
-	// with default encoding direction.
-	return k.StringWithDirs(nil /* valDirs */)
+	return k.StringWithDirs(nil /* valDirs */, 0 /* maxLen */)
 }
 
 // StringWithDirs is the value encoding direction-aware version of String.
-func (k Key) StringWithDirs(valDirs []encoding.Direction) string {
+//
+// Args:
+// valDirs: The direction for the key's components, generally needed for correct
+// 	decoding. If nil, the values are pretty-printed with default encoding
+// 	direction.
+// maxLen: If not 0, only the first maxLen chars from the decoded key are
+//   returned, plus a "..." suffix.
+func (k Key) StringWithDirs(valDirs []encoding.Direction, maxLen int) string {
+	var s string
 	if PrettyPrintKey != nil {
-		return PrettyPrintKey(valDirs, k)
+		s = PrettyPrintKey(valDirs, k)
+	} else {
+		s = fmt.Sprintf("%q", []byte(k))
 	}
-
-	return fmt.Sprintf("%q", []byte(k))
+	if maxLen != 0 && len(s) > maxLen {
+		return s[0:maxLen] + "..."
+	}
+	return s
 }
 
 // Format implements the fmt.Formatter interface.
@@ -329,6 +342,15 @@ func (v Value) dataBytes() []byte {
 	return v.RawBytes[headerSize:]
 }
 
+func (v *Value) ensureRawBytes(size int) {
+	if cap(v.RawBytes) < size {
+		v.RawBytes = make([]byte, size)
+		return
+	}
+	v.RawBytes = v.RawBytes[:size]
+	v.setChecksum(checksumUninitialized)
+}
+
 // EqualData returns a boolean reporting whether the receiver and the parameter
 // have equivalent byte values. This check ignores the optional checksum field
 // in the Values' byte slices, returning only whether the Values have the same
@@ -343,7 +365,7 @@ func (v Value) EqualData(o Value) bool {
 
 // SetBytes sets the bytes and tag field of the receiver and clears the checksum.
 func (v *Value) SetBytes(b []byte) {
-	v.RawBytes = make([]byte, headerSize+len(b))
+	v.ensureRawBytes(headerSize + len(b))
 	copy(v.dataBytes(), b)
 	v.setTag(ValueType_BYTES)
 }
@@ -352,7 +374,7 @@ func (v *Value) SetBytes(b []byte) {
 // checksum. This is identical to SetBytes, but specialized for a string
 // argument.
 func (v *Value) SetString(s string) {
-	v.RawBytes = make([]byte, headerSize+len(s))
+	v.ensureRawBytes(headerSize + len(s))
 	copy(v.dataBytes(), s)
 	v.setTag(ValueType_BYTES)
 }
@@ -360,7 +382,7 @@ func (v *Value) SetString(s string) {
 // SetFloat encodes the specified float64 value into the bytes field of the
 // receiver, sets the tag and clears the checksum.
 func (v *Value) SetFloat(f float64) {
-	v.RawBytes = make([]byte, headerSize+8)
+	v.ensureRawBytes(headerSize + 8)
 	encoding.EncodeUint64Ascending(v.RawBytes[headerSize:headerSize], math.Float64bits(f))
 	v.setTag(ValueType_FLOAT)
 }
@@ -369,7 +391,7 @@ func (v *Value) SetFloat(f float64) {
 // receiver, sets the tag and clears the checksum.
 func (v *Value) SetBool(b bool) {
 	// 0 or 1 will always encode to a 1-byte long varint.
-	v.RawBytes = make([]byte, headerSize+1)
+	v.ensureRawBytes(headerSize + 1)
 	i := int64(0)
 	if b {
 		i = 1
@@ -381,7 +403,7 @@ func (v *Value) SetBool(b bool) {
 // SetInt encodes the specified int64 value into the bytes field of the
 // receiver, sets the tag and clears the checksum.
 func (v *Value) SetInt(i int64) {
-	v.RawBytes = make([]byte, headerSize+binary.MaxVarintLen64)
+	v.ensureRawBytes(headerSize + binary.MaxVarintLen64)
 	n := binary.PutVarint(v.RawBytes[headerSize:], i)
 	v.RawBytes = v.RawBytes[:headerSize+n]
 	v.setTag(ValueType_INT)
@@ -395,8 +417,7 @@ func (v *Value) SetProto(msg protoutil.Message) error {
 	// All of the Cockroach protos implement MarshalTo and Size. So we marshal
 	// directly into the Value.RawBytes field instead of allocating a separate
 	// []byte and copying.
-	size := msg.Size()
-	v.RawBytes = make([]byte, headerSize+size)
+	v.ensureRawBytes(headerSize + msg.Size())
 	if _, err := protoutil.MarshalToWithoutFuzzing(msg, v.RawBytes[headerSize:]); err != nil {
 		return err
 	}
@@ -413,8 +434,8 @@ func (v *Value) SetProto(msg protoutil.Message) error {
 // receiver, sets the tag and clears the checksum.
 func (v *Value) SetTime(t time.Time) {
 	const encodingSizeOverestimate = 11
-	v.RawBytes = make([]byte, headerSize, headerSize+encodingSizeOverestimate)
-	v.RawBytes = encoding.EncodeTimeAscending(v.RawBytes, t)
+	v.ensureRawBytes(headerSize + encodingSizeOverestimate)
+	v.RawBytes = encoding.EncodeTimeAscending(v.RawBytes[:headerSize], t)
 	v.setTag(ValueType_TIME)
 }
 
@@ -422,8 +443,8 @@ func (v *Value) SetTime(t time.Time) {
 // receiver, sets the tag and clears the checksum.
 func (v *Value) SetDuration(t duration.Duration) error {
 	var err error
-	v.RawBytes = make([]byte, headerSize, headerSize+encoding.EncodedDurationMaxLen)
-	v.RawBytes, err = encoding.EncodeDurationAscending(v.RawBytes, t)
+	v.ensureRawBytes(headerSize + encoding.EncodedDurationMaxLen)
+	v.RawBytes, err = encoding.EncodeDurationAscending(v.RawBytes[:headerSize], t)
 	if err != nil {
 		return err
 	}
@@ -431,12 +452,21 @@ func (v *Value) SetDuration(t duration.Duration) error {
 	return nil
 }
 
+// SetBitArray encodes the specified bit array value into the bytes field of the
+// receiver, sets the tag and clears the checksum.
+func (v *Value) SetBitArray(t bitarray.BitArray) {
+	words, _ := t.EncodingParts()
+	v.ensureRawBytes(headerSize + encoding.NonsortingUvarintMaxLen + 8*len(words))
+	v.RawBytes = encoding.EncodeUntaggedBitArrayValue(v.RawBytes[:headerSize], t)
+	v.setTag(ValueType_BITARRAY)
+}
+
 // SetDecimal encodes the specified decimal value into the bytes field of
 // the receiver using Gob encoding, sets the tag and clears the checksum.
 func (v *Value) SetDecimal(dec *apd.Decimal) error {
 	decSize := encoding.UpperBoundNonsortingDecimalSize(dec)
-	v.RawBytes = make([]byte, headerSize, headerSize+decSize)
-	v.RawBytes = encoding.EncodeNonsortingDecimal(v.RawBytes, dec)
+	v.ensureRawBytes(headerSize + decSize)
+	v.RawBytes = encoding.EncodeNonsortingDecimal(v.RawBytes[:headerSize], dec)
 	v.setTag(ValueType_DECIMAL)
 	return nil
 }
@@ -444,9 +474,7 @@ func (v *Value) SetDecimal(dec *apd.Decimal) error {
 // SetTuple sets the tuple bytes and tag field of the receiver and clears the
 // checksum.
 func (v *Value) SetTuple(data []byte) {
-	// TODO(dan): Reuse this and stop allocating on every SetTuple call. Same for
-	// the other SetFoos.
-	v.RawBytes = make([]byte, headerSize+len(data))
+	v.ensureRawBytes(headerSize + len(data))
 	copy(v.dataBytes(), data)
 	v.setTag(ValueType_TUPLE)
 }
@@ -545,6 +573,16 @@ func (v Value) GetDuration() (duration.Duration, error) {
 	return t, err
 }
 
+// GetBitArray decodes a bit array value from the bytes field of the receiver. If
+// the tag is not BITARRAY an error will be returned.
+func (v Value) GetBitArray() (bitarray.BitArray, error) {
+	if tag := v.GetTag(); tag != ValueType_BITARRAY {
+		return bitarray.BitArray{}, fmt.Errorf("value type is not %s: %s", ValueType_BITARRAY, tag)
+	}
+	_, t, err := encoding.DecodeUntaggedBitArrayValue(v.dataBytes())
+	return t, err
+}
+
 // GetDecimal decodes a decimal value from the bytes of the receiver. If the
 // tag is not DECIMAL an error will be returned.
 func (v Value) GetDecimal() (apd.Decimal, error) {
@@ -552,6 +590,16 @@ func (v Value) GetDecimal() (apd.Decimal, error) {
 		return apd.Decimal{}, fmt.Errorf("value type is not %s: %s", ValueType_DECIMAL, tag)
 	}
 	return encoding.DecodeNonsortingDecimal(v.dataBytes(), nil)
+}
+
+// GetDecimalInto decodes a decimal value from the bytes of the receiver,
+// writing it directly into the provided non-null apd.Decimal. If the
+// tag is not DECIMAL an error will be returned.
+func (v Value) GetDecimalInto(d *apd.Decimal) error {
+	if tag := v.GetTag(); tag != ValueType_DECIMAL {
+		return fmt.Errorf("value type is not %s: %s", ValueType_DECIMAL, tag)
+	}
+	return encoding.DecodeIntoNonsortingDecimal(d, v.dataBytes(), nil)
 }
 
 // GetTimeseries decodes an InternalTimeSeriesData value from the bytes
@@ -656,12 +704,17 @@ func (v Value) PrettyPrint() string {
 	case ValueType_BYTES:
 		var data []byte
 		data, err = v.GetBytes()
-		printable := len(bytes.TrimLeftFunc(data, unicode.IsPrint)) == 0
-		if printable {
+		if encoding.PrintableBytes(data) {
 			buf.WriteString(string(data))
 		} else {
+			buf.WriteString("0x")
 			buf.WriteString(hex.EncodeToString(data))
 		}
+	case ValueType_BITARRAY:
+		var data bitarray.BitArray
+		data, err = v.GetBitArray()
+		buf.WriteByte('B')
+		data.Format(&buf)
 	case ValueType_TIME:
 		var t time.Time
 		t, err = v.GetTime()
@@ -673,7 +726,7 @@ func (v Value) PrettyPrint() string {
 	case ValueType_DURATION:
 		var d duration.Duration
 		d, err = v.GetDuration()
-		buf.WriteString(d.String())
+		buf.WriteString(d.StringNanos())
 	default:
 		err = errors.Errorf("unknown tag: %s", t)
 	}
@@ -684,12 +737,14 @@ func (v Value) PrettyPrint() string {
 	return buf.String()
 }
 
-const (
-	// MinTxnPriority is the minimum allowed txn priority.
-	MinTxnPriority = 0
-	// MaxTxnPriority is the maximum allowed txn priority.
-	MaxTxnPriority = math.MaxInt32
-)
+// IsFinalized determines whether the transaction status is in a finalized
+// state. A finalized state is terminal, meaning that once a transaction
+// enters one of these states, it will never leave it.
+func (ts TransactionStatus) IsFinalized() bool {
+	return ts == COMMITTED || ts == ABORTED
+}
+
+var _ log.SafeMessager = Transaction{}
 
 // MakeTransaction creates a new transaction. The transaction key is
 // composed using the specified baseKey (for locality with data
@@ -702,14 +757,9 @@ const (
 // baseKey can be nil, in which case it will be set when sending the first
 // write.
 func MakeTransaction(
-	name string,
-	baseKey Key,
-	userPriority UserPriority,
-	isolation enginepb.IsolationType,
-	now hlc.Timestamp,
-	maxOffsetNs int64,
+	name string, baseKey Key, userPriority UserPriority, now hlc.Timestamp, maxOffsetNs int64,
 ) Transaction {
-	u := uuid.MakeV4()
+	u := uuid.FastMakeV4()
 	var maxTS hlc.Timestamp
 	if maxOffsetNs == timeutil.ClocklessMaxOffset {
 		// For clockless reads, use the largest possible maxTS. This means we'll
@@ -722,18 +772,40 @@ func MakeTransaction(
 
 	return Transaction{
 		TxnMeta: enginepb.TxnMeta{
-			Key:       baseKey,
-			ID:        u,
-			Isolation: isolation,
-			Timestamp: now,
-			Priority:  MakePriority(userPriority),
-			Sequence:  1,
+			Key:          baseKey,
+			ID:           u,
+			Timestamp:    now,
+			MinTimestamp: now,
+			Priority:     MakePriority(userPriority),
+			Sequence:     0, // 1-indexed, incremented before each Request
 		},
 		Name:          name,
 		LastHeartbeat: now,
 		OrigTimestamp: now,
 		MaxTimestamp:  maxTS,
 	}
+}
+
+// MakeTxnCoordMeta creates a new transaction coordinator meta for the given
+// transaction.
+func MakeTxnCoordMeta(txn Transaction) TxnCoordMeta {
+	return TxnCoordMeta{Txn: txn}
+}
+
+// StripRootToLeaf strips out all information that is unnecessary to communicate
+// to leaf transactions.
+func (meta *TxnCoordMeta) StripRootToLeaf() *TxnCoordMeta {
+	meta.CommandCount = 0
+	meta.RefreshReads = nil
+	meta.RefreshWrites = nil
+	return meta
+}
+
+// StripLeafToRoot strips out all information that is unnecessary to communicate
+// back to the root transaction.
+func (meta *TxnCoordMeta) StripLeafToRoot() *TxnCoordMeta {
+	meta.InFlightWrites = nil
+	return meta
 }
 
 // LastActive returns the last timestamp at which client activity definitely
@@ -746,27 +818,16 @@ func (t Transaction) LastActive() hlc.Timestamp {
 	return ts
 }
 
-// Clone creates a copy of the given transaction. The copy is "mostly" deep,
-// but does share pieces of memory with the original such as Key, ID and the
-// keys with the intent spans.
-func (t Transaction) Clone() Transaction {
-	mt := t.ObservedTimestamps
-	if mt != nil {
-		t.ObservedTimestamps = make([]ObservedTimestamp, len(mt))
-		copy(t.ObservedTimestamps, mt)
-	}
-	// Note that we're not cloning the span keys under the assumption that the
-	// keys themselves are not mutable.
-	t.Intents = append([]Span(nil), t.Intents...)
-	return t
+// Clone creates a copy of the given transaction. The copy is shallow because
+// none of the references held by a transaction allow interior mutability.
+func (t Transaction) Clone() *Transaction {
+	return &t
 }
 
 // AssertInitialized crashes if the transaction is not initialized.
 func (t *Transaction) AssertInitialized(ctx context.Context) {
-	if t.ID == (uuid.UUID{}) ||
-		t.OrigTimestamp == (hlc.Timestamp{}) ||
-		t.Timestamp == (hlc.Timestamp{}) {
-		log.Fatalf(ctx, "uninitialized txn: %s", t)
+	if t.ID == (uuid.UUID{}) || t.Timestamp == (hlc.Timestamp{}) {
+		log.Fatalf(ctx, "uninitialized txn: %s", *t)
 	}
 }
 
@@ -781,7 +842,7 @@ func (t *Transaction) AssertInitialized(ctx context.Context) {
 // If userPriority is less than or equal to MinUserPriority, returns
 // MinTxnPriority; if greater than or equal to MaxUserPriority, returns
 // MaxTxnPriority. If userPriority is 0, returns NormalUserPriority.
-func MakePriority(userPriority UserPriority) int32 {
+func MakePriority(userPriority UserPriority) enginepb.TxnPriority {
 	// A currently undocumented feature allows an explicit priority to
 	// be set by specifying priority < 1. The explicit priority is
 	// simply -userPriority in this case. This is hacky, but currently
@@ -790,13 +851,13 @@ func MakePriority(userPriority UserPriority) int32 {
 		if -userPriority > UserPriority(math.MaxInt32) {
 			panic(fmt.Sprintf("cannot set explicit priority to a value less than -%d", math.MaxInt32))
 		}
-		return int32(-userPriority)
+		return enginepb.TxnPriority(-userPriority)
 	} else if userPriority == 0 {
 		userPriority = NormalUserPriority
 	} else if userPriority >= MaxUserPriority {
-		return MaxTxnPriority
+		return enginepb.MaxTxnPriority
 	} else if userPriority <= MinUserPriority {
-		return MinTxnPriority
+		return enginepb.MinTxnPriority
 	}
 
 	// We generate random values which are biased according to priorities. If v1 is a value
@@ -847,12 +908,12 @@ func MakePriority(userPriority UserPriority) int32 {
 	// For userPriority=MaxUserPriority, the probability of overflow is 0.7%.
 	// For userPriority=(MaxUserPriority/2), the probability of overflow is 0.005%.
 	val = (val / (5 * float64(MaxUserPriority))) * math.MaxInt32
-	if val <= MinTxnPriority {
-		return MinTxnPriority + 1
-	} else if val >= MaxTxnPriority {
-		return MaxTxnPriority - 1
+	if val < float64(enginepb.MinTxnPriority+1) {
+		return enginepb.MinTxnPriority + 1
+	} else if val > float64(enginepb.MaxTxnPriority-1) {
+		return enginepb.MaxTxnPriority - 1
 	}
-	return int32(val)
+	return enginepb.TxnPriority(val)
 }
 
 // Restart reconfigures a transaction for restart. The epoch is
@@ -860,7 +921,7 @@ func MakePriority(userPriority UserPriority) int32 {
 // transaction on restart is set to the maximum of the transaction's
 // timestamp and the specified timestamp.
 func (t *Transaction) Restart(
-	userPriority UserPriority, upgradePriority int32, timestamp hlc.Timestamp,
+	userPriority UserPriority, upgradePriority enginepb.TxnPriority, timestamp hlc.Timestamp,
 ) {
 	t.BumpEpoch()
 	if t.Timestamp.Less(timestamp) {
@@ -874,9 +935,12 @@ func (t *Transaction) Restart(
 	// - the conflicting transaction's upgradePriority
 	t.UpgradePriority(MakePriority(userPriority))
 	t.UpgradePriority(upgradePriority)
-	t.WriteTooOld = false
-	t.RetryOnPush = false
+	// Reset all epoch-scoped state.
 	t.Sequence = 0
+	t.WriteTooOld = false
+	t.OrigTimestampWasObserved = false
+	t.IntentSpans = nil
+	t.InFlightWrites = nil
 }
 
 // BumpEpoch increments the transaction's epoch, allowing for an in-place
@@ -884,7 +948,7 @@ func (t *Transaction) Restart(
 // epochs.
 func (t *Transaction) BumpEpoch() {
 	if t.Epoch == 0 {
-		t.EpochZeroTimestamp = t.OrigTimestamp
+		t.DeprecatedMinTimestamp = t.OrigTimestamp
 	}
 	t.Epoch++
 }
@@ -892,13 +956,18 @@ func (t *Transaction) BumpEpoch() {
 // InclusiveTimeBounds returns start and end timestamps such that all intents written as
 // part of this transaction have a timestamp in the interval [start, end].
 func (t *Transaction) InclusiveTimeBounds() (hlc.Timestamp, hlc.Timestamp) {
-	min := t.OrigTimestamp
+	min := t.MinTimestamp
 	max := t.Timestamp
-	if t.Epoch != 0 {
-		if min.Less(t.EpochZeroTimestamp) {
-			panic(fmt.Sprintf("orig timestamp %s less than epoch zero %s", min, t.EpochZeroTimestamp))
+	if min.IsEmpty() {
+		// Backwards compatibility with pre-v19.2 nodes.
+		// TODO(nvanbenschoten): Remove in v20.1.
+		min = t.OrigTimestamp
+		if t.Epoch != 0 && t.DeprecatedMinTimestamp != (hlc.Timestamp{}) {
+			if min.Less(t.DeprecatedMinTimestamp) {
+				panic(fmt.Sprintf("orig timestamp %s less than deprecated min timestamp %s", min, t.DeprecatedMinTimestamp))
+			}
+			min = t.DeprecatedMinTimestamp
 		}
-		min = t.EpochZeroTimestamp
 	}
 	return min, max
 }
@@ -912,79 +981,118 @@ func (t *Transaction) Update(o *Transaction) {
 	}
 	o.AssertInitialized(context.TODO())
 	if t.ID == (uuid.UUID{}) {
-		*t = o.Clone()
+		*t = *o
+		return
+	} else if t.ID != o.ID {
+		log.Fatalf(context.Background(), "updating txn %s with different txn %s", t.String(), o.String())
 		return
 	}
 	if len(t.Key) == 0 {
 		t.Key = o.Key
 	}
-	if o.Status != PENDING {
-		t.Status = o.Status
-	}
 
-	// If the epoch or refreshed timestamp move forward, overwrite
-	// WriteTooOld and RetryOnPush, otherwise the flags are cumulative.
-	if t.Epoch < o.Epoch || t.RefreshedTimestamp.Less(o.RefreshedTimestamp) {
-		t.WriteTooOld = o.WriteTooOld
-		t.RetryOnPush = o.RetryOnPush
-		t.OrigTimestampWasObserved = o.OrigTimestampWasObserved
-	} else {
-		t.WriteTooOld = t.WriteTooOld || o.WriteTooOld
-		t.RetryOnPush = t.RetryOnPush || o.RetryOnPush
-		t.OrigTimestampWasObserved = t.OrigTimestampWasObserved || o.OrigTimestampWasObserved
-	}
-
+	// Update epoch-scoped state, depending on the two transactions' epochs.
 	if t.Epoch < o.Epoch {
+		// Replace all epoch-scoped state.
 		t.Epoch = o.Epoch
+		t.Status = o.Status
+		t.WriteTooOld = o.WriteTooOld
+		t.OrigTimestampWasObserved = o.OrigTimestampWasObserved
+		t.Sequence = o.Sequence
+		t.IntentSpans = o.IntentSpans
+		t.InFlightWrites = o.InFlightWrites
+	} else if t.Epoch == o.Epoch {
+		// Forward all epoch-scoped state.
+		switch t.Status {
+		case PENDING:
+			t.Status = o.Status
+		case STAGING:
+			if o.Status != PENDING {
+				t.Status = o.Status
+			}
+		case ABORTED:
+			if o.Status == COMMITTED {
+				log.Warningf(context.Background(), "updating ABORTED txn %s with COMMITTED txn %s", t.String(), o.String())
+			}
+		case COMMITTED:
+			// Nothing to do.
+		}
+
+		// If the refreshed timestamp move forward, overwrite
+		// WriteTooOld, otherwise the flags are cumulative.
+		if t.RefreshedTimestamp.Less(o.RefreshedTimestamp) {
+			t.WriteTooOld = o.WriteTooOld
+			t.OrigTimestampWasObserved = o.OrigTimestampWasObserved
+		} else {
+			t.WriteTooOld = t.WriteTooOld || o.WriteTooOld
+			t.OrigTimestampWasObserved = t.OrigTimestampWasObserved || o.OrigTimestampWasObserved
+		}
+
+		if t.Sequence < o.Sequence {
+			t.Sequence = o.Sequence
+		}
+		if len(o.IntentSpans) > 0 {
+			t.IntentSpans = o.IntentSpans
+		}
+		if len(o.InFlightWrites) > 0 {
+			t.InFlightWrites = o.InFlightWrites
+		}
+	} else /* t.Epoch > o.Epoch */ {
+		// Ignore epoch-specific state from previous epoch.
+		if o.Status == COMMITTED {
+			log.Warningf(context.Background(), "updating txn %s with COMMITTED txn at earlier epoch %s", t.String(), o.String())
+		}
 	}
 
+	// Forward each of the transaction timestamps.
 	t.Timestamp.Forward(o.Timestamp)
 	t.LastHeartbeat.Forward(o.LastHeartbeat)
 	t.OrigTimestamp.Forward(o.OrigTimestamp)
 	t.MaxTimestamp.Forward(o.MaxTimestamp)
 	t.RefreshedTimestamp.Forward(o.RefreshedTimestamp)
 
+	// On update, set lower bound timestamps to the minimum seen by either txn.
+	// These shouldn't differ unless one of them is empty, but we're careful
+	// anyway.
+	if t.MinTimestamp == (hlc.Timestamp{}) {
+		t.MinTimestamp = o.MinTimestamp
+	} else if o.MinTimestamp != (hlc.Timestamp{}) {
+		t.MinTimestamp.Backward(o.MinTimestamp)
+	}
+	if t.DeprecatedMinTimestamp == (hlc.Timestamp{}) {
+		t.DeprecatedMinTimestamp = o.DeprecatedMinTimestamp
+	} else if o.DeprecatedMinTimestamp != (hlc.Timestamp{}) {
+		t.DeprecatedMinTimestamp.Backward(o.DeprecatedMinTimestamp)
+	}
+
 	// Absorb the collected clock uncertainty information.
 	for _, v := range o.ObservedTimestamps {
 		t.UpdateObservedTimestamp(v.NodeID, v.Timestamp)
 	}
+
+	// Ratchet the transaction priority.
 	t.UpgradePriority(o.Priority)
-
-	// We can't assert against regression here since it can actually happen
-	// that we update from a transaction which isn't Writing.
-	t.Writing = t.Writing || o.Writing
-
-	if t.Sequence < o.Sequence {
-		t.Sequence = o.Sequence
-	}
-	if len(o.Intents) > 0 {
-		t.Intents = o.Intents
-	}
-	// On update, set epoch zero timestamp to the minimum seen by either txn.
-	if o.EpochZeroTimestamp != (hlc.Timestamp{}) {
-		if t.EpochZeroTimestamp == (hlc.Timestamp{}) || o.EpochZeroTimestamp.Less(t.EpochZeroTimestamp) {
-			t.EpochZeroTimestamp = o.EpochZeroTimestamp
-		}
-	}
 }
 
 // UpgradePriority sets transaction priority to the maximum of current
 // priority and the specified minPriority. The exception is if the
 // current priority is set to the minimum, in which case the minimum
 // is preserved.
-func (t *Transaction) UpgradePriority(minPriority int32) {
-	if minPriority > t.Priority && t.Priority != MinTxnPriority {
+func (t *Transaction) UpgradePriority(minPriority enginepb.TxnPriority) {
+	if minPriority > t.Priority && t.Priority != enginepb.MinTxnPriority {
 		t.Priority = minPriority
 	}
 }
 
-// IsSerializable returns whether this transaction uses serializable
-// isolation.
-func (t *Transaction) IsSerializable() bool {
-	return t != nil && t.Isolation == enginepb.SERIALIZABLE
+// IsWriting returns whether the transaction has begun writing intents.
+// This method will never return true for a read-only transaction.
+func (t *Transaction) IsWriting() bool {
+	return t.Key != nil
 }
 
 // String formats transaction into human readable string.
+//
+// NOTE: When updating String(), you probably want to also update SafeMessage().
 func (t Transaction) String() string {
 	var buf bytes.Buffer
 	// Compute priority as a floating point number from 0-100 for readability.
@@ -992,12 +1100,39 @@ func (t Transaction) String() string {
 	if len(t.Name) > 0 {
 		fmt.Fprintf(&buf, "%q ", t.Name)
 	}
-	fmt.Fprintf(&buf, "id=%s key=%s rw=%t pri=%.8f iso=%s stat=%s epo=%d "+
-		"ts=%s orig=%s max=%s wto=%t rop=%t seq=%d",
-		t.Short(), Key(t.Key), t.Writing, floatPri, t.Isolation, t.Status, t.Epoch, t.Timestamp,
-		t.OrigTimestamp, t.MaxTimestamp, t.WriteTooOld, t.RetryOnPush, t.Sequence)
-	if ni := len(t.Intents); t.Status != PENDING && ni > 0 {
+	fmt.Fprintf(&buf, "id=%s key=%s rw=%t pri=%.8f stat=%s epo=%d "+
+		"ts=%s orig=%s min=%s max=%s wto=%t seq=%d",
+		t.Short(), Key(t.Key), t.IsWriting(), floatPri, t.Status, t.Epoch, t.Timestamp,
+		t.OrigTimestamp, t.MinTimestamp, t.MaxTimestamp, t.WriteTooOld, t.Sequence)
+	if ni := len(t.IntentSpans); t.Status != PENDING && ni > 0 {
 		fmt.Fprintf(&buf, " int=%d", ni)
+	}
+	if nw := len(t.InFlightWrites); t.Status != PENDING && nw > 0 {
+		fmt.Fprintf(&buf, " ifw=%d", nw)
+	}
+	return buf.String()
+}
+
+// SafeMessage implements the SafeMessager interface.
+//
+// This method should be kept largely synchronized with String(), except that it
+// can't include sensitive info (e.g. the transaction key).
+func (t Transaction) SafeMessage() string {
+	var buf bytes.Buffer
+	// Compute priority as a floating point number from 0-100 for readability.
+	floatPri := 100 * float64(t.Priority) / float64(math.MaxInt32)
+	if len(t.Name) > 0 {
+		fmt.Fprintf(&buf, "%q ", t.Name)
+	}
+	fmt.Fprintf(&buf, "id=%s rw=%t pri=%.8f stat=%s epo=%d "+
+		"ts=%s orig=%s min=%s max=%s wto=%t seq=%d",
+		t.Short(), t.IsWriting(), floatPri, t.Status, t.Epoch, t.Timestamp,
+		t.OrigTimestamp, t.MinTimestamp, t.MaxTimestamp, t.WriteTooOld, t.Sequence)
+	if ni := len(t.IntentSpans); t.Status != PENDING && ni > 0 {
+		fmt.Fprintf(&buf, " int=%d", ni)
+	}
+	if nw := len(t.InFlightWrites); t.Status != PENDING && nw > 0 {
+		fmt.Fprintf(&buf, " ifw=%d", nw)
 	}
 	return buf.String()
 }
@@ -1031,9 +1166,34 @@ func (t *Transaction) UpdateObservedTimestamp(nodeID NodeID, maxTS hlc.Timestamp
 // given node's clock during the transaction. The returned boolean is false if
 // no observation about the requested node was found. Otherwise, MaxTimestamp
 // can be lowered to the returned timestamp when reading from nodeID.
-func (t Transaction) GetObservedTimestamp(nodeID NodeID) (hlc.Timestamp, bool) {
+func (t *Transaction) GetObservedTimestamp(nodeID NodeID) (hlc.Timestamp, bool) {
 	s := observedTimestampSlice(t.ObservedTimestamps)
 	return s.get(nodeID)
+}
+
+// AsRecord returns a TransactionRecord object containing only the subset of
+// fields from the receiver that must be persisted in the transaction record.
+func (t *Transaction) AsRecord() TransactionRecord {
+	var tr TransactionRecord
+	tr.TxnMeta = t.TxnMeta
+	tr.Status = t.Status
+	tr.LastHeartbeat = t.LastHeartbeat
+	tr.IntentSpans = t.IntentSpans
+	tr.InFlightWrites = t.InFlightWrites
+	return tr
+}
+
+// AsTransaction returns a Transaction object containing populated fields for
+// state in the transaction record and empty fields for state omitted from the
+// transaction record.
+func (tr *TransactionRecord) AsTransaction() Transaction {
+	var t Transaction
+	t.TxnMeta = tr.TxnMeta
+	t.Status = tr.Status
+	t.LastHeartbeat = tr.LastHeartbeat
+	t.IntentSpans = tr.IntentSpans
+	t.InFlightWrites = tr.InFlightWrites
+	return t
 }
 
 // PrepareTransactionForRetry returns a new Transaction to be used for retrying
@@ -1061,7 +1221,7 @@ func PrepareTransactionForRetry(
 		log.Fatalf(ctx, "missing txn for retryable error: %s", pErr)
 	}
 
-	txn := pErr.GetTxn().Clone()
+	txn := *pErr.GetTxn()
 	aborted := false
 	switch tErr := pErr.GetDetail().(type) {
 	case *TransactionAbortedError:
@@ -1071,23 +1231,17 @@ func PrepareTransactionForRetry(
 		// TODO(andrei): Should we preserve the ObservedTimestamps across the
 		// restart?
 		errTxnPri := txn.Priority
-		// The OrigTimestamp of the new transaction is going to be the greater of
-		// two the current clock and the timestamp received in the error.
-		// TODO(andrei): Can we just use the clock since it has already been
-		// advanced to at least the error's timestamp?
+		// Start the new transaction at the current time from the local clock.
+		// The local hlc should have been advanced to at least the error's
+		// timestamp already.
 		now := clock.Now()
-		newTxnTimestamp := now
-		if newTxnTimestamp.Less(txn.Timestamp) {
-			newTxnTimestamp = txn.Timestamp
-		}
 		txn = MakeTransaction(
 			txn.Name,
 			nil, // baseKey
 			// We have errTxnPri, but this wants a UserPriority. So we're going to
 			// overwrite the priority below.
 			NormalUserPriority,
-			txn.Isolation,
-			newTxnTimestamp,
+			now,
 			clock.MaxOffset().Nanoseconds(),
 		)
 		// Use the priority communicated back by the server.
@@ -1111,6 +1265,9 @@ func PrepareTransactionForRetry(
 		log.Fatalf(ctx, "invalid retryable err (%T): %s", pErr.GetDetail(), pErr)
 	}
 	if !aborted {
+		if txn.Status.IsFinalized() {
+			log.Fatalf(ctx, "transaction unexpectedly finalized in (%T): %s", pErr.GetDetail(), pErr)
+		}
 		txn.Restart(pri, txn.Priority, txn.Timestamp)
 	}
 	return txn
@@ -1124,7 +1281,7 @@ func CanTransactionRetryAtRefreshedTimestamp(
 	ctx context.Context, pErr *Error,
 ) (bool, *Transaction) {
 	txn := pErr.GetTxn()
-	if !txn.IsSerializable() || txn.OrigTimestampWasObserved {
+	if txn == nil || txn.OrigTimestampWasObserved {
 		return false, nil
 	}
 	timestamp := txn.Timestamp
@@ -1134,6 +1291,11 @@ func CanTransactionRetryAtRefreshedTimestamp(
 			return false, nil
 		}
 	case *WriteTooOldError:
+		// TODO(andrei): Chances of success for on write-too-old conditions might be
+		// usually small: if our txn previously read the key that generated this
+		// error, obviously the refresh will fail. It might be worth trying to
+		// detect these cases and save the futile attempt; we'd need to have access
+		// to the key that generated the error.
 		timestamp.Forward(writeTooOldRetryTimestamp(txn, err))
 	case *ReadWithinUncertaintyIntervalError:
 		timestamp.Forward(
@@ -1147,7 +1309,7 @@ func CanTransactionRetryAtRefreshedTimestamp(
 	newTxn.RefreshedTimestamp.Forward(newTxn.Timestamp)
 	newTxn.WriteTooOld = false
 
-	return true, &newTxn
+	return true, newTxn
 }
 
 func readWithinUncertaintyIntervalRetryTimestamp(
@@ -1160,7 +1322,7 @@ func readWithinUncertaintyIntervalRetryTimestamp(
 	if !ok {
 		log.Fatalf(ctx,
 			"missing observed timestamp for node %d found on uncertainty restart. "+
-				"err: %s. txn: %s. Observed timestamps: %s",
+				"err: %s. txn: %s. Observed timestamps: %v",
 			origin, err, txn, txn.ObservedTimestamps)
 	}
 	// Also forward by the existing timestamp.
@@ -1172,10 +1334,249 @@ func writeTooOldRetryTimestamp(txn *Transaction, err *WriteTooOldError) hlc.Time
 	return err.ActualTimestamp
 }
 
+// Replicas returns all of the replicas present in the descriptor after this
+// trigger applies.
+func (crt ChangeReplicasTrigger) Replicas() []ReplicaDescriptor {
+	if crt.Desc != nil {
+		return crt.Desc.Replicas().All()
+	}
+	return crt.DeprecatedUpdatedReplicas
+}
+
+// NextReplicaID returns the next replica id to use after this trigger applies.
+func (crt ChangeReplicasTrigger) NextReplicaID() ReplicaID {
+	if crt.Desc != nil {
+		return crt.Desc.NextReplicaID
+	}
+	return crt.DeprecatedNextReplicaID
+}
+
+// ConfChange returns the configuration change described by the trigger.
+func (crt ChangeReplicasTrigger) ConfChange(encodedCtx []byte) (raftpb.ConfChangeI, error) {
+	return confChangeImpl(crt, encodedCtx)
+}
+
+func (crt ChangeReplicasTrigger) alwaysV2() bool {
+	// NB: we can return true in 20.1, but we don't win anything unless
+	// we are actively trying to migrate out of V1 membership changes, which
+	// could modestly simplify small areas of our codebase.
+	return false
+}
+
+// confChangeImpl is the implementation of (ChangeReplicasTrigger).ConfChange
+// narrowed down to the inputs it actually needs for better testability.
+func confChangeImpl(
+	crt interface {
+		Added() []ReplicaDescriptor
+		Removed() []ReplicaDescriptor
+		Replicas() []ReplicaDescriptor
+		alwaysV2() bool
+	},
+	encodedCtx []byte,
+) (raftpb.ConfChangeI, error) {
+	added, removed, replicas := crt.Added(), crt.Removed(), crt.Replicas()
+
+	var sl []raftpb.ConfChangeSingle
+
+	checkExists := func(in ReplicaDescriptor) error {
+		for _, rDesc := range replicas {
+			if rDesc.ReplicaID == in.ReplicaID {
+				if a, b := in.GetType(), rDesc.GetType(); a != b {
+					return errors.Errorf("have %s, but descriptor has %s", in, rDesc)
+				}
+				return nil
+			}
+		}
+		return errors.Errorf("%s missing from descriptors %v", in, replicas)
+	}
+	checkNotExists := func(in ReplicaDescriptor) error {
+		for _, rDesc := range replicas {
+			if rDesc.ReplicaID == in.ReplicaID {
+				return errors.Errorf("%s must no longer be present in descriptor", in)
+			}
+		}
+		return nil
+	}
+
+	for _, rDesc := range added {
+		// The incoming descriptor must also be present in the set of all
+		// replicas, which is ultimately the authoritative one because that's
+		// what's written to the KV store.
+		if err := checkExists(rDesc); err != nil {
+			return nil, err
+		}
+
+		var changeType raftpb.ConfChangeType
+		switch rDesc.GetType() {
+		case VOTER_FULL:
+			// We're adding a new voter.
+			changeType = raftpb.ConfChangeAddNode
+		case VOTER_INCOMING:
+			// We're adding a voter, but will transition into a joint config
+			// first.
+			changeType = raftpb.ConfChangeAddNode
+		case LEARNER:
+			// We're adding a new learner. Note that we're guaranteed by
+			// virtue of the upstream ChangeReplicas txn that this learner
+			// is not currently a voter. If we wanted to support that (i.e.
+			// demotions) we'd need to introduce a new
+			// replica type VOTER_DEMOTING for that purpose.
+			changeType = raftpb.ConfChangeAddLearnerNode
+		default:
+			return nil, errors.Errorf("can't add replica in state %v", rDesc.GetType())
+		}
+		sl = append(sl, raftpb.ConfChangeSingle{
+			Type:   changeType,
+			NodeID: uint64(rDesc.ReplicaID),
+		})
+	}
+
+	for _, rDesc := range removed {
+		switch rDesc.GetType() {
+		case VOTER_OUTGOING:
+			// If a voter is removed through joint consensus, it will
+			// be turned into an outgoing voter first.
+			if err := checkExists(rDesc); err != nil {
+				return nil, err
+			}
+		case VOTER_FULL, LEARNER:
+			// A learner or full voter can't be in the desc after.
+			if err := checkNotExists(rDesc); err != nil {
+				return nil, err
+			}
+		default:
+			return nil, errors.Errorf("can't remove replica in state %v", rDesc.GetType())
+		}
+		sl = append(sl, raftpb.ConfChangeSingle{
+			Type:   raftpb.ConfChangeRemoveNode,
+			NodeID: uint64(rDesc.ReplicaID),
+		})
+	}
+
+	// Check whether we're entering a joint state. This is the case precisely when
+	// the resulting descriptors tells us that this is the case. Note that we've
+	// made sure above that all of the additions/removals are in tune with that
+	// descriptor already.
+	var enteringJoint bool
+	for _, rDesc := range replicas {
+		switch rDesc.GetType() {
+		case VOTER_INCOMING, VOTER_OUTGOING:
+			enteringJoint = true
+		default:
+		}
+	}
+	wantLeaveJoint := len(added)+len(removed) == 0
+	if !enteringJoint {
+		if len(added)+len(removed) > 1 {
+			return nil, errors.Errorf("change requires joint consensus")
+		}
+	} else if wantLeaveJoint {
+		return nil, errors.Errorf("descriptor enters joint state, but trigger is requesting to leave one")
+	}
+
+	var cc raftpb.ConfChangeI
+
+	if enteringJoint || crt.alwaysV2() {
+		// V2 membership changes, which allow atomic replication changes. We
+		// track the joint state in the range descriptor and thus we need to be
+		// in charge of when to leave the joint state.
+		transition := raftpb.ConfChangeTransitionJointExplicit
+		if !enteringJoint {
+			// If we're using V2 just to avoid V1 (and not because we actually
+			// have a change that requires V2), then use an auto transition
+			// which skips the joint state. This is necessary: our descriptor
+			// says we're not supposed to go through one.
+			transition = raftpb.ConfChangeTransitionAuto
+		}
+		cc = raftpb.ConfChangeV2{
+			Transition: transition,
+			Changes:    sl,
+			Context:    encodedCtx,
+		}
+	} else if wantLeaveJoint {
+		// Transitioning out of a joint config.
+		cc = raftpb.ConfChangeV2{
+			Context: encodedCtx,
+		}
+	} else {
+		// Legacy path with exactly one change.
+		cc = raftpb.ConfChange{
+			Type:    sl[0].Type,
+			NodeID:  sl[0].NodeID,
+			Context: encodedCtx,
+		}
+	}
+	return cc, nil
+}
+
 var _ fmt.Stringer = &ChangeReplicasTrigger{}
 
 func (crt ChangeReplicasTrigger) String() string {
-	return fmt.Sprintf("%s(%s): updated=%s next=%d", crt.ChangeType, crt.Replica, crt.UpdatedReplicas, crt.NextReplicaID)
+	var nextReplicaID ReplicaID
+	var afterReplicas []ReplicaDescriptor
+	added, removed := crt.Added(), crt.Removed()
+	if crt.Desc != nil {
+		nextReplicaID = crt.Desc.NextReplicaID
+		// NB: we don't want to mutate InternalReplicas, so we don't call
+		// .Replicas()
+		//
+		// TODO(tbg): revisit after #39489 is merged.
+		afterReplicas = crt.Desc.InternalReplicas
+	} else {
+		nextReplicaID = crt.DeprecatedNextReplicaID
+		afterReplicas = crt.DeprecatedUpdatedReplicas
+	}
+	var chgS strings.Builder
+	cc, err := crt.ConfChange(nil)
+	if err != nil {
+		fmt.Fprintf(&chgS, "<malformed ChangeReplicasTrigger: %s>", err)
+	} else {
+		ccv2 := cc.AsV2()
+		if ccv2.LeaveJoint() {
+			// NB: this isn't missing a trailing space.
+			//
+			// TODO(tbg): could list the replicas that will actually leave the
+			// voter set.
+			fmt.Fprintf(&chgS, "LEAVE_JOINT")
+		}
+		if _, ok := ccv2.EnterJoint(); ok {
+			fmt.Fprintf(&chgS, "ENTER_JOINT ")
+		}
+	}
+	if len(added) > 0 {
+		fmt.Fprintf(&chgS, "%s%s", ADD_REPLICA, added)
+	}
+	if len(removed) > 0 {
+		if len(added) > 0 {
+			chgS.WriteString(", ")
+		}
+		fmt.Fprintf(&chgS, "%s%s", REMOVE_REPLICA, removed)
+	}
+	fmt.Fprintf(&chgS, ": after=%s next=%d", afterReplicas, nextReplicaID)
+	return chgS.String()
+}
+
+func (crt ChangeReplicasTrigger) legacy() (ReplicaDescriptor, bool) {
+	if len(crt.InternalAddedReplicas)+len(crt.InternalRemovedReplicas) == 0 && crt.DeprecatedReplica.ReplicaID != 0 {
+		return crt.DeprecatedReplica, true
+	}
+	return ReplicaDescriptor{}, false
+}
+
+// Added returns the replicas added by this change (if there are any).
+func (crt ChangeReplicasTrigger) Added() []ReplicaDescriptor {
+	if rDesc, ok := crt.legacy(); ok && crt.DeprecatedChangeType == ADD_REPLICA {
+		return []ReplicaDescriptor{rDesc}
+	}
+	return crt.InternalAddedReplicas
+}
+
+// Removed returns the replicas removed by this change (if there are any).
+func (crt ChangeReplicasTrigger) Removed() []ReplicaDescriptor {
+	if rDesc, ok := crt.legacy(); ok && crt.DeprecatedChangeType == REMOVE_REPLICA {
+		return []ReplicaDescriptor{rDesc}
+	}
+	return crt.InternalRemovedReplicas
 }
 
 // LeaseSequence is a custom type for a lease sequence number.
@@ -1254,6 +1655,16 @@ func (l Lease) Equivalent(newL Lease) bool {
 	// Ignore sequence numbers, they are simply a reflection of
 	// the equivalency of other fields.
 	l.Sequence, newL.Sequence = 0, 0
+	// Ignore the ReplicaDescriptor's type. This shouldn't affect lease
+	// equivalency because Raft state shouldn't be factored into the state of a
+	// Replica's lease. We don't expect a leaseholder to ever become a LEARNER
+	// replica, but that also shouldn't prevent it from extending its lease. The
+	// code also avoids a potential bug where an unset ReplicaType and a set
+	// VOTER ReplicaType are considered distinct and non-equivalent.
+	//
+	// Change this line to the following when ReplicaType becomes non-nullable:
+	//  l.Replica.Type, newL.Replica.Type = 0, 0
+	l.Replica.Type, newL.Replica.Type = nil, nil
 	// If both leases are epoch-based, we must dereference the epochs
 	// and then set to nil.
 	switch l.Type() {
@@ -1449,6 +1860,11 @@ func (s Span) ContainsKey(key Key) bool {
 	return bytes.Compare(key, s.Key) >= 0 && bytes.Compare(key, s.EndKey) < 0
 }
 
+// ProperlyContainsKey returns whether the span properly contains the given key.
+func (s Span) ProperlyContainsKey(key Key) bool {
+	return bytes.Compare(key, s.Key) > 0 && bytes.Compare(key, s.EndKey) < 0
+}
+
 // AsRange returns the Span as an interval.Range.
 func (s Span) AsRange() interval.Range {
 	startKey := s.Key
@@ -1614,7 +2030,8 @@ func (kv KeyValueByKey) Swap(i, j int) {
 
 var _ sort.Interface = KeyValueByKey{}
 
-// observedTimestampSlice maintains a sorted list of observed timestamps.
+// observedTimestampSlice maintains an immutable sorted list of observed
+// timestamps.
 type observedTimestampSlice []ObservedTimestamp
 
 func (s observedTimestampSlice) index(nodeID NodeID) int {
@@ -1636,19 +2053,61 @@ func (s observedTimestampSlice) get(nodeID NodeID) (hlc.Timestamp, bool) {
 }
 
 // update the timestamp for the specified node, or add a new entry in the
-// correct (sorted) location.
+// correct (sorted) location. The receiver is not mutated.
 func (s observedTimestampSlice) update(
 	nodeID NodeID, timestamp hlc.Timestamp,
 ) observedTimestampSlice {
 	i := s.index(nodeID)
 	if i < len(s) && s[i].NodeID == nodeID {
 		if timestamp.Less(s[i].Timestamp) {
-			s[i].Timestamp = timestamp
+			// The input slice is immutable, so copy and update.
+			cpy := make(observedTimestampSlice, len(s))
+			copy(cpy, s)
+			cpy[i].Timestamp = timestamp
+			return cpy
 		}
 		return s
 	}
-	s = append(s, ObservedTimestamp{})
-	copy(s[i+1:], s[i:])
-	s[i] = ObservedTimestamp{NodeID: nodeID, Timestamp: timestamp}
-	return s
+	// The input slice is immutable, so copy and update. Don't append to
+	// avoid an allocation. Doing so could invalidate a previous update
+	// to this receiver.
+	cpy := make(observedTimestampSlice, len(s)+1)
+	copy(cpy[:i], s[:i])
+	cpy[i] = ObservedTimestamp{NodeID: nodeID, Timestamp: timestamp}
+	copy(cpy[i+1:], s[i:])
+	return cpy
 }
+
+// SequencedWriteBySeq implements sorting of a slice of SequencedWrites
+// by sequence number.
+type SequencedWriteBySeq []SequencedWrite
+
+// Len implements sort.Interface.
+func (s SequencedWriteBySeq) Len() int { return len(s) }
+
+// Less implements sort.Interface.
+func (s SequencedWriteBySeq) Less(i, j int) bool { return s[i].Sequence < s[j].Sequence }
+
+// Swap implements sort.Interface.
+func (s SequencedWriteBySeq) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
+
+var _ sort.Interface = SequencedWriteBySeq{}
+
+// Find searches for the index of the SequencedWrite with the provided
+// sequence number. Returns -1 if no corresponding write is found.
+func (s SequencedWriteBySeq) Find(seq enginepb.TxnSeq) int {
+	if util.RaceEnabled {
+		if !sort.IsSorted(s) {
+			panic("SequencedWriteBySeq must be sorted")
+		}
+	}
+	if i := sort.Search(len(s), func(i int) bool {
+		return s[i].Sequence >= seq
+	}); i < len(s) && s[i].Sequence == seq {
+		return i
+	}
+	return -1
+}
+
+// Silence unused warning.
+var _ = (SequencedWriteBySeq{}).Find

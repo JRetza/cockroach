@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 //
 //
 //
@@ -22,7 +18,6 @@
 
 #include <algorithm>
 
-#include "../file_registry.h"
 #include "../fmt.h"
 #include "../plaintext_stream.h"
 #include "aligned_buffer.h"
@@ -436,7 +431,20 @@ class EncryptedEnv : public rocksdb::EnvWrapper {
     return rocksdb::Status::OK();
   }
 
-  // Reuse an existing file by renaming it and opening it as writable.
+  // `ReuseWritableFile` is used for recycling WAL files. With `EncryptedEnv`, we
+  // currently do not know a crash-safe way to recycle WALs. The workaround is to
+  // pretend to recycle in this function by producing a new file and throwing away
+  // the old one. This method of "recycling" sacrifices performance for crash-safety.
+  //
+  // True recycling is not crash-safe because RocksDB recovery fails if it encounters
+  // a non-empty WAL with zero readable entries. With true recycling, we need to change
+  // the encryption key. Imagine a crash happened after we renamed the file and assigned
+  // a new key, but before we wrote any data to the recycled file. Then, that file would
+  // appear to recovery as containing all garbage data, causing it to fail.
+  //
+  // TODO(ajkr): Try to change how RocksDB handles WALs with zero readable entries:
+  // https://www.facebook.com/groups/rocksdb.dev/permalink/2405909486174218/
+  // Then we can have both performance and crash-safety.
   virtual rocksdb::Status ReuseWritableFile(const std::string& fname, const std::string& old_fname,
                                             std::unique_ptr<rocksdb::WritableFile>* result,
                                             const rocksdb::EnvOptions& options) override {
@@ -444,23 +452,11 @@ class EncryptedEnv : public rocksdb::EnvWrapper {
     if (options.use_mmap_writes) {
       return rocksdb::Status::InvalidArgument();
     }
-    // Open file using underlying Env implementation
-    std::unique_ptr<rocksdb::WritableFile> underlying;
-    rocksdb::Status status =
-        rocksdb::EnvWrapper::ReuseWritableFile(fname, old_fname, &underlying, options);
-    if (!status.ok()) {
-      return status;
+    auto status = NewWritableFile(fname, result, options);
+    if (status.ok()) {
+      status = DeleteFile(old_fname);
     }
-
-    // Create cipher stream
-    std::unique_ptr<BlockAccessCipherStream> stream;
-    status = CreateCipherStream(fname, true /* new_file */, &stream);
-    if (!status.ok()) {
-      return status;
-    }
-    (*result) = std::unique_ptr<rocksdb::WritableFile>(
-        new EncryptedWritableFile(underlying.release(), stream.release()));
-    return rocksdb::Status::OK();
+    return status;
   }
 
   // Open `fname` for random read and write, if file dont exist the file
@@ -497,26 +493,27 @@ class EncryptedEnv : public rocksdb::EnvWrapper {
   }
 
   virtual rocksdb::Status DeleteFile(const std::string& fname) override {
-    auto status = file_registry_->MaybeDeleteEntry(fname);
+    auto status = EnvWrapper::DeleteFile(fname);
     if (!status.ok()) {
       return status;
     }
-    return EnvWrapper::DeleteFile(fname);
+    return file_registry_->MaybeDeleteEntry(fname);
   }
+
   virtual rocksdb::Status RenameFile(const std::string& src, const std::string& target) override {
-    auto status = file_registry_->MaybeRenameEntry(src, target);
+    auto status = EnvWrapper::RenameFile(src, target);
     if (!status.ok()) {
       return status;
     }
-    return EnvWrapper::RenameFile(src, target);
+    return file_registry_->MaybeRenameEntry(src, target);
   }
 
   virtual rocksdb::Status LinkFile(const std::string& src, const std::string& target) override {
-    auto status = file_registry_->MaybeLinkEntry(src, target);
+    auto status = EnvWrapper::LinkFile(src, target);
     if (!status.ok()) {
       return status;
     }
-    return EnvWrapper::LinkFile(src, target);
+    return file_registry_->MaybeLinkEntry(src, target);
   }
 
   rocksdb::Status
@@ -571,19 +568,11 @@ class EncryptedEnv : public rocksdb::EnvWrapper {
       return status;
     }
 
-    if (encryption_settings.size() == 0) {
-      // Plaintext: delete registry entry if is exists.
-      return file_registry_->MaybeDeleteEntry(fname);
-    } else {
-      // Encryption settings specified: create a FileEntry and save it, overwriting any existing
-      // one.
-      std::unique_ptr<enginepb::FileEntry> new_entry(new enginepb::FileEntry());
-      new_entry->set_env_type(stream_creator_->GetEnvType());
-      new_entry->set_encryption_settings(encryption_settings);
-      return file_registry_->SetFileEntry(fname, std::move(new_entry));
-    }
-
-    return rocksdb::Status::OK();
+    // Create a FileEntry and save it, overwriting any existing one.
+    std::unique_ptr<enginepb::FileEntry> new_entry(new enginepb::FileEntry());
+    new_entry->set_env_type(stream_creator_->GetEnvType());
+    new_entry->set_encryption_settings(encryption_settings);
+    return file_registry_->SetFileEntry(fname, std::move(new_entry));
   }
 
  private:
@@ -600,15 +589,26 @@ rocksdb::Env* NewEncryptedEnv(rocksdb::Env* base_env, FileRegistry* file_registr
 
 // Encrypt one or more (partial) blocks of data at the file offset.
 // Length of data is given in dataSize.
-rocksdb::Status BlockAccessCipherStream::Encrypt(uint64_t fileOffset, char* data, size_t dataSize) {
+rocksdb::Status BlockAccessCipherStream::Encrypt(uint64_t fileOffset, char* data,
+                                                 size_t dataSize) const {
+  if (dataSize == 0) {
+    return rocksdb::Status::OK();
+  }
+
+  std::unique_ptr<rocksdb_utils::BlockCipher> cipher;
+  auto status = InitCipher(&cipher);
+  if (!status.ok()) {
+    return status;
+  }
+
   // Calculate block index
-  auto blockSize = BlockSize();
+  auto blockSize = cipher->BlockSize();
   uint64_t blockIndex = fileOffset / blockSize;
   size_t blockOffset = fileOffset % blockSize;
   std::unique_ptr<char[]> blockBuffer;
 
   std::string scratch;
-  AllocateScratch(scratch);
+  scratch.reserve(blockSize);
 
   // Encrypt individual blocks.
   while (1) {
@@ -625,7 +625,7 @@ rocksdb::Status BlockAccessCipherStream::Encrypt(uint64_t fileOffset, char* data
       // Copy plain data to block buffer
       memmove(block + blockOffset, data, n);
     }
-    auto status = EncryptBlock(blockIndex, block, (char*)scratch.data());
+    auto status = EncryptBlock(cipher.get(), blockIndex, block, (char*)scratch.data());
     if (!status.ok()) {
       return status;
     }
@@ -645,15 +645,26 @@ rocksdb::Status BlockAccessCipherStream::Encrypt(uint64_t fileOffset, char* data
 
 // Decrypt one or more (partial) blocks of data at the file offset.
 // Length of data is given in dataSize.
-rocksdb::Status BlockAccessCipherStream::Decrypt(uint64_t fileOffset, char* data, size_t dataSize) {
+rocksdb::Status BlockAccessCipherStream::Decrypt(uint64_t fileOffset, char* data,
+                                                 size_t dataSize) const {
+  if (dataSize == 0) {
+    return rocksdb::Status::OK();
+  }
+
+  std::unique_ptr<rocksdb_utils::BlockCipher> cipher;
+  auto status = InitCipher(&cipher);
+  if (!status.ok()) {
+    return status;
+  }
+
   // Calculate block index
-  auto blockSize = BlockSize();
+  auto blockSize = cipher->BlockSize();
   uint64_t blockIndex = fileOffset / blockSize;
   size_t blockOffset = fileOffset % blockSize;
   std::unique_ptr<char[]> blockBuffer;
 
   std::string scratch;
-  AllocateScratch(scratch);
+  scratch.reserve(blockSize);
 
   // Decrypt individual blocks.
   while (1) {
@@ -670,7 +681,7 @@ rocksdb::Status BlockAccessCipherStream::Decrypt(uint64_t fileOffset, char* data
       // Copy encrypted data to block buffer
       memmove(block + blockOffset, data, n);
     }
-    auto status = DecryptBlock(blockIndex, block, (char*)scratch.data());
+    auto status = DecryptBlock(cipher.get(), blockIndex, block, (char*)scratch.data());
     if (!status.ok()) {
       return status;
     }

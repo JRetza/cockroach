@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import React from "react";
 import { Helmet } from "react-helmet";
 import { Link } from "react-router";
@@ -17,8 +27,9 @@ import { TimestampToMoment } from "src/util/convert";
 import { getEventDescription } from "src/util/events";
 import { SortSetting } from "src/views/shared/components/sortabletable";
 import { SortedTable } from "src/views/shared/components/sortedtable";
+import { ToolTipWrapper } from "src/views/shared/components/toolTip";
 
-type Event$Properties = protos.cockroach.server.serverpb.EventsResponse.Event$Properties;
+type Event$Properties = protos.cockroach.server.serverpb.EventsResponse.IEvent;
 
 // Number of events to show in the sidebar.
 const EVENT_BOX_NUM_EVENTS = 10;
@@ -55,7 +66,11 @@ export class EventRow extends React.Component<EventRowProps, {}> {
     const { event } = this.props;
     const e = getEventInfo(event);
     return <tr>
-      <td><div className="events__message">{e.content}</div></td>
+      <td>
+        <ToolTipWrapper text={ e.content }>
+          <div className="events__message">{e.content}</div>
+        </ToolTipWrapper>
+      </td>
       <td><div className="events__timestamp">{e.fromNowString}</div></td>
     </tr>;
   }

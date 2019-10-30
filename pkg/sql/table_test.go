@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -19,8 +15,8 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
@@ -30,117 +26,142 @@ func TestMakeTableDescColumns(t *testing.T) {
 
 	testData := []struct {
 		sqlType  string
-		colType  sqlbase.ColumnType
+		colType  *types.T
 		nullable bool
 	}{
 		{
 			"BIT",
-			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT, Width: 1, VisibleType: sqlbase.ColumnType_BIT},
+			types.MakeBit(1),
 			true,
 		},
 		{
 			"BIT(3)",
-			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT, Width: 3, VisibleType: sqlbase.ColumnType_BIT},
+			types.MakeBit(3),
+			true,
+		},
+		{
+			"VARBIT",
+			types.VarBit,
+			true,
+		},
+		{
+			"VARBIT(3)",
+			types.MakeVarBit(3),
 			true,
 		},
 		{
 			"BOOLEAN",
-			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_BOOL},
+			types.Bool,
 			true,
 		},
 		{
 			"INT",
-			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT},
+			types.Int,
 			true,
 		},
 		{
 			"INT2",
-			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT, Width: 16, VisibleType: sqlbase.ColumnType_SMALLINT},
+			types.Int2,
 			true,
 		},
 		{
 			"INT4",
-			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT, Width: 32, VisibleType: sqlbase.ColumnType_INTEGER},
+			types.Int4,
 			true,
 		},
 		{
 			"INT8",
-			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT, VisibleType: sqlbase.ColumnType_BIGINT},
+			types.Int,
 			true,
 		},
 		{
 			"INT64",
-			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT, VisibleType: sqlbase.ColumnType_BIGINT},
+			types.Int,
 			true,
 		},
 		{
 			"BIGINT",
-			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT, VisibleType: sqlbase.ColumnType_BIGINT},
+			types.Int,
 			true,
 		},
 		{
 			"FLOAT(3)",
-			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_FLOAT, Precision: 3},
+			types.Float4,
 			true,
 		},
 		{
 			"DOUBLE PRECISION",
-			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_FLOAT, VisibleType: sqlbase.ColumnType_DOUBLE_PRECISION},
+			types.Float,
 			true,
 		},
 		{
 			"DECIMAL(6,5)",
-			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_DECIMAL, Precision: 6, Width: 5},
+			types.MakeDecimal(6, 5),
 			true,
 		},
 		{
 			"DATE",
-			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_DATE},
+			types.Date,
 			true,
 		},
 		{
 			"TIME",
-			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_TIME},
-			true,
-		},
-		{
-			"TIMETZ",
-			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_TIMETZ},
+			types.Time,
 			true,
 		},
 		{
 			"TIMESTAMP",
-			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_TIMESTAMP},
+			types.Timestamp,
 			true,
 		},
 		{
 			"INTERVAL",
-			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INTERVAL},
+			types.Interval,
 			true,
 		},
 		{
 			"CHAR",
-			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_STRING},
+			types.MakeChar(1),
+			true,
+		},
+		{
+			"CHAR(3)",
+			types.MakeChar(3),
+			true,
+		},
+		{
+			"VARCHAR",
+			types.VarChar,
+			true,
+		},
+		{
+			"VARCHAR(3)",
+			types.MakeVarChar(3),
 			true,
 		},
 		{
 			"TEXT",
-			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_STRING},
+			types.String,
+			true,
+		},
+		{
+			`"char"`,
+			types.MakeQChar(0),
 			true,
 		},
 		{
 			"BLOB",
-			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_BYTES},
+			types.Bytes,
 			true,
 		},
 		{
 			"INT NOT NULL",
-			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT},
+			types.Int,
 			false,
 		},
 		{
 			"INT NULL",
-			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT},
+			types.Int,
 			true,
 		},
 	}
@@ -150,14 +171,11 @@ func TestMakeTableDescColumns(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%d: %v", i, err)
 		}
-		if !reflect.DeepEqual(d.colType, schema.Columns[0].Type) {
-			t.Fatalf("%d: expected %+v, but got %+v", i, d.colType, schema.Columns[0])
-		}
 		if schema.Columns[0].Nullable {
 			t.Fatalf("%d: expected non-nullable primary key, but got %+v", i, schema.Columns[0].Nullable)
 		}
-		if !reflect.DeepEqual(d.colType, schema.Columns[1].Type) {
-			t.Fatalf("%d: expected %+v, but got %+v", i, d.colType, schema.Columns[1])
+		if !reflect.DeepEqual(*d.colType, schema.Columns[0].Type) {
+			t.Fatalf("%d: expected %+v, but got %+v", i, d.colType.DebugString(), schema.Columns[0].Type.DebugString())
 		}
 		if d.nullable != schema.Columns[1].Nullable {
 			t.Fatalf("%d: expected %+v, but got %+v", i, d.nullable, schema.Columns[1].Nullable)
@@ -279,7 +297,7 @@ func TestPrimaryKeyUnspecified(t *testing.T) {
 	}
 	desc.PrimaryIndex = sqlbase.IndexDescriptor{}
 
-	err = desc.ValidateTable(cluster.MakeTestingClusterSettings())
+	err = desc.ValidateTable()
 	if !testutils.IsError(err, sqlbase.ErrMissingPrimaryKey.Error()) {
 		t.Fatalf("unexpected error: %v", err)
 	}

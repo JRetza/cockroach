@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import { assert } from "chai";
 import fetchMock from "src/util/fetch-mock";
 import { Store } from "redux";
@@ -308,7 +318,7 @@ describe("alerts", function() {
         const alert = disconnectedAlertSelector(state());
         assert.isObject(alert);
         assert.equal(alert.level, AlertLevel.CRITICAL);
-        assert.equal(alert.title, "Connection to CockroachDB node lost.");
+        assert.equal(alert.title, "We're currently having some trouble fetching updated data. If this persists, it might be a good idea to check your network connection to the CockroachDB cluster.");
       });
 
       it("does not display if dismissed locally", function () {

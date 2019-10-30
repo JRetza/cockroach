@@ -1,7 +1,17 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import React from "react";
 import _ from "lodash";
 
-import docsURL from "src/util/docs";
+import * as docsURL from "src/util/docs";
 import { LineGraph } from "src/views/cluster/components/linegraph";
 import { Metric, Axis, AxisUnits } from "src/views/shared/components/metricQuery";
 
@@ -15,13 +25,12 @@ export default function (props: GraphDashboardProps) {
       title="SQL Queries"
       sources={nodeSources}
       tooltip={
-        `A ten-second moving average of the # of SELECT, INSERT, UPDATE, and DELETE operations
-        started per second ${tooltipSelection}.`
+        `A ten-second moving average of the # of SELECT, INSERT, UPDATE, and DELETE statements
+        successfully executed per second ${tooltipSelection}.`
       }
     >
       <Axis label="queries">
-        <Metric name="cr.node.sql.select.count" title="Total Reads" nonNegativeRate />
-        <Metric name="cr.node.sql.distsql.select.count" title="DistSQL Reads" nonNegativeRate />
+        <Metric name="cr.node.sql.select.count" title="Selects" nonNegativeRate />
         <Metric name="cr.node.sql.update.count" title="Updates" nonNegativeRate />
         <Metric name="cr.node.sql.insert.count" title="Inserts" nonNegativeRate />
         <Metric name="cr.node.sql.delete.count" title="Deletes" nonNegativeRate />
@@ -90,10 +99,7 @@ export default function (props: GraphDashboardProps) {
                 Control this value per node with the
                 {" "}
                 <code>
-                  <a
-                    href={docsURL("start-a-node.html#flags")}
-                    target="_blank"
-                  >
+                  <a href={docsURL.startFlags} target="_blank">
                     --store
                   </a>
                 </code>

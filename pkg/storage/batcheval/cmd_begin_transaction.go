@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package batcheval
 
@@ -30,10 +26,10 @@ func init() {
 	RegisterCommand(roachpb.BeginTransaction, declareKeysBeginTransaction, BeginTransaction)
 }
 
-// DeclareKeysWriteTransaction is the shared portion of
-// declareKeys{Begin,End,Heartbeat}Transaction
-func DeclareKeysWriteTransaction(
-	_ roachpb.RangeDescriptor, header roachpb.Header, req roachpb.Request, spans *spanset.SpanSet,
+// declareKeysWriteTransaction is the shared portion of
+// declareKeys{Begin,End,Heartbeat}Transaction.
+func declareKeysWriteTransaction(
+	_ *roachpb.RangeDescriptor, header roachpb.Header, req roachpb.Request, spans *spanset.SpanSet,
 ) {
 	if header.Txn != nil {
 		header.Txn.AssertInitialized(context.TODO())
@@ -44,10 +40,12 @@ func DeclareKeysWriteTransaction(
 }
 
 func declareKeysBeginTransaction(
-	desc roachpb.RangeDescriptor, header roachpb.Header, req roachpb.Request, spans *spanset.SpanSet,
+	desc *roachpb.RangeDescriptor, header roachpb.Header, req roachpb.Request, spans *spanset.SpanSet,
 ) {
-	DeclareKeysWriteTransaction(desc, header, req, spans)
-	spans.Add(spanset.SpanReadOnly, roachpb.Span{Key: keys.RangeTxnSpanGCThresholdKey(header.RangeID)})
+	declareKeysWriteTransaction(desc, header, req, spans)
+	spans.Add(spanset.SpanReadOnly, roachpb.Span{
+		Key: keys.AbortSpanKey(header.RangeID, header.Txn.ID),
+	})
 }
 
 // BeginTransaction writes the initial transaction record. Fails in
@@ -63,74 +61,68 @@ func BeginTransaction(
 	h := cArgs.Header
 	reply := resp.(*roachpb.BeginTransactionResponse)
 
-	if err := VerifyTransaction(h, args); err != nil {
+	if err := VerifyTransaction(h, args, roachpb.PENDING); err != nil {
 		return result.Result{}, err
 	}
 	key := keys.TransactionKey(h.Txn.Key, h.Txn.ID)
-	clonedTxn := h.Txn.Clone()
-	reply.Txn = &clonedTxn
+	reply.Txn = h.Txn.Clone()
 
 	// Check whether the transaction record already exists. If it already
 	// exists, check its current status and react accordingly.
-	tmpTxn := roachpb.Transaction{}
-	ok, err := engine.MVCCGetProto(ctx, batch, key, hlc.Timestamp{}, true, nil, &tmpTxn)
-	if err != nil {
+	var existingTxn roachpb.Transaction
+	if ok, err := engine.MVCCGetProto(
+		ctx, batch, key, hlc.Timestamp{}, &existingTxn, engine.MVCCGetOptions{},
+	); err != nil {
 		return result.Result{}, err
-	}
-	if ok {
-		switch tmpTxn.Status {
+	} else if !ok {
+		// Verify that it is safe to create the transaction record.
+		if err := CanCreateTxnRecord(cArgs.EvalCtx, reply.Txn); err != nil {
+			return result.Result{}, err
+		}
+	} else {
+		switch existingTxn.Status {
 		case roachpb.ABORTED:
 			// Check whether someone has come in ahead and already aborted the
 			// txn.
-			return result.Result{}, roachpb.NewTransactionAbortedError()
+			return result.Result{}, roachpb.NewTransactionAbortedError(
+				roachpb.ABORT_REASON_ABORTED_RECORD_FOUND,
+			)
 
 		case roachpb.PENDING:
-			if h.Txn.Epoch > tmpTxn.Epoch {
+			if h.Txn.Epoch > existingTxn.Epoch {
 				// On a transaction retry there will be an extant txn record
 				// but this run should have an upgraded epoch. The extant txn
 				// record may have been pushed or otherwise updated, so update
 				// this command's txn and rewrite the record.
-				reply.Txn.Update(&tmpTxn)
+				reply.Txn.Update(&existingTxn)
 			} else {
-				// Our txn record already exists. This is either a client error, sending
-				// a duplicate BeginTransaction, or it's an artifact of DistSender
-				// re-sending a batch. Assume the latter and ask the client to restart.
-				return result.Result{}, roachpb.NewTransactionRetryError(roachpb.RETRY_POSSIBLE_REPLAY)
+				// Our txn record already exists. This is possible if the first
+				// transaction heartbeat evaluated before this BeginTransaction
+				// request or if the DistSender re-sent the batch. Either way,
+				// this request will contain no new information about the
+				// transaction, so treat the BeginTransaction as a no-op.
+				return result.Result{}, nil
 			}
+
+		case roachpb.STAGING:
+			// NB: we could support this case, but there isn't a reason to. No
+			// cluster that's performing parallel commits should still be sending
+			// BeginTransaction requests.
+			fallthrough
 
 		case roachpb.COMMITTED:
 			return result.Result{}, roachpb.NewTransactionStatusError(
-				fmt.Sprintf("BeginTransaction can't overwrite %s", tmpTxn),
+				fmt.Sprintf("BeginTransaction can't overwrite %s", existingTxn),
 			)
 
 		default:
 			return result.Result{}, roachpb.NewTransactionStatusError(
-				fmt.Sprintf("bad txn state: %s", tmpTxn),
+				fmt.Sprintf("bad txn state: %s", existingTxn),
 			)
 		}
 	}
 
-	// Disallow creation or modification of a transaction record if it's at a
-	// timestamp before the TxnSpanGCThreshold, as in that case our transaction
-	// may already have been aborted by a concurrent actor which encountered one
-	// of our intents (which may have been written before this entry).
-	//
-	// See #9265.
-	threshold := cArgs.EvalCtx.GetTxnSpanGCThreshold()
-	if reply.Txn.LastActive().Less(threshold) {
-		return result.Result{}, roachpb.NewTransactionAbortedError()
-	}
-
-	// Transaction heartbeats don't begin until after the transaction record
-	// has been laid down and the response has returned to the transaction
-	// coordinator. This poses a problem for BeginTxn requests that get
-	// delayed, because it's possible that the transaction records they
-	// write will look inactive immediately after being written. To avoid
-	// this situation resulting in transactions being aborted unnecessarily,
-	// we bump the record's heartbeat timestamp right before laying it down.
-	reply.Txn.LastHeartbeat.Forward(cArgs.EvalCtx.Clock().Now())
-
 	// Write the txn record.
-	reply.Txn.Writing = true
-	return result.Result{}, engine.MVCCPutProto(ctx, batch, cArgs.Stats, key, hlc.Timestamp{}, nil, reply.Txn)
+	txnRecord := reply.Txn.AsRecord()
+	return result.Result{}, engine.MVCCPutProto(ctx, batch, cArgs.Stats, key, hlc.Timestamp{}, nil, &txnRecord)
 }

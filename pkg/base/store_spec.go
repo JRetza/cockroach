@@ -1,35 +1,32 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package base
 
 import (
 	"bytes"
 	"fmt"
+	"net"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 
-	"github.com/dustin/go-humanize"
-	"github.com/pkg/errors"
-	"github.com/spf13/pflag"
-
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/netutil"
+	humanize "github.com/dustin/go-humanize"
+	"github.com/pkg/errors"
+	"github.com/spf13/pflag"
 )
 
 // This file implements method receivers for members of server.Config struct
@@ -197,7 +194,7 @@ func (ss StoreSpec) String() string {
 			if i != 0 {
 				fmt.Fprint(&buffer, ":")
 			}
-			fmt.Fprintf(&buffer, attr)
+			buffer.WriteString(attr)
 		}
 		fmt.Fprintf(&buffer, ",")
 	}
@@ -403,6 +400,26 @@ func (jls *JoinListType) Type() string {
 // Set adds a new value to the JoinListType. It is the important part of
 // pflag's value interface.
 func (jls *JoinListType) Set(value string) error {
-	*jls = append(*jls, value)
+	if strings.TrimSpace(value) == "" {
+		// No value, likely user error.
+		return errors.New("no address specified in --join")
+	}
+	for _, v := range strings.Split(value, ",") {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			// --join=a,,b  equivalent to --join=a,b
+			continue
+		}
+		// Try splitting the address. This validates the format
+		// of the address and tolerates a missing delimiter colon
+		// between the address and port number.
+		addr, port, err := netutil.SplitHostPort(v, "")
+		if err != nil {
+			return err
+		}
+		// Re-join the parts. This guarantees an address that
+		// will be valid for net.SplitHostPort().
+		*jls = append(*jls, net.JoinHostPort(addr, port))
+	}
 	return nil
 }

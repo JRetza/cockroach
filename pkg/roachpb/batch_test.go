@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package roachpb
 
@@ -23,6 +19,69 @@ import (
 	"github.com/kr/pretty"
 )
 
+func TestBatchIsCompleteTransaction(t *testing.T) {
+	get := &GetRequest{}
+	put := &PutRequest{}
+	bt := &BeginTransactionRequest{}
+	etA := &EndTransactionRequest{Commit: false}
+	etC := &EndTransactionRequest{Commit: true}
+	withSeq := func(r Request, s enginepb.TxnSeq) Request {
+		c := r.ShallowCopy()
+		h := c.Header()
+		h.Sequence = s
+		c.SetHeader(h)
+		return c
+	}
+	testCases := []struct {
+		reqs       []Request
+		isComplete bool
+	}{
+		{[]Request{get, put}, false},
+		{[]Request{bt}, false},
+		{[]Request{etA}, false},
+		{[]Request{etC}, false},
+		{[]Request{bt, put, get}, false},
+		{[]Request{put, get, etA}, false},
+		{[]Request{put, get, etC}, false},
+		{[]Request{bt, put, get, etA}, false},
+		{[]Request{bt, put, get, etC}, true},
+		{[]Request{bt, get, etA}, false},
+		{[]Request{bt, get, etC}, true},
+		{[]Request{withSeq(etA, 1)}, false},
+		{[]Request{withSeq(etC, 1)}, true},
+		{[]Request{put, withSeq(etC, 3)}, false},
+		{[]Request{withSeq(put, 1), withSeq(etC, 3)}, false},
+		{[]Request{withSeq(put, 2), withSeq(etC, 3)}, false},
+		{[]Request{withSeq(put, 1), withSeq(put, 2), withSeq(etA, 3)}, false},
+		{[]Request{withSeq(put, 1), withSeq(put, 2), withSeq(etC, 3)}, true},
+		{[]Request{withSeq(put, 1), withSeq(put, 2), withSeq(etC, 4)}, false},
+		{[]Request{withSeq(put, 1), withSeq(put, 2), withSeq(put, 3), withSeq(etA, 4)}, false},
+		{[]Request{withSeq(put, 1), withSeq(put, 2), withSeq(put, 3), withSeq(etC, 4)}, true},
+		{[]Request{withSeq(get, 0), withSeq(put, 1), withSeq(get, 1), withSeq(etC, 3)}, false},
+		{[]Request{withSeq(get, 0), withSeq(get, 1), withSeq(put, 2), withSeq(etC, 3)}, false},
+		{[]Request{withSeq(get, 0), withSeq(put, 1), withSeq(put, 2), withSeq(get, 2), withSeq(etC, 3)}, true},
+		{[]Request{withSeq(put, 1), withSeq(get, 1), withSeq(put, 2), withSeq(etC, 4)}, false},
+		{[]Request{withSeq(get, 0), withSeq(put, 1), withSeq(put, 2), withSeq(put, 3), withSeq(get, 3), withSeq(etC, 4)}, true},
+		// These cases will be removed in 2.3 once we're sure that all nodes
+		// will properly set sequence numbers (i.e. on writes only).
+		{[]Request{bt, withSeq(put, 1), withSeq(etC, 3)}, true},
+		{[]Request{bt, withSeq(put, 2), withSeq(etC, 3)}, true},
+		{[]Request{bt, withSeq(put, 1), withSeq(put, 2), withSeq(etC, 3)}, true},
+		{[]Request{bt, withSeq(put, 1), withSeq(put, 2), withSeq(etC, 4)}, true},
+		{[]Request{bt, withSeq(put, 1), withSeq(put, 2), withSeq(put, 3), withSeq(etC, 4)}, true},
+	}
+	for i, test := range testCases {
+		ba := BatchRequest{}
+		for _, args := range test.reqs {
+			ba.Add(args)
+		}
+		complete := ba.IsCompleteTransaction()
+		if complete != test.isComplete {
+			t.Errorf("%d: expected IsCompleteTransaction=%t, found %t", i, test.isComplete, complete)
+		}
+	}
+}
+
 func TestBatchSplit(t *testing.T) {
 	get := &GetRequest{}
 	scan := &ScanRequest{}
@@ -31,8 +90,8 @@ func TestBatchSplit(t *testing.T) {
 	dr := &DeleteRangeRequest{}
 	bt := &BeginTransactionRequest{}
 	et := &EndTransactionRequest{}
+	qi := &QueryIntentRequest{}
 	rv := &ReverseScanRequest{}
-	np := &NoopRequest{}
 	testCases := []struct {
 		reqs       []Request
 		sizes      []int
@@ -52,11 +111,17 @@ func TestBatchSplit(t *testing.T) {
 		// have isAlone set). Could be useful if we ever want to allow executing
 		// multiple batches back-to-back.
 		{[]Request{et, scan, et}, []int{1, 2}, false},
-		// Check that Noop can mix with other requests regardless of flags.
-		{[]Request{np, put, np}, []int{3}, true},
-		{[]Request{np, spl, np}, []int{3}, true},
-		{[]Request{np, rv, np}, []int{3}, true},
-		{[]Request{np, np, et}, []int{3}, true}, // et does not split off
+		{[]Request{et, et}, []int{1, 1}, false},
+		// QueryIntents count as headers that are always compatible with the
+		// request that follows.
+		{[]Request{get, qi, put}, []int{1, 2}, true},
+		{[]Request{get, qi, qi, qi, qi, put}, []int{1, 5}, true},
+		{[]Request{qi, get, qi, get, qi, get, qi, put, qi, put, qi, get, qi, get}, []int{6, 4, 4}, true},
+		{[]Request{qi, spl, qi, get, scan, qi, qi, spl, qi, get}, []int{1, 1, 5, 1, 2}, true},
+		{[]Request{scan, qi, qi, qi, et}, []int{4, 1}, true},
+		{[]Request{scan, qi, qi, qi, et}, []int{5}, false},
+		{[]Request{put, qi, qi, qi, et}, []int{1, 3, 1}, true},
+		{[]Request{put, qi, qi, qi, et}, []int{5}, false},
 	}
 
 	for i, test := range testCases {
@@ -80,15 +145,20 @@ func TestBatchSplit(t *testing.T) {
 }
 
 func TestBatchRequestGetArg(t *testing.T) {
+	get := RequestUnion{
+		Value: &RequestUnion_Get{Get: &GetRequest{}},
+	}
+	end := RequestUnion{
+		Value: &RequestUnion_EndTransaction{EndTransaction: &EndTransactionRequest{}},
+	}
 	testCases := []struct {
 		bu         []RequestUnion
 		expB, expG bool
 	}{
 		{[]RequestUnion{}, false, false},
-		{[]RequestUnion{{Get: &GetRequest{}}}, false, true},
-		{[]RequestUnion{{EndTransaction: &EndTransactionRequest{}}, {Get: &GetRequest{}}}, false, true},
-		{[]RequestUnion{{EndTransaction: &EndTransactionRequest{}}}, true, false},
-		{[]RequestUnion{{Get: &GetRequest{}}, {EndTransaction: &EndTransactionRequest{}}}, true, true},
+		{[]RequestUnion{get}, false, true},
+		{[]RequestUnion{end, get}, false, true},
+		{[]RequestUnion{get, end}, true, true},
 	}
 
 	for i, c := range testCases {
@@ -107,37 +177,37 @@ func TestBatchRequestSummary(t *testing.T) {
 	// The Summary function is generated automatically, so the tests don't need to
 	// be exhaustive.
 	testCases := []struct {
-		reqs     []interface{}
+		reqs     []Request
 		expected string
 	}{
 		{
-			reqs:     []interface{}{},
+			reqs:     []Request{},
 			expected: "empty batch",
 		},
 		{
-			reqs:     []interface{}{&GetRequest{}},
+			reqs:     []Request{&GetRequest{}},
 			expected: "1 Get",
 		},
 		{
-			reqs:     []interface{}{&PutRequest{}},
+			reqs:     []Request{&PutRequest{}},
 			expected: "1 Put",
 		},
 		{
-			reqs:     []interface{}{&ConditionalPutRequest{}},
+			reqs:     []Request{&ConditionalPutRequest{}},
 			expected: "1 CPut",
 		},
 		{
-			reqs:     []interface{}{&ReverseScanRequest{}},
+			reqs:     []Request{&ReverseScanRequest{}},
 			expected: "1 RevScan",
 		},
 		{
-			reqs: []interface{}{
+			reqs: []Request{
 				&GetRequest{}, &GetRequest{}, &PutRequest{}, &ScanRequest{}, &ScanRequest{},
 			},
 			expected: "2 Get, 1 Put, 2 Scan",
 		},
 		{
-			reqs: []interface{}{
+			reqs: []Request{
 				&CheckConsistencyRequest{}, &InitPutRequest{}, &TruncateLogRequest{},
 			},
 			expected: "1 TruncLog, 1 ChkConsistency, 1 InitPut",
@@ -147,7 +217,7 @@ func TestBatchRequestSummary(t *testing.T) {
 		var br BatchRequest
 		for _, v := range tc.reqs {
 			var ru RequestUnion
-			ru.SetValue(v)
+			ru.MustSetInner(v)
 			br.Requests = append(br.Requests, ru)
 		}
 		if str := br.Summary(); str != tc.expected {
@@ -163,19 +233,16 @@ func TestIntentSpanIterate(t *testing.T) {
 		span   Span
 		resume Span
 	}{
-		{&ScanRequest{}, &ScanResponse{},
-			Span{Key("a"), Key("c")}, Span{Key("b"), Key("c")}},
-		{&ReverseScanRequest{}, &ReverseScanResponse{},
-			Span{Key("d"), Key("f")}, Span{Key("d"), Key("e")}},
-		{&DeleteRangeRequest{}, &DeleteRangeResponse{},
-			Span{Key("g"), Key("i")}, Span{Key("h"), Key("i")}},
+		{&ScanRequest{}, &ScanResponse{}, sp("a", "c"), sp("b", "c")},
+		{&ReverseScanRequest{}, &ReverseScanResponse{}, sp("d", "f"), sp("d", "e")},
+		{&DeleteRangeRequest{}, &DeleteRangeResponse{}, sp("g", "i"), sp("h", "i")},
 	}
 
 	// A batch request with a batch response with no ResumeSpan.
 	ba := BatchRequest{}
 	br := BatchResponse{}
 	for _, tc := range testCases {
-		tc.req.SetHeader(tc.span)
+		tc.req.SetHeader(RequestHeaderFromSpan(tc.span))
 		ba.Add(tc.req)
 		br.Add(tc.resp)
 	}
@@ -197,7 +264,7 @@ func TestIntentSpanIterate(t *testing.T) {
 	ba = BatchRequest{}
 	br = BatchResponse{}
 	for _, tc := range testCases {
-		tc.req.SetHeader(tc.span)
+		tc.req.SetHeader(RequestHeaderFromSpan(tc.span))
 		ba.Add(tc.req)
 		tc.resp.SetHeader(ResponseHeader{ResumeSpan: &tc.resume})
 		br.Add(tc.resp)
@@ -209,7 +276,7 @@ func TestIntentSpanIterate(t *testing.T) {
 	if e := 1; len(spans) != e {
 		t.Fatalf("unexpected number of spans: e = %d, found = %d", e, len(spans))
 	}
-	if e := (Span{Key("g"), Key("h")}); !reflect.DeepEqual(e, spans[0]) {
+	if e := sp("g", "h"); !reflect.DeepEqual(e, spans[0]) {
 		t.Fatalf("unexpected spans: e = %+v, found = %+v", e, spans[0])
 	}
 }
@@ -219,47 +286,40 @@ func TestRefreshSpanIterate(t *testing.T) {
 		req    Request
 		resp   Response
 		span   Span
-		resume *Span
+		resume Span
 	}{
-		{&ConditionalPutRequest{}, &ConditionalPutResponse{},
-			Span{Key: Key("a")}, nil},
-		{&PutRequest{}, &PutResponse{},
-			Span{Key: Key("a-put")}, nil},
-		{&InitPutRequest{}, &InitPutResponse{},
-			Span{Key: Key("a-initput")}, nil},
-		{&IncrementRequest{}, &IncrementResponse{},
-			Span{Key: Key("a-inc")}, nil},
-		{&ScanRequest{}, &ScanResponse{},
-			Span{Key("a"), Key("c")}, &Span{Key("b"), Key("c")}},
-		{&GetRequest{}, &GetResponse{},
-			Span{Key: Key("b")}, nil},
-		{&ReverseScanRequest{}, &ReverseScanResponse{},
-			Span{Key("d"), Key("f")}, &Span{Key("d"), Key("e")}},
-		{&DeleteRangeRequest{}, &DeleteRangeResponse{},
-			Span{Key("g"), Key("i")}, &Span{Key("h"), Key("i")}},
+		{&ConditionalPutRequest{}, &ConditionalPutResponse{}, sp("a", ""), Span{}},
+		{&PutRequest{}, &PutResponse{}, sp("a-put", ""), Span{}},
+		{&InitPutRequest{}, &InitPutResponse{}, sp("a-initput", ""), Span{}},
+		{&IncrementRequest{}, &IncrementResponse{}, sp("a-inc", ""), Span{}},
+		{&ScanRequest{}, &ScanResponse{}, sp("a", "c"), sp("b", "c")},
+		{&GetRequest{}, &GetResponse{}, sp("b", ""), Span{}},
+		{&ReverseScanRequest{}, &ReverseScanResponse{}, sp("d", "f"), sp("d", "e")},
+		{&DeleteRangeRequest{}, &DeleteRangeResponse{}, sp("g", "i"), sp("h", "i")},
 	}
 
 	// A batch request with a batch response with no ResumeSpan.
 	ba := BatchRequest{}
 	br := BatchResponse{}
 	for _, tc := range testCases {
-		tc.req.SetHeader(tc.span)
+		tc.req.SetHeader(RequestHeaderFromSpan(tc.span))
 		ba.Add(tc.req)
 		br.Add(tc.resp)
 	}
 
 	var readSpans []Span
 	var writeSpans []Span
-	fn := func(span Span, write bool) {
+	fn := func(span Span, write bool) bool {
 		if write {
 			writeSpans = append(writeSpans, span)
 		} else {
 			readSpans = append(readSpans, span)
 		}
+		return true
 	}
 	ba.RefreshSpanIterate(&br, fn)
-	// Only the conditional put isn't considered a read span.
-	expReadSpans := []Span{testCases[2].span, testCases[4].span, testCases[5].span, testCases[6].span}
+	// The conditional put and init put are not considered read spans.
+	expReadSpans := []Span{testCases[4].span, testCases[5].span, testCases[6].span}
 	expWriteSpans := []Span{testCases[7].span}
 	if !reflect.DeepEqual(expReadSpans, readSpans) {
 		t.Fatalf("unexpected read spans: expected %+v, found = %+v", expReadSpans, readSpans)
@@ -272,10 +332,11 @@ func TestRefreshSpanIterate(t *testing.T) {
 	ba = BatchRequest{}
 	br = BatchResponse{}
 	for _, tc := range testCases {
-		tc.req.SetHeader(tc.span)
+		tc.req.SetHeader(RequestHeaderFromSpan(tc.span))
 		ba.Add(tc.req)
-		if tc.resume != nil {
-			tc.resp.SetHeader(ResponseHeader{ResumeSpan: tc.resume})
+		if tc.resume.Key != nil {
+			resume := tc.resume
+			tc.resp.SetHeader(ResponseHeader{ResumeSpan: &resume})
 		}
 		br.Add(tc.resp)
 	}
@@ -284,13 +345,12 @@ func TestRefreshSpanIterate(t *testing.T) {
 	writeSpans = []Span{}
 	ba.RefreshSpanIterate(&br, fn)
 	expReadSpans = []Span{
-		{Key: Key("a-initput")},
-		{Key("a"), Key("b")},
-		{Key: Key("b")},
-		{Key("e"), Key("f")},
+		sp("a", "b"),
+		sp("b", ""),
+		sp("e", "f"),
 	}
 	expWriteSpans = []Span{
-		{Key("g"), Key("h")},
+		sp("g", "h"),
 	}
 	if !reflect.DeepEqual(expReadSpans, readSpans) {
 		t.Fatalf("unexpected read spans: expected %+v, found = %+v", expReadSpans, readSpans)
@@ -305,7 +365,7 @@ func TestBatchResponseCombine(t *testing.T) {
 	{
 		txn := MakeTransaction(
 			"test", nil /* baseKey */, NormalUserPriority,
-			enginepb.SERIALIZABLE, hlc.Timestamp{WallTime: 123}, 0, /* maxOffsetNs */
+			hlc.Timestamp{WallTime: 123}, 0, /* maxOffsetNs */
 		)
 		brTxn := &BatchResponse{
 			BatchResponse_Header: BatchResponse_Header{
@@ -372,4 +432,12 @@ func TestBatchResponseCombine(t *testing.T) {
 		`can not combine *roachpb.PutResponse and *roachpb.ScanResponse` {
 		t.Fatal(err)
 	}
+}
+
+func sp(start, end string) Span {
+	res := Span{Key: Key(start)}
+	if end != "" {
+		res.EndKey = Key(end)
+	}
+	return res
 }

@@ -1,38 +1,35 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package pgwire
 
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"math/rand"
 	"reflect"
 	"testing"
 	"time"
 
-	"github.com/lib/pq/oid"
-
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/lib/pq/oid"
 )
 
 // The assertions in this test should also be caught by the integration tests on
@@ -48,11 +45,11 @@ func TestParseTs(t *testing.T) {
 		{"2006-07-08T00:00:00.000000123Z", time.Date(2006, 7, 8, 0, 0, 0, 123, time.FixedZone("UTC", 0))},
 
 		// The format accepted by pq.ParseTimestamp.
-		{"2001-02-03 04:05:06.123-07", time.Date(2001, time.February, 3, 4, 5, 6, 123000000, time.FixedZone("", -7*60*60))},
+		{"2001-02-03 04:05:06.123-07", time.Date(2001, time.February, 3, 4, 5, 6, 123000000, time.FixedZone("", 0))},
 	}
 
 	for i, test := range parseTsTests {
-		parsed, err := tree.ParseDTimestamp(test.strTimestamp, time.Nanosecond)
+		parsed, err := tree.ParseDTimestamp(nil, test.strTimestamp, time.Nanosecond)
 		if err != nil {
 			t.Errorf("%d could not parse [%s]: %v", i, test.strTimestamp, err)
 			continue
@@ -68,7 +65,7 @@ func TestTimestampRoundtrip(t *testing.T) {
 	ts := time.Date(2006, 7, 8, 0, 0, 0, 123000, time.FixedZone("UTC", 0))
 
 	parse := func(encoded []byte) time.Time {
-		decoded, err := tree.ParseDTimestamp(string(encoded), time.Nanosecond)
+		decoded, err := tree.ParseDTimestamp(nil, string(encoded), time.Nanosecond)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -96,17 +93,19 @@ func TestWriteBinaryArray(t *testing.T) {
 	// writeBuffer is equivalent to writing to two different writeBuffers and
 	// then concatenating the result.
 	st := cluster.MakeTestingClusterSettings()
-	ary, _ := tree.ParseDArrayFromString(tree.NewTestingEvalContext(st), "{1}", coltypes.Int)
+	ary, _ := tree.ParseDArrayFromString(tree.NewTestingEvalContext(st), "{1}", types.Int)
+
+	defaultConv := makeTestingConvCfg()
 
 	writeBuf1 := newWriteBuffer(nil /* bytecount */)
-	writeBuf1.writeTextDatum(context.Background(), ary, time.UTC)
-	writeBuf1.writeBinaryDatum(context.Background(), ary, time.UTC)
+	writeBuf1.writeTextDatum(context.Background(), ary, defaultConv)
+	writeBuf1.writeBinaryDatum(context.Background(), ary, time.UTC, 0 /* oid */)
 
 	writeBuf2 := newWriteBuffer(nil /* bytecount */)
-	writeBuf2.writeTextDatum(context.Background(), ary, time.UTC)
+	writeBuf2.writeTextDatum(context.Background(), ary, defaultConv)
 
 	writeBuf3 := newWriteBuffer(nil /* bytecount */)
-	writeBuf3.writeBinaryDatum(context.Background(), ary, time.UTC)
+	writeBuf3.writeBinaryDatum(context.Background(), ary, defaultConv.Location, 0 /* oid */)
 
 	concatted := bytes.Join([][]byte{writeBuf2.wrapped.Bytes(), writeBuf3.wrapped.Bytes()}, nil)
 
@@ -127,11 +126,12 @@ func TestIntArrayRoundTrip(t *testing.T) {
 		}
 	}
 
-	buf.writeTextDatum(context.Background(), d, time.UTC)
+	defaultConv := makeTestingConvCfg()
+	buf.writeTextDatum(context.Background(), d, defaultConv)
 
 	b := buf.wrapped.Bytes()
 
-	got, err := pgwirebase.DecodeOidDatum(oid.T__int8, pgwirebase.FormatText, b[4:])
+	got, err := pgwirebase.DecodeOidDatum(nil, oid.T__int8, pgwirebase.FormatText, b[4:])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,28 +142,109 @@ func TestIntArrayRoundTrip(t *testing.T) {
 	}
 }
 
+func TestFloatConversion(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	testData := []struct {
+		val              float64
+		extraFloatDigits int
+		expected         string
+	}{
+		{123.4567890123456789, 0, "123.456789012346"},
+		{123.4567890123456789, 1, "123.4567890123457"},
+		{123.4567890123456789, 2, "123.45678901234568"},
+		{123.4567890123456789, 3, "123.45678901234568"},
+		{123.4567890123456789, 100, "123.45678901234568"}, // values above 3 clamp to work like 3
+		{123.4567890123456789, -10, "123.46"},
+		{123.4567890123456789, -13, "1.2e+02"},
+		{123.4567890123456789, -15, "1e+02"},
+		{123.4567890123456789, -100, "1e+02"}, // values below -15 clamp to work like -15
+	}
+
+	for _, test := range testData {
+		t.Run(fmt.Sprintf("%g/%d", test.val, test.extraFloatDigits), func(t *testing.T) {
+			buf := newWriteBuffer(nil /* bytecount */)
+			buf.bytecount = metric.NewCounter(metric.Metadata{})
+
+			defaultConv := makeTestingConvCfg()
+			defaultConv.ExtraFloatDigits = test.extraFloatDigits
+
+			d := tree.NewDFloat(tree.DFloat(test.val))
+			buf.writeTextDatum(context.Background(), d, defaultConv)
+			b := buf.wrapped.Bytes()
+
+			got := string(b[4:])
+			if test.expected != got {
+				t.Fatalf("got %q, expected %q", got, test.expected)
+			}
+		})
+	}
+}
+
+func TestByteArrayRoundTrip(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	rng := rand.New(rand.NewSource(timeutil.Now().Unix()))
+	randValues := make(tree.Datums, 0, 11)
+	randValues = append(randValues, tree.NewDBytes(tree.DBytes("\x00abc\\\n")))
+	for i := 0; i < 10; i++ {
+		d := sqlbase.RandDatum(rng, types.Bytes, false /* nullOK */)
+		randValues = append(randValues, d)
+	}
+
+	for _, be := range []sessiondata.BytesEncodeFormat{
+		sessiondata.BytesEncodeHex, sessiondata.BytesEncodeEscape} {
+		t.Run(be.String(), func(t *testing.T) {
+			for i, d := range randValues {
+				t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+					t.Logf("byte array: %q", d.String())
+
+					buf := newWriteBuffer(nil /* bytecount */)
+					buf.bytecount = metric.NewCounter(metric.Metadata{})
+
+					defaultConv := makeTestingConvCfg()
+					defaultConv.BytesEncodeFormat = be
+					buf.writeTextDatum(context.Background(), d, defaultConv)
+					b := buf.wrapped.Bytes()
+					t.Logf("encoded: %v (%q)", b, b)
+
+					got, err := pgwirebase.DecodeOidDatum(nil, oid.T_bytea, pgwirebase.FormatText, b[4:])
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, ok := got.(*tree.DBytes); !ok {
+						t.Fatalf("parse does not return DBytes, got %T", got)
+					}
+					evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+					defer evalCtx.Stop(context.Background())
+					if got.Compare(evalCtx, d) != 0 {
+						t.Fatalf("expected %s, got %s", d, got)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestCanWriteAllDatums(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	rng := rand.New(rand.NewSource(timeutil.Now().Unix()))
 
-	for _, typ := range types.AnyNonArray {
+	defaultConv := makeTestingConvCfg()
+
+	for _, typ := range types.Scalar {
 		buf := newWriteBuffer(nil /* bytecount */)
 
-		semtyp, err := sqlbase.DatumTypeToColumnSemanticType(typ)
-		if err != nil {
-			t.Fatal(err)
-		}
-
 		for i := 0; i < 10; i++ {
-			d := sqlbase.RandDatum(rng, sqlbase.ColumnType{SemanticType: semtyp}, true)
+			d := sqlbase.RandDatum(rng, typ, true)
 
-			buf.writeTextDatum(context.Background(), d, time.UTC)
+			buf.writeTextDatum(context.Background(), d, defaultConv)
 			if buf.err != nil {
 				t.Fatalf("got %s while attempting to write datum %s as text", buf.err, d)
 			}
 
-			buf.writeBinaryDatum(context.Background(), d, time.UTC)
+			buf.writeBinaryDatum(context.Background(), d, defaultConv.Location, d.ResolvedType().Oid())
 			if buf.err != nil {
 				t.Fatalf("got %s while attempting to write datum %s as binary", buf.err, d)
 			}
@@ -177,9 +258,15 @@ func benchmarkWriteType(b *testing.B, d tree.Datum, format pgwirebase.FormatCode
 	buf := newWriteBuffer(nil /* bytecount */)
 	buf.bytecount = metric.NewCounter(metric.Metadata{Name: ""})
 
-	writeMethod := buf.writeTextDatum
+	writeMethod := func(ctx context.Context, d tree.Datum, loc *time.Location) {
+		defaultConv := makeTestingConvCfg()
+		defaultConv.Location = loc
+		buf.writeTextDatum(ctx, d, defaultConv)
+	}
 	if format == pgwirebase.FormatBinary {
-		writeMethod = buf.writeBinaryDatum
+		writeMethod = func(ctx context.Context, d tree.Datum, loc *time.Location) {
+			buf.writeBinaryDatum(ctx, d, loc, d.ResolvedType().Oid())
+		}
 	}
 
 	// Warm up the buffer.
@@ -192,6 +279,9 @@ func benchmarkWriteType(b *testing.B, d tree.Datum, format pgwirebase.FormatCode
 		// to take much longer. See http://stackoverflow.com/a/37624250/3435257.
 		// buf.wrapped.Reset() should be fast enough to be negligible.
 		writeMethod(ctx, d, nil)
+		if buf.err != nil {
+			b.Fatal(buf.err)
+		}
 		buf.wrapped.Reset()
 	}
 }
@@ -221,12 +311,17 @@ func benchmarkWriteBytes(b *testing.B, format pgwirebase.FormatCode) {
 	benchmarkWriteType(b, tree.NewDBytes("testing"), format)
 }
 
+func benchmarkWriteUUID(b *testing.B, format pgwirebase.FormatCode) {
+	u := uuid.MakeV4()
+	benchmarkWriteType(b, tree.NewDUuid(tree.DUuid{UUID: u}), format)
+}
+
 func benchmarkWriteString(b *testing.B, format pgwirebase.FormatCode) {
 	benchmarkWriteType(b, tree.NewDString("testing"), format)
 }
 
 func benchmarkWriteDate(b *testing.B, format pgwirebase.FormatCode) {
-	d, err := tree.ParseDDate("2010-09-28", time.UTC)
+	d, err := tree.ParseDDate(nil, "2010-09-28")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -234,7 +329,7 @@ func benchmarkWriteDate(b *testing.B, format pgwirebase.FormatCode) {
 }
 
 func benchmarkWriteTimestamp(b *testing.B, format pgwirebase.FormatCode) {
-	ts, err := tree.ParseDTimestamp("2010-09-28 12:00:00.1", time.Microsecond)
+	ts, err := tree.ParseDTimestamp(nil, "2010-09-28 12:00:00.1", time.Microsecond)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -242,7 +337,7 @@ func benchmarkWriteTimestamp(b *testing.B, format pgwirebase.FormatCode) {
 }
 
 func benchmarkWriteTimestampTZ(b *testing.B, format pgwirebase.FormatCode) {
-	tstz, err := tree.ParseDTimestampTZ("2010-09-28 12:00:00.1", time.UTC, time.Microsecond)
+	tstz, err := tree.ParseDTimestampTZ(nil, "2010-09-28 12:00:00.1", time.Microsecond)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -261,7 +356,8 @@ func benchmarkWriteTuple(b *testing.B, format pgwirebase.FormatCode) {
 	i := tree.NewDInt(1234)
 	f := tree.NewDFloat(12.34)
 	s := tree.NewDString("testing")
-	t := tree.NewDTuple(i, f, s)
+	typ := types.MakeTuple([]types.T{*types.Int, *types.Float, *types.String})
+	t := tree.NewDTuple(typ, i, f, s)
 	benchmarkWriteType(b, t, format)
 }
 
@@ -308,6 +404,13 @@ func BenchmarkWriteTextBytes(b *testing.B) {
 }
 func BenchmarkWriteBinaryBytes(b *testing.B) {
 	benchmarkWriteBytes(b, pgwirebase.FormatBinary)
+}
+
+func BenchmarkWriteTextUUID(b *testing.B) {
+	benchmarkWriteUUID(b, pgwirebase.FormatText)
+}
+func BenchmarkWriteBinaryUUID(b *testing.B) {
+	benchmarkWriteUUID(b, pgwirebase.FormatBinary)
 }
 
 func BenchmarkWriteTextString(b *testing.B) {
@@ -359,7 +462,7 @@ func BenchmarkDecodeBinaryDecimal(b *testing.B) {
 	if err := expected.SetString(s); err != nil {
 		b.Fatalf("could not set %q on decimal", s)
 	}
-	wbuf.writeBinaryDatum(context.Background(), expected, nil /* sessionLoc */)
+	wbuf.writeBinaryDatum(context.Background(), expected, nil /* sessionLoc */, 0 /* oid */)
 
 	rbuf := pgwirebase.ReadBuffer{Msg: wbuf.wrapped.Bytes()}
 
@@ -375,7 +478,7 @@ func BenchmarkDecodeBinaryDecimal(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		b.StartTimer()
-		got, err := pgwirebase.DecodeOidDatum(oid.T_numeric, pgwirebase.FormatBinary, bytes)
+		got, err := pgwirebase.DecodeOidDatum(nil, oid.T_numeric, pgwirebase.FormatBinary, bytes)
 		b.StopTimer()
 		evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 		defer evalCtx.Stop(context.Background())

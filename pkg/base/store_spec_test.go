@@ -1,25 +1,23 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
-package base
+package base_test
 
 import (
 	"fmt"
 	"reflect"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
 
@@ -31,7 +29,7 @@ func TestNewStoreSpec(t *testing.T) {
 	testCases := []struct {
 		value       string
 		expectedErr string
-		expected    StoreSpec
+		expected    base.StoreSpec
 	}{
 		// path
 		{"path=/mnt/hda1", "", StoreSpec{Path: "/mnt/hda1"}},
@@ -141,7 +139,7 @@ func TestNewStoreSpec(t *testing.T) {
 	}
 
 	for i, testCase := range testCases {
-		storeSpec, err := NewStoreSpec(testCase.value)
+		storeSpec, err := base.NewStoreSpec(testCase.value)
 		if err != nil {
 			if len(testCase.expectedErr) == 0 {
 				t.Errorf("%d(%s): no expected error, got %s", i, testCase.value, err)
@@ -163,7 +161,7 @@ func TestNewStoreSpec(t *testing.T) {
 
 		// Now test String() to make sure the result can be parsed.
 		storeSpecString := storeSpec.String()
-		storeSpec2, err := NewStoreSpec(storeSpecString)
+		storeSpec2, err := base.NewStoreSpec(storeSpecString)
 		if err != nil {
 			t.Errorf("%d(%s): error parsing String() result: %s", i, testCase.value, err)
 			continue
@@ -173,5 +171,49 @@ func TestNewStoreSpec(t *testing.T) {
 			t.Errorf("%d(%s): actual doesn't match expected\nactual:   %#+v\nexpected: %#+v", i, testCase.value,
 				storeSpec, storeSpec2)
 		}
+	}
+}
+
+// StoreSpec aliases base.StoreSpec for convenience.
+type StoreSpec = base.StoreSpec
+
+// SizeSpec aliases base.SizeSpec for convenience.
+type SizeSpec = base.SizeSpec
+
+func TestJoinListType(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	testData := []struct {
+		join string
+		exp  string
+		err  string
+	}{
+		{"", "", "no address specified in --join"},
+		{":", "--join=:", ""},
+		{"a", "--join=a:", ""},
+		{"a,b", "--join=a: --join=b:", ""},
+		{"a,,b", "--join=a: --join=b:", ""},
+		{",a", "--join=a:", ""},
+		{"a,", "--join=a:", ""},
+		{"a:123,b", "--join=a:123 --join=b:", ""},
+		{"[::1]:123,b", "--join=[::1]:123 --join=b:", ""},
+		{"[::1,b", "", `address \[::1: missing ']' in address`},
+	}
+
+	for _, test := range testData {
+		t.Run(test.join, func(t *testing.T) {
+			var jls base.JoinListType
+			err := jls.Set(test.join)
+			if !testutils.IsError(err, test.err) {
+				t.Fatalf("error: expected %q, got: %+v", test.err, err)
+			}
+			if test.err != "" {
+				return
+			}
+			actual := jls.String()
+			if actual != test.exp {
+				t.Errorf("expected: %q, got: %q", test.exp, actual)
+			}
+		})
 	}
 }

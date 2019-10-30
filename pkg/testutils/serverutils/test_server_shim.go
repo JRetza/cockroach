@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 //
 // This file provides generic interfaces that allow tests to set up test servers
 // without importing the server package (avoiding circular dependencies).
@@ -28,9 +24,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -52,14 +46,22 @@ type TestServerInterface interface {
 	// NodeID returns the ID of this node within its cluster.
 	NodeID() roachpb.NodeID
 
-	// ServingAddr returns the server's advertised address.
-	ServingAddr() string
+	// ServingRPCAddr returns the server's advertised address.
+	ServingRPCAddr() string
+
+	// ServingSQLAddr returns the server's advertised SQL address.
+	ServingSQLAddr() string
 
 	// HTTPAddr returns the server's http address.
 	HTTPAddr() string
 
-	// Addr returns the server's address.
-	Addr() string
+	// RPCAddr returns the server's RPC address.
+	// Note: use ServingRPCAddr() instead unless specific reason not to.
+	RPCAddr() string
+
+	// SQLAddr returns the server's SQL address.
+	// Note: use ServingSQLAddr() instead unless specific reason not to.
+	SQLAddr() string
 
 	// DB returns a *client.DB instance for talking to this KV server.
 	DB() *client.DB
@@ -78,23 +80,25 @@ type TestServerInterface interface {
 	// The real return type is sql.ExecutorConfig.
 	ExecutorConfig() interface{}
 
-	// Gossip returns the gossip used by the TestServer.
-	Gossip() *gossip.Gossip
+	// GossipI returns the gossip used by the TestServer.
+	// The real return type is *gossip.Gossip.
+	GossipI() interface{}
 
 	// Clock returns the clock used by the TestServer.
 	Clock() *hlc.Clock
 
-	// DistSender returns the DistSender used by the TestServer.
-	DistSender() *kv.DistSender
+	// DistSenderI returns the DistSender used by the TestServer.
+	// The real return type is *kv.DistSender.
+	DistSenderI() interface{}
 
-	// DistSQLServer returns the *distsqlrun.ServerImpl as an interface{}.
+	// DistSQLServer returns the *distsql.ServerImpl as an interface{}.
 	DistSQLServer() interface{}
 
 	// JobRegistry returns the *jobs.Registry as an interface{}.
 	JobRegistry() interface{}
 
 	// SetDistSQLSpanResolver changes the SpanResolver used for DistSQL inside the
-	// server's executor. The argument must be a distsqlplan.SpanResolver
+	// server's executor. The argument must be a physicalplan.SpanResolver
 	// instance.
 	//
 	// This method exists because we cannot pass the fake span resolver with the
@@ -143,6 +147,10 @@ type TestServerInterface interface {
 		splitKey roachpb.Key,
 	) (left roachpb.RangeDescriptor, right roachpb.RangeDescriptor, err error)
 
+	// MergeRanges merges the range containing leftKey with the following adjacent
+	// range.
+	MergeRanges(leftKey roachpb.Key) (merged roachpb.RangeDescriptor, err error)
+
 	// ExpectedInitialRangeCount returns the expected number of ranges that should
 	// be on the server after initial (asynchronous) splits have been completed,
 	// assuming no additional information is added outside of the normal bootstrap
@@ -177,7 +185,7 @@ func StartServer(
 	}
 
 	pgURL, cleanupGoDB := sqlutils.PGUrl(
-		t, server.ServingAddr(), "StartServer", url.User(security.RootUser))
+		t, server.ServingSQLAddr(), "StartServer" /* prefix */, url.User(security.RootUser))
 	pgURL.Path = params.UseDatabase
 	if params.Insecure {
 		pgURL.RawQuery = "sslmode=disable"

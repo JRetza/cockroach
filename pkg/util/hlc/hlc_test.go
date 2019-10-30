@@ -1,23 +1,18 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package hlc
 
 import (
 	"context"
 	"fmt"
-	"os"
 	"regexp"
 	"testing"
 	"time"
@@ -115,8 +110,8 @@ func isErrSimilar(expected *regexp.Regexp, actual error) bool {
 
 func TestHLCPhysicalClockJump(t *testing.T) {
 	var fatal bool
-	defer log.SetExitFunc(os.Exit)
-	log.SetExitFunc(func(r int) {
+	defer log.ResetExitFunc()
+	log.SetExitFunc(true /* hideStack */, func(r int) {
 		if r != 0 {
 			fatal = true
 		}
@@ -372,8 +367,8 @@ func TestHLCMonotonicityCheck(t *testing.T) {
 
 func TestHLCEnforceWallTimeWithinBoundsInNow(t *testing.T) {
 	var fatal bool
-	defer log.SetExitFunc(os.Exit)
-	log.SetExitFunc(func(r int) {
+	defer log.ResetExitFunc()
+	log.SetExitFunc(true /* hideStack */, func(r int) {
 		defer log.Flush()
 		if r != 0 {
 			fatal = true
@@ -421,8 +416,8 @@ func TestHLCEnforceWallTimeWithinBoundsInNow(t *testing.T) {
 
 func TestHLCEnforceWallTimeWithinBoundsInUpdate(t *testing.T) {
 	var fatal bool
-	defer log.SetExitFunc(os.Exit)
-	log.SetExitFunc(func(r int) {
+	defer log.ResetExitFunc()
+	log.SetExitFunc(true /* hideStack */, func(r int) {
 		defer log.Flush()
 		if r != 0 {
 			fatal = true
@@ -536,4 +531,33 @@ func TestResetAndRefreshHLCUpperBound(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLateStartForwardClockJump(t *testing.T) {
+	// Regression test for https://github.com/cockroachdb/cockroach/issues/28367
+	//
+	// Previously, if the clock offset monitor were started a long time
+	// after the last call to hlc.Clock.Now, that time would register as
+	// a forward clock jump (because the background goroutine to keep
+	// the HLC clock fresh was not yet running).
+	m := NewManualClock(1)
+	c := NewClock(m.UnixNano, 500*time.Millisecond)
+	c.Now()
+	m.Increment(int64(time.Second))
+
+	// Control channels for the clock monitor: active it immediately,
+	// then wait for the first tick. We use a real ticker because the
+	// interfaces involved are not very mock-friendly.
+	activeCh := make(chan bool, 1)
+	activeCh <- true
+	tickedCh := make(chan struct{}, 1)
+	ticked := func() {
+		tickedCh <- struct{}{}
+	}
+	if err := c.StartMonitoringForwardClockJumps(activeCh, time.NewTicker, ticked); err != nil {
+		t.Fatal(err)
+	}
+	<-tickedCh
+	c.Now()
+
 }

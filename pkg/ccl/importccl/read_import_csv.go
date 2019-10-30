@@ -10,45 +10,62 @@ package importccl
 
 import (
 	"context"
-	"encoding/csv"
 	"io"
 	"runtime"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding/csv"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 type csvInputReader struct {
 	evalCtx      *tree.EvalContext
-	kvCh         chan kvBatch
+	kvCh         chan row.KVBatch
 	recordCh     chan csvRecord
 	batchSize    int
 	batch        csvRecord
 	opts         roachpb.CSVOptions
+	walltime     int64
 	tableDesc    *sqlbase.TableDescriptor
+	targetCols   tree.NameList
 	expectedCols int
+	parallelism  int
 }
 
 var _ inputConverter = &csvInputReader{}
 
 func newCSVInputReader(
-	kvCh chan kvBatch,
+	kvCh chan row.KVBatch,
 	opts roachpb.CSVOptions,
+	walltime int64,
+	parallelism int,
 	tableDesc *sqlbase.TableDescriptor,
+	targetCols tree.NameList,
 	evalCtx *tree.EvalContext,
 ) *csvInputReader {
+	if parallelism <= 0 {
+		parallelism = runtime.NumCPU()
+	}
+
 	return &csvInputReader{
 		evalCtx:      evalCtx,
 		opts:         opts,
+		walltime:     walltime,
 		kvCh:         kvCh,
 		expectedCols: len(tableDesc.VisibleColumns()),
 		tableDesc:    tableDesc,
+		targetCols:   targetCols,
 		recordCh:     make(chan csvRecord),
 		batchSize:    500,
+		parallelism:  parallelism,
 	}
 }
 
@@ -58,7 +75,8 @@ func (c *csvInputReader) start(group ctxgroup.Group) {
 		defer tracing.FinishSpan(span)
 
 		defer close(c.kvCh)
-		return ctxgroup.GroupWorkers(ctx, runtime.NumCPU(), func(ctx context.Context) error {
+
+		return ctxgroup.GroupWorkers(ctx, c.parallelism, func(ctx context.Context) error {
 			return c.convertRecordWorker(ctx)
 		})
 	})
@@ -68,7 +86,16 @@ func (c *csvInputReader) inputFinished(_ context.Context) {
 	close(c.recordCh)
 }
 
-func (c *csvInputReader) flushBatch(ctx context.Context, finished bool, progFn progressFn) error {
+func (c *csvInputReader) readFiles(
+	ctx context.Context,
+	dataFiles map[int32]string,
+	format roachpb.IOFileFormat,
+	makeExternalStorage cloud.ExternalStorageFactory,
+) error {
+	return readInputFiles(ctx, dataFiles, format, c.readFile, makeExternalStorage)
+}
+
+func (c *csvInputReader) flushBatch(ctx context.Context, finished bool) error {
 	// if the batch isn't empty, we need to flush it.
 	if len(c.batch.r) > 0 {
 		select {
@@ -77,9 +104,6 @@ func (c *csvInputReader) flushBatch(ctx context.Context, finished bool, progFn p
 		case c.recordCh <- c.batch:
 		}
 	}
-	if progressErr := progFn(finished); progressErr != nil {
-		return progressErr
-	}
 	if !finished {
 		c.batch.r = make([][]string, 0, c.batchSize)
 	}
@@ -87,14 +111,14 @@ func (c *csvInputReader) flushBatch(ctx context.Context, finished bool, progFn p
 }
 
 func (c *csvInputReader) readFile(
-	ctx context.Context, input io.Reader, inputIdx int32, inputName string, progressFn progressFn,
+	ctx context.Context, input *fileReader, inputIdx int32, inputName string, rejected chan string,
 ) error {
 	cr := csv.NewReader(input)
 	if c.opts.Comma != 0 {
 		cr.Comma = c.opts.Comma
 	}
 	cr.FieldsPerRecord = -1
-	cr.LazyQuotes = true
+	cr.LazyQuotes = !c.opts.StrictQuotes
 	cr.Comment = c.opts.Comment
 
 	c.batch = csvRecord{
@@ -108,7 +132,8 @@ func (c *csvInputReader) readFile(
 		record, err := cr.Read()
 		finished := err == io.EOF
 		if finished || len(c.batch.r) >= c.batchSize {
-			if err := c.flushBatch(ctx, finished, progressFn); err != nil {
+			c.batch.progress = input.ReadFraction()
+			if err := c.flushBatch(ctx, finished); err != nil {
 				return err
 			}
 			c.batch.rowOffset = i
@@ -141,38 +166,63 @@ type csvRecord struct {
 	file      string
 	fileIndex int32
 	rowOffset int
+	progress  float32
 }
 
 // convertRecordWorker converts CSV records into KV pairs and sends them on the
 // kvCh chan.
 func (c *csvInputReader) convertRecordWorker(ctx context.Context) error {
-	conv, err := newRowConverter(c.tableDesc, c.evalCtx, c.kvCh)
+	// Create a new evalCtx per converter so each go routine gets its own
+	// collationenv, which can't be accessed in parallel.
+	evalCtx := c.evalCtx.Copy()
+	conv, err := row.NewDatumRowConverter(c.tableDesc, c.targetCols, evalCtx, c.kvCh)
 	if err != nil {
 		return err
 	}
-	if conv.evalCtx.SessionData == nil {
+	if conv.EvalCtx.SessionData == nil {
 		panic("uninitialized session data")
 	}
 
+	epoch := time.Date(2015, time.January, 1, 0, 0, 0, 0, time.UTC).UnixNano()
+	const precision = uint64(10 * time.Microsecond)
+	timestamp := uint64(c.walltime-epoch) / precision
+
 	for batch := range c.recordCh {
+		if conv.KvBatch.Source != batch.fileIndex {
+			if err := conv.SendBatch(ctx); err != nil {
+				return err
+			}
+			conv.KvBatch.Source = batch.fileIndex
+		}
+		conv.KvBatch.Progress = batch.progress
 		for batchIdx, record := range batch.r {
 			rowNum := int64(batch.rowOffset + batchIdx)
+			datumIdx := 0
 			for i, v := range record {
-				col := conv.visibleCols[i]
+				// Skip over record entries corresponding to columns not in the target
+				// columns specified by the user.
+				if _, ok := conv.IsTargetCol[i]; !ok {
+					continue
+				}
+				col := conv.VisibleCols[i]
 				if c.opts.NullEncoding != nil && v == *c.opts.NullEncoding {
-					conv.datums[i] = tree.DNull
+					conv.Datums[datumIdx] = tree.DNull
 				} else {
 					var err error
-					conv.datums[i], err = tree.ParseDatumStringAs(conv.visibleColTypes[i], v, conv.evalCtx)
+					conv.Datums[datumIdx], err = tree.ParseDatumStringAs(conv.VisibleColTypes[i], v, conv.EvalCtx)
 					if err != nil {
-						return makeRowErr(batch.file, rowNum, "parse %q as %s: %s:", col.Name, col.Type.SQLString(), err)
+						return wrapRowErr(err, batch.file, rowNum, pgcode.Syntax,
+							"parse %q as %s", col.Name, col.Type.SQLString())
 					}
 				}
+				datumIdx++
 			}
-			if err := conv.row(ctx, batch.fileIndex, rowNum); err != nil {
-				return makeRowErr(batch.file, rowNum, "%s", err)
+
+			rowIndex := int64(timestamp) + rowNum
+			if err := conv.Row(ctx, batch.fileIndex, rowIndex); err != nil {
+				return wrapRowErr(err, batch.file, rowNum, pgcode.Uncategorized, "")
 			}
 		}
 	}
-	return conv.sendBatch(ctx)
+	return conv.SendBatch(ctx)
 }

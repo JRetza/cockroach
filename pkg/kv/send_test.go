@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package kv
 
@@ -24,8 +20,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -46,6 +41,10 @@ func (n Node) Batch(
 	return &roachpb.BatchResponse{}, nil
 }
 
+func (n Node) RangeFeed(_ *roachpb.RangeFeedRequest, _ roachpb.Internal_RangeFeedServer) error {
+	panic("unimplemented")
+}
+
 // TestSendToOneClient verifies that Send correctly sends a request
 // to one server using the heartbeat RPC.
 func TestSendToOneClient(t *testing.T) {
@@ -54,21 +53,24 @@ func TestSendToOneClient(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.TODO())
 
-	rpcContext := rpc.NewContext(
-		log.AmbientContext{Tracer: tracing.NewTracer()},
-		testutils.NewNodeTestBaseContext(),
-		hlc.NewClock(hlc.UnixNano, time.Nanosecond),
-		stopper,
-		&cluster.MakeTestingClusterSettings().Version,
-	)
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
+	// This test uses the testing function sendBatch() which does not
+	// support setting the node ID on GRPCDialNode(). Disable Node ID
+	// checks to avoid log.Fatal.
+	rpcContext.TestingAllowNamedRPCToAnonymousServer = true
+
 	s := rpc.NewServer(rpcContext)
 	roachpb.RegisterInternalServer(s, Node(0))
 	ln, err := netutil.ListenAndServeGRPC(rpcContext.Stopper, s, util.TestAddr)
 	if err != nil {
 		t.Fatal(err)
 	}
+	nodeDialer := nodedialer.New(rpcContext, func(roachpb.NodeID) (net.Addr, error) {
+		return ln.Addr(), nil
+	})
 
-	reply, err := sendBatch(context.Background(), nil, []net.Addr{ln.Addr()}, rpcContext)
+	reply, err := sendBatch(context.Background(), nil, []net.Addr{ln.Addr()}, rpcContext, nodeDialer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +83,6 @@ func TestSendToOneClient(t *testing.T) {
 // requests to the first N addresses, then succeeds.
 type firstNErrorTransport struct {
 	replicas  ReplicaSlice
-	args      roachpb.BatchRequest
 	numErrors int
 	numSent   int
 }
@@ -90,19 +91,21 @@ func (f *firstNErrorTransport) IsExhausted() bool {
 	return f.numSent >= len(f.replicas)
 }
 
-func (f *firstNErrorTransport) GetPending() []roachpb.ReplicaDescriptor {
-	return nil
-}
-
-func (f *firstNErrorTransport) SendNext(_ context.Context, done chan<- BatchCall) {
-	call := BatchCall{
-		Reply: &roachpb.BatchResponse{},
-	}
+func (f *firstNErrorTransport) SendNext(
+	_ context.Context, _ roachpb.BatchRequest,
+) (*roachpb.BatchResponse, error) {
+	var err error
 	if f.numSent < f.numErrors {
-		call.Err = roachpb.NewSendError("test")
+		err = roachpb.NewSendError("test")
 	}
 	f.numSent++
-	done <- call
+	return &roachpb.BatchResponse{}, err
+}
+
+func (f *firstNErrorTransport) NextInternalClient(
+	ctx context.Context,
+) (context.Context, roachpb.InternalClient, error) {
+	panic("unimplemented")
 }
 
 func (f *firstNErrorTransport) NextReplica() roachpb.ReplicaDescriptor {
@@ -110,9 +113,6 @@ func (f *firstNErrorTransport) NextReplica() roachpb.ReplicaDescriptor {
 }
 
 func (*firstNErrorTransport) MoveToFront(roachpb.ReplicaDescriptor) {
-}
-
-func (*firstNErrorTransport) Close() {
 }
 
 // TestComplexScenarios verifies various complex success/failure scenarios by
@@ -123,13 +123,12 @@ func TestComplexScenarios(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.TODO())
 
-	nodeContext := rpc.NewContext(
-		log.AmbientContext{Tracer: tracing.NewTracer()},
-		testutils.NewNodeTestBaseContext(),
-		hlc.NewClock(hlc.UnixNano, time.Nanosecond),
-		stopper,
-		&cluster.MakeTestingClusterSettings().Version,
-	)
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
+	// We're going to serve multiple node IDs with that one
+	// context. Disable node ID checks.
+	rpcContext.TestingAllowNamedRPCToAnonymousServer = true
+	nodeDialer := nodedialer.New(rpcContext, nil)
 
 	// TODO(bdarnell): the retryable flag is no longer used for RPC errors.
 	// Rework this test to incorporate application-level errors carried in
@@ -162,18 +161,17 @@ func TestComplexScenarios(t *testing.T) {
 			context.Background(),
 			func(
 				_ SendOptions,
-				_ *rpc.Context,
+				_ *nodedialer.Dialer,
 				replicas ReplicaSlice,
-				args roachpb.BatchRequest,
 			) (Transport, error) {
 				return &firstNErrorTransport{
 					replicas:  replicas,
-					args:      args,
 					numErrors: test.numErrors,
 				}, nil
 			},
 			serverAddrs,
-			nodeContext,
+			rpcContext,
+			nodeDialer,
 		)
 		if test.success {
 			if err != nil {
@@ -203,40 +201,40 @@ func TestSplitHealthy(t *testing.T) {
 		{nil, nil, 0},
 		{
 			[]batchClient{
-				{remoteAddr: "1", healthy: false},
-				{remoteAddr: "2", healthy: false},
-				{remoteAddr: "3", healthy: true},
+				{replica: roachpb.ReplicaDescriptor{NodeID: 1}, healthy: false},
+				{replica: roachpb.ReplicaDescriptor{NodeID: 2}, healthy: false},
+				{replica: roachpb.ReplicaDescriptor{NodeID: 3}, healthy: true},
 			},
 			[]batchClient{
-				{remoteAddr: "3", healthy: true},
-				{remoteAddr: "1", healthy: false},
-				{remoteAddr: "2", healthy: false},
+				{replica: roachpb.ReplicaDescriptor{NodeID: 3}, healthy: true},
+				{replica: roachpb.ReplicaDescriptor{NodeID: 1}, healthy: false},
+				{replica: roachpb.ReplicaDescriptor{NodeID: 2}, healthy: false},
 			},
 			1,
 		},
 		{
 			[]batchClient{
-				{remoteAddr: "1", healthy: true},
-				{remoteAddr: "2", healthy: false},
-				{remoteAddr: "3", healthy: true},
+				{replica: roachpb.ReplicaDescriptor{NodeID: 1}, healthy: true},
+				{replica: roachpb.ReplicaDescriptor{NodeID: 2}, healthy: false},
+				{replica: roachpb.ReplicaDescriptor{NodeID: 3}, healthy: true},
 			},
 			[]batchClient{
-				{remoteAddr: "1", healthy: true},
-				{remoteAddr: "3", healthy: true},
-				{remoteAddr: "2", healthy: false},
+				{replica: roachpb.ReplicaDescriptor{NodeID: 1}, healthy: true},
+				{replica: roachpb.ReplicaDescriptor{NodeID: 3}, healthy: true},
+				{replica: roachpb.ReplicaDescriptor{NodeID: 2}, healthy: false},
 			},
 			2,
 		},
 		{
 			[]batchClient{
-				{remoteAddr: "1", healthy: true},
-				{remoteAddr: "2", healthy: true},
-				{remoteAddr: "3", healthy: true},
+				{replica: roachpb.ReplicaDescriptor{NodeID: 1}, healthy: true},
+				{replica: roachpb.ReplicaDescriptor{NodeID: 2}, healthy: true},
+				{replica: roachpb.ReplicaDescriptor{NodeID: 3}, healthy: true},
 			},
 			[]batchClient{
-				{remoteAddr: "1", healthy: true},
-				{remoteAddr: "2", healthy: true},
-				{remoteAddr: "3", healthy: true},
+				{replica: roachpb.ReplicaDescriptor{NodeID: 1}, healthy: true},
+				{replica: roachpb.ReplicaDescriptor{NodeID: 2}, healthy: true},
+				{replica: roachpb.ReplicaDescriptor{NodeID: 3}, healthy: true},
 			},
 			3,
 		},
@@ -265,13 +263,27 @@ func makeReplicas(addrs ...net.Addr) ReplicaSlice {
 
 // sendBatch sends Batch requests to specified addresses using send.
 func sendBatch(
-	ctx context.Context, transportFactory TransportFactory, addrs []net.Addr, rpcContext *rpc.Context,
+	ctx context.Context,
+	transportFactory TransportFactory,
+	addrs []net.Addr,
+	rpcContext *rpc.Context,
+	nodeDialer *nodedialer.Dialer,
 ) (*roachpb.BatchResponse, error) {
 	ds := NewDistSender(DistSenderConfig{
 		AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
-		TestingKnobs: DistSenderTestingKnobs{
+		RPCContext: rpcContext,
+		TestingKnobs: ClientTestingKnobs{
 			TransportFactory: transportFactory,
 		},
 	}, nil)
-	return ds.sendToReplicas(ctx, SendOptions{metrics: &ds.metrics}, 0, makeReplicas(addrs...), roachpb.BatchRequest{}, rpcContext)
+	return ds.sendToReplicas(
+		ctx,
+		roachpb.BatchRequest{},
+		SendOptions{metrics: &ds.metrics},
+		0, /* rangeID */
+		makeReplicas(addrs...),
+		nodeDialer,
+		roachpb.ReplicaDescriptor{},
+		false, /* withCommit */
+	)
 }

@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package batcheval
 
@@ -42,42 +38,32 @@ func RefreshRange(
 		return result.Result{}, errors.Errorf("no transaction specified to %s", args.Method())
 	}
 
-	// Use a time-bounded iterator to avoid unnecessarily iterating over
-	// older data.
-	iter := batch.NewTimeBoundIterator(h.Txn.OrigTimestamp, h.Txn.Timestamp, false)
-	defer iter.Close()
-	// Iterate over values until we discover any value written at or
-	// after the original timestamp, but before or at the current
-	// timestamp. Note that we do not iterate using the txn and the
-	// iteration is done with consistent=false. This reads only
-	// committed values and returns all intents, including those from
-	// the txn itself. Note that we include tombstones, which must be
-	// considered as updates on refresh.
-	log.VEventf(ctx, 2, "refresh %s @[%s-%s]", args.Header(), h.Txn.OrigTimestamp, h.Txn.Timestamp)
-	intents, err := engine.MVCCIterateUsingIter(
-		ctx,
-		batch,
-		args.Key,
-		args.EndKey,
-		h.Txn.Timestamp,
-		false, /* consistent */
-		true,  /* tombstones */
-		nil,   /* txn */
-		false, /* reverse */
-		iter,
-		func(kv roachpb.KeyValue) (bool, error) {
-			if ts := kv.Value.Timestamp; !ts.Less(h.Txn.OrigTimestamp) {
-				return true, errors.Errorf("encountered recently written key %s @%s", kv.Key, ts)
-			}
-			return false, nil
-		},
-	)
+	// Iterate over values until we discover any value written at or after the
+	// original timestamp, but before or at the current timestamp. Note that we
+	// iterate inconsistently without using the txn. This reads only committed
+	// values and returns all intents, including those from the txn itself. Note
+	// that we include tombstones, which must be considered as updates on refresh.
+	log.VEventf(ctx, 2, "refresh %s @[%s-%s]", args.Span(), h.Txn.OrigTimestamp, h.Txn.Timestamp)
+	intents, err := engine.MVCCIterate(ctx, batch, args.Key, args.EndKey, h.Txn.Timestamp, engine.MVCCScanOptions{
+		Inconsistent: true,
+		Tombstones:   true,
+	}, func(kv roachpb.KeyValue) (bool, error) {
+		// TODO(nvanbenschoten): This is pessimistic. We only need to check
+		//   !ts.Less(h.Txn.PrevRefreshTimestamp)
+		// This could avoid failed refreshes due to requests performed after
+		// earlier refreshes (which read at the refresh ts) that already
+		// observed writes between the orig ts and the refresh ts.
+		if ts := kv.Value.Timestamp; !ts.Less(h.Txn.OrigTimestamp) {
+			return true, errors.Errorf("encountered recently written key %s @%s", kv.Key, ts)
+		}
+		return false, nil
+	})
 	if err != nil {
 		return result.Result{}, err
 	}
 
-	// Now, check intents slice for any which were written earlier than
-	// the command's timestamp, not owned by this transaction.
+	// Check if any intents which are not owned by this transaction were written
+	// at or beneath the refresh timestamp.
 	for _, i := range intents {
 		// Ignore our own intents.
 		if i.Txn.ID == h.Txn.ID {

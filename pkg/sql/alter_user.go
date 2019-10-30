@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -18,9 +14,10 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/pkg/errors"
 )
 
 // alterUserSetPasswordNode represents an ALTER USER ... WITH PASSWORD statement.
@@ -36,7 +33,7 @@ type alterUserSetPasswordNode struct {
 func (p *planner) AlterUserSetPassword(
 	ctx context.Context, n *tree.AlterUserSetPassword,
 ) (planNode, error) {
-	tDesc, err := ResolveExistingObject(ctx, p, userTableName, true /*required*/, requireTableDesc)
+	tDesc, err := ResolveExistingObject(ctx, p, userTableName, tree.ObjectLookupFlagsWithRequired(), ResolveRequireTableDesc)
 	if err != nil {
 		return nil, err
 	}
@@ -70,11 +67,13 @@ func (n *alterUserSetPasswordNode) startExec(params runParams) error {
 
 	// The root user is not allowed a password.
 	if normalizedUsername == security.RootUser {
-		return errors.Errorf("user %s cannot use password authentication", security.RootUser)
+		return pgerror.Newf(pgcode.InvalidPassword,
+			"user %s cannot use password authentication", security.RootUser)
 	}
 
 	if len(hashedPassword) > 0 && params.extendedEvalCtx.ExecCfg.RPCContext.Insecure {
-		return errors.New("cluster in insecure mode; user cannot use password authentication")
+		return pgerror.New(pgcode.InvalidPassword,
+			"cluster in insecure mode; user cannot use password authentication")
 	}
 
 	n.run.rowsAffected, err = params.extendedEvalCtx.ExecCfg.InternalExecutor.Exec(
@@ -89,7 +88,8 @@ func (n *alterUserSetPasswordNode) startExec(params runParams) error {
 		return err
 	}
 	if n.run.rowsAffected == 0 && !n.ifExists {
-		return errors.Errorf("user %s does not exist", normalizedUsername)
+		return pgerror.Newf(pgcode.UndefinedObject,
+			"user %s does not exist", normalizedUsername)
 	}
 	return err
 }

@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package batcheval
 
@@ -35,10 +31,25 @@ func init() {
 func TransferLease(
 	ctx context.Context, batch engine.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
 ) (result.Result, error) {
-	args := cArgs.Args.(*roachpb.TransferLeaseRequest)
-
 	// When returning an error from this method, must always return
 	// a newFailedLeaseTrigger() to satisfy stats.
+	args := cArgs.Args.(*roachpb.TransferLeaseRequest)
+
+	// For now, don't allow replicas of type LEARNER to be leaseholders. There's
+	// no reason this wouldn't work in principle, but it seems inadvisable. In
+	// particular, learners can't become raft leaders, so we wouldn't be able to
+	// co-locate the leaseholder + raft leader, which is going to affect tail
+	// latencies. Additionally, as of the time of writing, learner replicas are
+	// only used for a short time in replica addition, so it's not worth working
+	// out the edge cases. If we decide to start using long-lived learners at some
+	// point, that math may change.
+	//
+	// If this check is removed at some point, the filtering of learners on the
+	// sending side would have to be removed as well.
+	if err := checkCanReceiveLease(cArgs.EvalCtx); err != nil {
+		return newFailedLeaseTrigger(true /* isTransfer */), err
+	}
+
 	prevLease, _ := cArgs.EvalCtx.GetLease()
 	if log.V(2) {
 		log.Infof(ctx, "lease transfer: prev lease: %+v, new lease: %+v", prevLease, args.Lease)

@@ -1,5 +1,3 @@
-# LogicTest: default parallel-stmts distsql distsql-metadata
-
 query T
 SHOW DATABASES
 ----
@@ -50,7 +48,7 @@ SET sql_safe_updates = FALSE;
 statement error pgcode 42P01 relation "kv" does not exist
 SELECT * FROM kv
 
-statement error database "test" does not exist
+statement error target database or schema does not exist
 SHOW GRANTS ON DATABASE test
 
 query T
@@ -105,7 +103,7 @@ GRANT ALL ON DATABASE t TO testuser
 
 user testuser
 
-statement error only superusers are allowed to ALTER DATABASE ... RENAME
+statement error only users with the admin role are allowed to ALTER DATABASE ... RENAME
 ALTER DATABASE t RENAME TO v
 
 query T
@@ -147,3 +145,29 @@ ALTER DATABASE defaultdb RENAME TO w;
   ALTER DATABASE postgres RENAME TO defaultdb;
   ALTER DATABASE w RENAME TO postgres
 
+query T
+SHOW DATABASES
+----
+defaultdb
+postgres
+system
+t
+v
+
+query TTT
+EXPLAIN ALTER DATABASE v RENAME TO x
+----
+·                distributed  false
+·                vectorized   false
+rename database  ·            ·
+
+# Verify that the EXPLAIN above does not actually rename the database (#30543)
+query T colnames
+SHOW DATABASES
+----
+database_name
+defaultdb
+postgres
+system
+t
+v

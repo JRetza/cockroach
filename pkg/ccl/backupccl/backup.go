@@ -11,31 +11,35 @@ package backupccl
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io/ioutil"
+	"net/url"
 	"sort"
 	"time"
 
-	"github.com/pkg/errors"
-
 	"github.com/cockroachdb/cockroach/pkg/build"
-	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
-	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl/intervalccl"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/jobs"
+	"github.com/cockroachdb/cockroach/pkg/sql/covering"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
-	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/interval"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -43,27 +47,42 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/errors"
 )
 
 const (
 	// BackupDescriptorName is the file name used for serialized
 	// BackupDescriptor protos.
 	BackupDescriptorName = "BACKUP"
+	// BackupManifestName is a future name for the serialized
+	// BackupDescriptor proto.
+	BackupManifestName = "BACKUP_MANIFEST"
+
+	// BackupPartitionDescriptorPrefix is the file name prefix for serialized
+	// BackupPartitionDescriptor protos.
+	BackupPartitionDescriptorPrefix = "BACKUP_PART"
 	// BackupDescriptorCheckpointName is the file name used to store the
 	// serialized BackupDescriptor proto while the backup is in progress.
 	BackupDescriptorCheckpointName = "BACKUP-CHECKPOINT"
-	// BackupFormatInitialVersion is the first version of backup and its files.
-	BackupFormatInitialVersion uint32 = 0
 	// BackupFormatDescriptorTrackingVersion added tracking of complete DBs.
 	BackupFormatDescriptorTrackingVersion uint32 = 1
 )
 
 const (
 	backupOptRevisionHistory = "revision_history"
+	localityURLParam         = "COCKROACH_LOCALITY"
+	defaultLocalityValue     = "default"
 )
 
-var backupOptionExpectValues = map[string]bool{
-	backupOptRevisionHistory: false,
+var useTBI = settings.RegisterBoolSetting(
+	"kv.bulk_io_write.experimental_incremental_export_enabled",
+	"use experimental time-bound file filter when exporting in BACKUP",
+	false,
+)
+
+var backupOptionExpectValues = map[string]sql.KVStringOptValidate{
+	backupOptRevisionHistory: sql.KVStringOptRequireNoValue,
 }
 
 // BackupCheckpointInterval is the interval at which backup progress is saved
@@ -74,16 +93,21 @@ var BackupCheckpointInterval = time.Minute
 // reads and unmarshals a BackupDescriptor at the standard location in the
 // export storage.
 func ReadBackupDescriptorFromURI(
-	ctx context.Context, uri string, settings *cluster.Settings,
+	ctx context.Context, uri string, makeExternalStorageFromURI cloud.ExternalStorageFromURIFactory,
 ) (BackupDescriptor, error) {
-	exportStore, err := storageccl.ExportStorageFromURI(ctx, uri, settings)
+	exportStore, err := makeExternalStorageFromURI(ctx, uri)
+
 	if err != nil {
 		return BackupDescriptor{}, err
 	}
 	defer exportStore.Close()
 	backupDesc, err := readBackupDescriptor(ctx, exportStore, BackupDescriptorName)
 	if err != nil {
-		return BackupDescriptor{}, err
+		backupManifest, manifestErr := readBackupDescriptor(ctx, exportStore, BackupManifestName)
+		if manifestErr != nil {
+			return BackupDescriptor{}, err
+		}
+		backupDesc = backupManifest
 	}
 	backupDesc.Dir = exportStore.Conf()
 	// TODO(dan): Sanity check this BackupDescriptor: non-empty EndTime,
@@ -94,7 +118,7 @@ func ReadBackupDescriptorFromURI(
 // readBackupDescriptor reads and unmarshals a BackupDescriptor from filename in
 // the provided export store.
 func readBackupDescriptor(
-	ctx context.Context, exportStore storageccl.ExportStorage, filename string,
+	ctx context.Context, exportStore cloud.ExternalStorage, filename string,
 ) (BackupDescriptor, error) {
 	r, err := exportStore.ReadFile(ctx, filename)
 	if err != nil {
@@ -108,6 +132,42 @@ func readBackupDescriptor(
 	var backupDesc BackupDescriptor
 	if err := protoutil.Unmarshal(descBytes, &backupDesc); err != nil {
 		return BackupDescriptor{}, err
+	}
+	for _, d := range backupDesc.Descriptors {
+		// Calls to GetTable are generally frowned upon.
+		// This specific call exists to provide backwards compatibility with
+		// backups created prior to version 19.1. Starting in v19.1 the
+		// ModificationTime is always written in backups for all versions
+		// of table descriptors. In earlier cockroach versions only later
+		// table descriptor versions contain a non-empty ModificationTime.
+		// Later versions of CockroachDB use the MVCC timestamp to fill in
+		// the ModificationTime for table descriptors. When performing a restore
+		// we no longer have access to that MVCC timestamp but we can set it
+		// to a value we know will be safe.
+		if t := d.GetTable(); t == nil {
+			continue
+		} else if t.Version == 1 && t.ModificationTime.IsEmpty() {
+			t.ModificationTime = hlc.Timestamp{WallTime: 1}
+		}
+	}
+	return backupDesc, err
+}
+
+func readBackupPartitionDescriptor(
+	ctx context.Context, exportStore cloud.ExternalStorage, filename string,
+) (BackupPartitionDescriptor, error) {
+	r, err := exportStore.ReadFile(ctx, filename)
+	if err != nil {
+		return BackupPartitionDescriptor{}, err
+	}
+	defer r.Close()
+	descBytes, err := ioutil.ReadAll(r)
+	if err != nil {
+		return BackupPartitionDescriptor{}, err
+	}
+	var backupDesc BackupPartitionDescriptor
+	if err := protoutil.Unmarshal(descBytes, &backupDesc); err != nil {
+		return BackupPartitionDescriptor{}, err
 	}
 	return backupDesc, err
 }
@@ -151,7 +211,7 @@ func getRelevantDescChanges(
 	// obviously interesting to our backup.
 	for _, i := range descs {
 		interestingIDs[i.GetID()] = struct{}{}
-		if t := i.GetTable(); t != nil {
+		if t := i.Table(hlc.Timestamp{}); t != nil {
 			for j := t.ReplacementOf.ID; j != sqlbase.InvalidID; j = priorIDs[j] {
 				interestingIDs[j] = struct{}{}
 			}
@@ -173,7 +233,7 @@ func getRelevantDescChanges(
 			return nil, err
 		}
 		for _, i := range starting {
-			if table := i.GetTable(); table != nil {
+			if table := i.Table(hlc.Timestamp{}); table != nil {
 				// We need to add to interestingIDs so that if we later see a delete for
 				// this ID we still know it is interesting to us, even though we will not
 				// have a parentID at that point (since the delete is a nil desc).
@@ -204,7 +264,7 @@ func getRelevantDescChanges(
 		if _, ok := interestingIDs[change.ID]; ok {
 			interestingChanges = append(interestingChanges, change)
 		} else if change.Desc != nil {
-			if table := change.Desc.GetTable(); table != nil {
+			if table := change.Desc.Table(hlc.Timestamp{}); table != nil {
 				if _, ok := interestingParents[table.ParentID]; ok {
 					interestingIDs[table.ID] = struct{}{}
 					interestingChanges = append(interestingChanges, change)
@@ -252,7 +312,8 @@ func getAllDescChanges(
 					return nil, err
 				}
 				r.Desc = &desc
-				if t := desc.GetTable(); t != nil && t.ReplacementOf.ID != sqlbase.InvalidID {
+				t := desc.Table(rev.Timestamp)
+				if t != nil && t.ReplacementOf.ID != sqlbase.InvalidID {
 					priorIDs[t.ID] = t.ReplacementOf.ID
 				}
 			}
@@ -267,17 +328,17 @@ func allSQLDescriptors(ctx context.Context, txn *client.Txn) ([]sqlbase.Descript
 	endKey := startKey.PrefixEnd()
 	rows, err := txn.Scan(ctx, startKey, endKey, 0)
 	if err != nil {
-		// NB: Don't wrap this error, as wrapped HandledRetryableTxnErrors are not
-		// automatically retried by db.Txn.
-		//
-		// TODO(benesch): teach the KV layer to use errors.Cause.
 		return nil, err
 	}
 
 	sqlDescs := make([]sqlbase.Descriptor, len(rows))
 	for i, row := range rows {
 		if err := row.ValueProto(&sqlDescs[i]); err != nil {
-			return nil, errors.Wrapf(err, "%s: unable to unmarshal SQL descriptor", row.Key)
+			return nil, errors.NewAssertionErrorWithWrappedErrf(err,
+				"%s: unable to unmarshal SQL descriptor", row.Key)
+		}
+		if row.Value != nil {
+			sqlDescs[i].Table(row.Value.Timestamp)
 		}
 	}
 	return sqlDescs, nil
@@ -316,17 +377,15 @@ func ensureInterleavesIncluded(tables []*sqlbase.TableDescriptor) error {
 func allRangeDescriptors(ctx context.Context, txn *client.Txn) ([]roachpb.RangeDescriptor, error) {
 	rows, err := txn.Scan(ctx, keys.Meta2Prefix, keys.MetaMax, 0)
 	if err != nil {
-		// NB: Don't wrap this error, as wrapped HandledRetryableTxnErrors are not
-		// automatically retried by db.Txn.
-		//
-		// TODO(benesch): teach the KV layer to use errors.Cause.
-		return nil, err
+		return nil, errors.Wrapf(err,
+			"unable to scan range descriptors")
 	}
 
 	rangeDescs := make([]roachpb.RangeDescriptor, len(rows))
 	for i, row := range rows {
 		if err := row.ValueProto(&rangeDescs[i]); err != nil {
-			return nil, errors.Wrapf(err, "%s: unable to unmarshal range descriptor", row.Key)
+			return nil, errors.NewAssertionErrorWithWrappedErrf(err,
+				"%s: unable to unmarshal range descriptor", row.Key)
 		}
 	}
 	return rangeDescs, nil
@@ -348,7 +407,7 @@ func spansForAllTableIndexes(
 	for _, table := range tables {
 		for _, index := range table.AllNonDropIndexes() {
 			if err := sstIntervalTree.Insert(intervalSpan(table.IndexSpan(index.ID)), false); err != nil {
-				panic(errors.Wrap(err, "IndexSpan"))
+				panic(errors.NewAssertionErrorWithWrappedErrf(err, "IndexSpan"))
 			}
 			added[tableAndIndex{tableID: table.ID, indexID: index.ID}] = true
 		}
@@ -357,12 +416,12 @@ func spansForAllTableIndexes(
 	// in them that we didn't already get above e.g. indexes or tables that are
 	// not in latest because they were dropped during the time window in question.
 	for _, rev := range revs {
-		if tbl := rev.Desc.GetTable(); tbl != nil {
+		if tbl := rev.Desc.Table(hlc.Timestamp{}); tbl != nil {
 			for _, idx := range tbl.AllNonDropIndexes() {
 				key := tableAndIndex{tableID: tbl.ID, indexID: idx.ID}
 				if !added[key] {
 					if err := sstIntervalTree.Insert(intervalSpan(tbl.IndexSpan(idx.ID)), false); err != nil {
-						panic(errors.Wrap(err, "IndexSpan"))
+						panic(errors.NewAssertionErrorWithWrappedErrf(err, "IndexSpan"))
 					}
 					added[key] = true
 				}
@@ -381,18 +440,18 @@ func spansForAllTableIndexes(
 	return spans
 }
 
-// coveringFromSpans creates an intervalccl.Covering with a fixed payload from a
+// coveringFromSpans creates an interval.Covering with a fixed payload from a
 // slice of roachpb.Spans.
-func coveringFromSpans(spans []roachpb.Span, payload interface{}) intervalccl.Covering {
-	var covering intervalccl.Covering
+func coveringFromSpans(spans []roachpb.Span, payload interface{}) covering.Covering {
+	var c covering.Covering
 	for _, span := range spans {
-		covering = append(covering, intervalccl.Range{
+		c = append(c, covering.Range{
 			Start:   []byte(span.Key),
 			End:     []byte(span.EndKey),
 			Payload: payload,
 		})
 	}
-	return covering
+	return c
 }
 
 // splitAndFilterSpans returns the spans that represent the set difference
@@ -407,16 +466,16 @@ func splitAndFilterSpans(
 	includeCovering := coveringFromSpans(includes, includeMarker{})
 	excludeCovering := coveringFromSpans(excludes, excludeMarker{})
 
-	var rangeCovering intervalccl.Covering
+	var rangeCovering covering.Covering
 	for _, rangeDesc := range ranges {
-		rangeCovering = append(rangeCovering, intervalccl.Range{
+		rangeCovering = append(rangeCovering, covering.Range{
 			Start: []byte(rangeDesc.StartKey),
 			End:   []byte(rangeDesc.EndKey),
 		})
 	}
 
-	splits := intervalccl.OverlapCoveringMerge(
-		[]intervalccl.Covering{includeCovering, excludeCovering, rangeCovering},
+	splits := covering.OverlapCoveringMerge(
+		[]covering.Covering{includeCovering, excludeCovering, rangeCovering},
 	)
 
 	var out []roachpb.Span
@@ -441,39 +500,66 @@ func splitAndFilterSpans(
 	return out
 }
 
+func optsToKVOptions(opts map[string]string) tree.KVOptions {
+	if len(opts) == 0 {
+		return nil
+	}
+	sortedOpts := make([]string, 0, len(opts))
+	for k := range opts {
+		sortedOpts = append(sortedOpts, k)
+	}
+	sort.Strings(sortedOpts)
+	kvopts := make(tree.KVOptions, 0, len(opts))
+	for _, k := range sortedOpts {
+		opt := tree.KVOption{Key: tree.Name(k)}
+		if v := opts[k]; v != "" {
+			opt.Value = tree.NewDString(v)
+		}
+		kvopts = append(kvopts, opt)
+	}
+	return kvopts
+}
+
 func backupJobDescription(
-	backup *tree.Backup, to string, incrementalFrom []string,
+	p sql.PlanHookState,
+	backup *tree.Backup,
+	to []string,
+	incrementalFrom []string,
+	opts map[string]string,
 ) (string, error) {
 	b := &tree.Backup{
 		AsOf:    backup.AsOf,
-		Options: backup.Options,
+		Options: optsToKVOptions(opts),
 		Targets: backup.Targets,
 	}
 
-	to, err := storageccl.SanitizeExportStorageURI(to)
-	if err != nil {
-		return "", err
+	for _, t := range to {
+		sanitizedTo, err := cloud.SanitizeExternalStorageURI(t)
+		if err != nil {
+			return "", err
+		}
+		b.To = append(b.To, tree.NewDString(sanitizedTo))
 	}
-	b.To = tree.NewDString(to)
 
 	for _, from := range incrementalFrom {
-		sanitizedFrom, err := storageccl.SanitizeExportStorageURI(from)
+		sanitizedFrom, err := cloud.SanitizeExternalStorageURI(from)
 		if err != nil {
 			return "", err
 		}
 		b.IncrementalFrom = append(b.IncrementalFrom, tree.NewDString(sanitizedFrom))
 	}
-	return tree.AsStringWithFlags(b, tree.FmtAlwaysQualifyTableNames), nil
+
+	ann := p.ExtendedEvalContext().Annotations
+	return tree.AsStringWithFQNames(b, ann), nil
 }
 
 // clusterNodeCount returns the approximate number of nodes in the cluster.
 func clusterNodeCount(g *gossip.Gossip) int {
 	var nodes int
-	for k := range g.GetInfoStatus().Infos {
-		if gossip.IsNodeIDKey(k) {
-			nodes++
-		}
-	}
+	_ = g.IterateInfos(gossip.KeyNodeIDPrefix, func(_ string, _ gossip.Info) error {
+		nodes++
+		return nil
+	})
 	return nodes
 }
 
@@ -491,12 +577,38 @@ func (r BackupFileDescriptors) Less(i, j int) bool {
 
 func writeBackupDescriptor(
 	ctx context.Context,
-	exportStore storageccl.ExportStorage,
+	settings *cluster.Settings,
+	exportStore cloud.ExternalStorage,
 	filename string,
 	desc *BackupDescriptor,
 ) error {
 	sort.Sort(BackupFileDescriptors(desc.Files))
 
+	// When writing a backup descriptor, make sure to downgrade any new-style FKs
+	// when we're in the 19.1/2 mixed state so that 19.1 clusters can still
+	// restore backups taken on a 19.1/2 mixed cluster.
+	// TODO(lucy, jordan): Remove in 20.1.
+	downgradedDesc, err := maybeDowngradeTableDescsInBackupDescriptor(ctx, settings, desc)
+	if err != nil {
+		return err
+	}
+
+	descBuf, err := protoutil.Marshal(downgradedDesc)
+	if err != nil {
+		return err
+	}
+	return exportStore.WriteFile(ctx, filename, bytes.NewReader(descBuf))
+}
+
+// writeBackupPartitionDescriptor writes metadata (containing a locality KV and
+// partial file listing) for a partitioned BACKUP to one of the stores in the
+// backup.
+func writeBackupPartitionDescriptor(
+	ctx context.Context,
+	exportStore cloud.ExternalStorage,
+	filename string,
+	desc *BackupPartitionDescriptor,
+) error {
 	descBuf, err := protoutil.Marshal(desc)
 	if err != nil {
 		return err
@@ -509,18 +621,14 @@ func loadAllDescs(
 	ctx context.Context, db *client.DB, asOf hlc.Timestamp,
 ) ([]sqlbase.Descriptor, error) {
 	var allDescs []sqlbase.Descriptor
-	// TODO(andrei): Plumb a gatewayNodeID in here and also find a way to
-	// express that whatever this txn does should not count towards lease
-	// placement stats.
-	txn := client.NewTxn(db, 0 /* gatewayNodeID */, client.RootTxn)
-	opt := client.TxnExecOptions{AutoRetry: true, AutoCommit: true}
-	err := txn.Exec(ctx, opt, func(ctx context.Context, txn *client.Txn, opt *client.TxnExecOptions) error {
-		var err error
-		txn.SetFixedTimestamp(ctx, asOf)
-		allDescs, err = allSQLDescriptors(ctx, txn)
-		return err
-	})
-	if err != nil {
+	if err := db.Txn(
+		ctx,
+		func(ctx context.Context, txn *client.Txn) error {
+			var err error
+			txn.SetFixedTimestamp(ctx, asOf)
+			allDescs, err = allSQLDescriptors(ctx, txn)
+			return err
+		}); err != nil {
 		return nil, err
 	}
 	return allDescs, nil
@@ -565,11 +673,13 @@ func backup(
 	db *client.DB,
 	gossip *gossip.Gossip,
 	settings *cluster.Settings,
-	exportStore storageccl.ExportStorage,
+	defaultStore cloud.ExternalStorage,
+	storageByLocalityKV map[string]*roachpb.ExternalStorage,
 	job *jobs.Job,
 	backupDesc *BackupDescriptor,
 	checkpointDesc *BackupDescriptor,
 	resultsCh chan<- tree.Datums,
+	makeExternalStorage cloud.ExternalStorageFactory,
 ) (roachpb.BulkOpSummary, error) {
 	// TODO(dan): Figure out how permissions should work. #6713 is tracking this
 	// for grpc.
@@ -592,7 +702,7 @@ func backup(
 		ranges, err = allRangeDescriptors(ctx, txn)
 		return err
 	}); err != nil {
-		return mu.exported, errors.Wrap(err, "fetching range descriptors")
+		return mu.exported, err
 	}
 
 	var completedSpans, completedIntroducedSpans []roachpb.Span
@@ -625,11 +735,7 @@ func backup(
 		allSpans = append(allSpans, spanAndTime{span: s, start: backupDesc.StartTime, end: backupDesc.EndTime})
 	}
 
-	progressLogger := jobs.ProgressLogger{
-		Job:           job,
-		TotalChunks:   len(spans),
-		StartFraction: job.Payload().FractionCompleted,
-	}
+	progressLogger := jobs.NewChunkProgressLogger(job, len(spans), job.FractionCompleted(), jobs.ProgressUpdateOnly)
 
 	// We're already limiting these on the server-side, but sending all the
 	// Export requests at once would fill up distsender/grpc/something and cause
@@ -647,7 +753,7 @@ func backup(
 	// TODO(dan): Make this limiting per node.
 	//
 	// TODO(dan): See if there's some better solution than rate-limiting #14798.
-	maxConcurrentExports := clusterNodeCount(gossip) * int(storage.ExportRequestsLimit.Get(&settings.SV))
+	maxConcurrentExports := clusterNodeCount(gossip) * int(storage.ExportRequestsLimit.Get(&settings.SV)) * 10
 	exportsSem := make(chan struct{}, maxConcurrentExports)
 
 	g := ctxgroup.WithContext(ctx)
@@ -662,76 +768,87 @@ func backup(
 			return progressLogger.Loop(ctx, requestFinishedCh)
 		})
 	}
+	g.GoCtx(func(ctx context.Context) error {
+		for i := range allSpans {
+			{
+				select {
+				case exportsSem <- struct{}{}:
+				case <-ctx.Done():
+					// Break the for loop to avoid creating more work - the backup
+					// has failed because either the context has been canceled or an
+					// error has been returned. Either way, Wait() is guaranteed to
+					// return an error now.
+					return ctx.Err()
+				}
+			}
 
-	for i := range allSpans {
-		select {
-		case exportsSem <- struct{}{}:
-		case <-g.Done:
-			return mu.exported, g.Err()
+			span := allSpans[i]
+			g.GoCtx(func(ctx context.Context) error {
+				defer func() { <-exportsSem }()
+				header := roachpb.Header{Timestamp: span.end}
+				req := &roachpb.ExportRequest{
+					RequestHeader:                       roachpb.RequestHeaderFromSpan(span.span),
+					Storage:                             defaultStore.Conf(),
+					StorageByLocalityKV:                 storageByLocalityKV,
+					StartTime:                           span.start,
+					EnableTimeBoundIteratorOptimization: useTBI.Get(&settings.SV),
+					MVCCFilter:                          roachpb.MVCCFilter(backupDesc.MVCCFilter),
+				}
+				rawRes, pErr := client.SendWrappedWith(ctx, db.NonTransactionalSender(), header, req)
+				if pErr != nil {
+					return pErr.GoError()
+				}
+				res := rawRes.(*roachpb.ExportResponse)
+
+				mu.Lock()
+				if backupDesc.RevisionStartTime.Less(res.StartTime) {
+					backupDesc.RevisionStartTime = res.StartTime
+				}
+				for _, file := range res.Files {
+					f := BackupDescriptor_File{
+						Span:        file.Span,
+						Path:        file.Path,
+						Sha512:      file.Sha512,
+						EntryCounts: file.Exported,
+						LocalityKV:  file.LocalityKV,
+					}
+					if span.start != backupDesc.StartTime {
+						f.StartTime = span.start
+						f.EndTime = span.end
+					}
+					mu.files = append(mu.files, f)
+					mu.exported.Add(file.Exported)
+				}
+				var checkpointFiles BackupFileDescriptors
+				if timeutil.Since(mu.lastCheckpoint) > BackupCheckpointInterval {
+					// We optimistically assume the checkpoint will succeed to prevent
+					// multiple threads from attempting to checkpoint.
+					mu.lastCheckpoint = timeutil.Now()
+					checkpointFiles = append(checkpointFiles, mu.files...)
+				}
+				mu.Unlock()
+
+				requestFinishedCh <- struct{}{}
+
+				if checkpointFiles != nil {
+					checkpointMu.Lock()
+					backupDesc.Files = checkpointFiles
+					err := writeBackupDescriptor(
+						ctx, settings, defaultStore, BackupDescriptorCheckpointName, backupDesc,
+					)
+					checkpointMu.Unlock()
+					if err != nil {
+						log.Errorf(ctx, "unable to checkpoint backup descriptor: %+v", err)
+					}
+				}
+				return nil
+			})
 		}
-
-		span := allSpans[i]
-		g.GoCtx(func(ctx context.Context) error {
-			defer func() { <-exportsSem }()
-			header := roachpb.Header{Timestamp: span.end}
-			req := &roachpb.ExportRequest{
-				Span:       span.span,
-				Storage:    exportStore.Conf(),
-				StartTime:  span.start,
-				MVCCFilter: roachpb.MVCCFilter(backupDesc.MVCCFilter),
-			}
-			rawRes, pErr := client.SendWrappedWith(ctx, db.GetSender(), header, req)
-			if pErr != nil {
-				return pErr.GoError()
-			}
-			res := rawRes.(*roachpb.ExportResponse)
-
-			mu.Lock()
-			if backupDesc.RevisionStartTime.Less(res.StartTime) {
-				backupDesc.RevisionStartTime = res.StartTime
-			}
-			for _, file := range res.Files {
-				f := BackupDescriptor_File{
-					Span:        file.Span,
-					Path:        file.Path,
-					Sha512:      file.Sha512,
-					EntryCounts: file.Exported,
-				}
-				if span.start != backupDesc.StartTime {
-					f.StartTime = span.start
-					f.EndTime = span.end
-				}
-				mu.files = append(mu.files, f)
-				mu.exported.Add(file.Exported)
-			}
-			var checkpointFiles BackupFileDescriptors
-			if timeutil.Since(mu.lastCheckpoint) > BackupCheckpointInterval {
-				// We optimistically assume the checkpoint will succeed to prevent
-				// multiple threads from attempting to checkpoint.
-				mu.lastCheckpoint = timeutil.Now()
-				checkpointFiles = append(checkpointFiles, mu.files...)
-			}
-			mu.Unlock()
-
-			requestFinishedCh <- struct{}{}
-
-			if checkpointFiles != nil {
-				checkpointMu.Lock()
-				backupDesc.Files = checkpointFiles
-				err := writeBackupDescriptor(
-					ctx, exportStore, BackupDescriptorCheckpointName, backupDesc,
-				)
-				checkpointMu.Unlock()
-				if err != nil {
-					log.Errorf(ctx, "unable to checkpoint backup descriptor: %+v", err)
-				}
-			}
-			return nil
-		})
-	}
+		return nil
+	})
 
 	if err := g.Wait(); err != nil {
-		return mu.exported, errors.Wrapf(err, "exporting %d ranges", len(spans))
+		return mu.exported, errors.Wrapf(err, "exporting %d ranges", errors.Safe(len(spans)))
 	}
 
 	// No more concurrency, so no need to acquire locks below.
@@ -739,11 +856,66 @@ func backup(
 	backupDesc.Files = mu.files
 	backupDesc.EntryCounts = mu.exported
 
-	if err := writeBackupDescriptor(ctx, exportStore, BackupDescriptorName, backupDesc); err != nil {
+	backupID := uuid.MakeV4()
+	backupDesc.ID = backupID
+	// Write additional partial descriptors to each node for partitioned backups.
+	if len(storageByLocalityKV) > 0 {
+		filesByLocalityKV := make(map[string][]BackupDescriptor_File)
+		for i := range mu.files {
+			file := &mu.files[i]
+			filesByLocalityKV[file.LocalityKV] = append(filesByLocalityKV[file.LocalityKV], *file)
+		}
+
+		nextPartitionedDescFilenameID := 1
+		for kv, conf := range storageByLocalityKV {
+			backupDesc.LocalityKVs = append(backupDesc.LocalityKVs, kv)
+			// Set a unique filename for each partition backup descriptor. The ID
+			// ensures uniqueness, and the kv string appended to the end is for
+			// readability.
+			filename := fmt.Sprintf("%s_%d_%s",
+				BackupPartitionDescriptorPrefix, nextPartitionedDescFilenameID, sanitizeLocalityKV(kv))
+			nextPartitionedDescFilenameID++
+			backupDesc.PartitionDescriptorFilenames = append(backupDesc.PartitionDescriptorFilenames, filename)
+			desc := BackupPartitionDescriptor{
+				LocalityKV: kv,
+				Files:      filesByLocalityKV[kv],
+				BackupID:   backupID,
+			}
+
+			if err := func() error {
+				store, err := makeExternalStorage(ctx, *conf)
+				if err != nil {
+					return err
+				}
+				defer store.Close()
+				return writeBackupPartitionDescriptor(ctx, store, filename, &desc)
+			}(); err != nil {
+				return mu.exported, err
+			}
+		}
+	}
+
+	if err := writeBackupDescriptor(ctx, settings, defaultStore, BackupDescriptorName, backupDesc); err != nil {
 		return mu.exported, err
 	}
 
 	return mu.exported, nil
+}
+
+// sanitizeLocalityKV returns a sanitized version of the input string where all
+// characters that are not alphanumeric or -, =, or _ are replaced with _.
+func sanitizeLocalityKV(kv string) string {
+	sanitizedKV := make([]byte, len(kv))
+	for i := 0; i < len(kv); i++ {
+		if (kv[i] >= 'a' && kv[i] <= 'z') ||
+			(kv[i] >= 'A' && kv[i] <= 'Z') ||
+			(kv[i] >= '0' && kv[i] <= '9') || kv[i] == '-' || kv[i] == '=' {
+			sanitizedKV[i] = kv[i]
+		} else {
+			sanitizedKV[i] = '_'
+		}
+	}
+	return string(sanitizedKV)
 }
 
 // VerifyUsableExportTarget ensures that the target location does not already
@@ -753,22 +925,35 @@ func backup(
 // clean up the written checkpoint file (BackupDescriptorCheckpointName) only
 // after writing to the backup file location (BackupDescriptorName).
 func VerifyUsableExportTarget(
-	ctx context.Context, exportStore storageccl.ExportStorage, readable string,
+	ctx context.Context,
+	settings *cluster.Settings,
+	exportStore cloud.ExternalStorage,
+	readable string,
 ) error {
 	if r, err := exportStore.ReadFile(ctx, BackupDescriptorName); err == nil {
-		// TODO(dt): If we audit exactly what not-exists error each ExportStorage
+		// TODO(dt): If we audit exactly what not-exists error each ExternalStorage
 		// returns (and then wrap/tag them), we could narrow this check.
 		r.Close()
-		return errors.Errorf("%s already contains a %s file",
+		return pgerror.Newf(pgcode.DuplicateFile,
+			"%s already contains a %s file",
 			readable, BackupDescriptorName)
+	}
+	if r, err := exportStore.ReadFile(ctx, BackupManifestName); err == nil {
+		// TODO(dt): If we audit exactly what not-exists error each ExternalStorage
+		// returns (and then wrap/tag them), we could narrow this check.
+		r.Close()
+		return pgerror.Newf(pgcode.DuplicateFile,
+			"%s already contains a %s file",
+			readable, BackupManifestName)
 	}
 	if r, err := exportStore.ReadFile(ctx, BackupDescriptorCheckpointName); err == nil {
 		r.Close()
-		return errors.Errorf("%s already contains a %s file (is another operation already in progress?)",
+		return pgerror.Newf(pgcode.DuplicateFile,
+			"%s already contains a %s file (is another operation already in progress?)",
 			readable, BackupDescriptorCheckpointName)
 	}
 	if err := writeBackupDescriptor(
-		ctx, exportStore, BackupDescriptorCheckpointName, &BackupDescriptor{},
+		ctx, settings, exportStore, BackupDescriptorCheckpointName, &BackupDescriptor{},
 	); err != nil {
 		return errors.Wrapf(err, "cannot write to %s", readable)
 	}
@@ -778,23 +963,23 @@ func VerifyUsableExportTarget(
 // backupPlanHook implements PlanHookFn.
 func backupPlanHook(
 	_ context.Context, stmt tree.Statement, p sql.PlanHookState,
-) (sql.PlanHookRowFn, sqlbase.ResultColumns, []sql.PlanNode, error) {
+) (sql.PlanHookRowFn, sqlbase.ResultColumns, []sql.PlanNode, bool, error) {
 	backupStmt, ok := stmt.(*tree.Backup)
 	if !ok {
-		return nil, nil, nil, nil
+		return nil, nil, nil, false, nil
 	}
 
-	toFn, err := p.TypeAsString(backupStmt.To, "BACKUP")
+	toFn, err := p.TypeAsStringArray(tree.Exprs(backupStmt.To), "BACKUP")
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, false, err
 	}
 	incrementalFromFn, err := p.TypeAsStringArray(backupStmt.IncrementalFrom, "BACKUP")
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, false, err
 	}
 	optsFn, err := p.TypeAsStringOpts(backupStmt.Options, backupOptionExpectValues)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, false, err
 	}
 
 	header := sqlbase.ResultColumns{
@@ -818,7 +1003,7 @@ func backupPlanHook(
 			return err
 		}
 
-		if err := p.RequireSuperUser(ctx, "BACKUP"); err != nil {
+		if err := p.RequireAdminRole(ctx, "BACKUP"); err != nil {
 			return err
 		}
 
@@ -826,12 +1011,15 @@ func backupPlanHook(
 			return errors.Errorf("BACKUP cannot be used inside a transaction")
 		}
 
-		requireVersion2 := false
-
 		to, err := toFn()
 		if err != nil {
 			return err
 		}
+		if len(to) > 1 &&
+			!p.ExecCfg().Settings.Version.IsActive(cluster.VersionPartitionedBackup) {
+			return errors.Errorf("partitioned backups can only be made on a cluster that has been fully upgraded to version 19.2")
+		}
+
 		incrementalFrom, err := incrementalFromFn()
 		if err != nil {
 			return err
@@ -840,16 +1028,20 @@ func backupPlanHook(
 		endTime := p.ExecCfg().Clock.Now()
 		if backupStmt.AsOf.Expr != nil {
 			var err error
-			if endTime, err = sql.EvalAsOfTimestamp(nil, backupStmt.AsOf, endTime); err != nil {
+			if endTime, err = p.EvalAsOfTimestamp(backupStmt.AsOf); err != nil {
 				return err
 			}
 		}
 
-		exportStore, err := storageccl.ExportStorageFromURI(ctx, to, p.ExecCfg().Settings)
+		defaultURI, urisByLocalityKV, err := getURIsByLocalityKV(to)
+		if err != nil {
+			return nil
+		}
+		defaultStore, err := p.ExecCfg().DistSQLSrv.ExternalStorageFromURI(ctx, defaultURI)
 		if err != nil {
 			return err
 		}
-		defer exportStore.Close()
+		defer defaultStore.Close()
 
 		opts, err := optsFn()
 		if err != nil {
@@ -859,7 +1051,6 @@ func backupPlanHook(
 		mvccFilter := MVCCFilter_Latest
 		if _, ok := opts[backupOptRevisionHistory]; ok {
 			mvccFilter = MVCCFilter_All
-			requireVersion2 = true
 		}
 
 		targetDescs, completeDBs, err := ResolveTargetsToDescriptors(ctx, p, endTime, backupStmt.Targets)
@@ -867,6 +1058,8 @@ func backupPlanHook(
 			return err
 		}
 
+		statsCache := p.ExecCfg().TableStatsCache
+		tableStatistics := make([]*stats.TableStatisticProto, 0)
 		var tables []*sqlbase.TableDescriptor
 		for _, desc := range targetDescs {
 			if dbDesc := desc.GetDatabase(); dbDesc != nil {
@@ -874,11 +1067,20 @@ func backupPlanHook(
 					return err
 				}
 			}
-			if tableDesc := desc.GetTable(); tableDesc != nil {
+			if tableDesc := desc.Table(hlc.Timestamp{}); tableDesc != nil {
 				if err := p.CheckPrivilege(ctx, tableDesc, privilege.SELECT); err != nil {
 					return err
 				}
 				tables = append(tables, tableDesc)
+
+				// Collect all the table stats for this table.
+				tableStatisticsAcc, err := statsCache.GetTableStats(ctx, tableDesc.GetID())
+				if err != nil {
+					return err
+				}
+				for i := range tableStatisticsAcc {
+					tableStatistics = append(tableStatistics, &tableStatisticsAcc[i].TableStatisticProto)
+				}
 			}
 		}
 
@@ -891,7 +1093,13 @@ func backupPlanHook(
 			clusterID := p.ExecCfg().ClusterID()
 			prevBackups = make([]BackupDescriptor, len(incrementalFrom))
 			for i, uri := range incrementalFrom {
-				desc, err := ReadBackupDescriptorFromURI(ctx, uri, p.ExecCfg().Settings)
+				// TODO(lucy): We may want to upgrade the table descs to the newer
+				// foreign key representation here, in case there are backups from an
+				// older cluster. Keeping the descriptors as they are works for now
+				// since all we need to do is get the past backups' table/index spans,
+				// but it will be safer for future code to avoid having older-style
+				// descriptors around.
+				desc, err := ReadBackupDescriptorFromURI(ctx, uri, p.ExecCfg().DistSQLSrv.ExternalStorageFromURI)
 				if err != nil {
 					return errors.Wrapf(err, "failed to read backup from %q", uri)
 				}
@@ -899,7 +1107,7 @@ func backupPlanHook(
 				// context of their own cluster, so we need to ensure we only allow
 				// incremental previous backups that we created.
 				if !desc.ClusterID.Equal(clusterID) {
-					return errors.Errorf("previous BACKUP %q belongs to cluster %s", uri, desc.ClusterID.String())
+					return errors.Newf("previous BACKUP %q belongs to cluster %s", uri, desc.ClusterID.String())
 				}
 				prevBackups[i] = desc
 			}
@@ -928,7 +1136,7 @@ func backupPlanHook(
 			tablesInPrev := make(map[sqlbase.ID]struct{})
 			dbsInPrev := make(map[sqlbase.ID]struct{})
 			for _, d := range prevBackups[len(prevBackups)-1].Descriptors {
-				if t := d.GetTable(); t != nil {
+				if t := d.Table(hlc.Timestamp{}); t != nil {
 					tablesInPrev[t.ID] = struct{}{}
 				}
 			}
@@ -937,7 +1145,7 @@ func backupPlanHook(
 			}
 
 			for _, d := range targetDescs {
-				if t := d.GetTable(); t != nil {
+				if t := d.Table(hlc.Timestamp{}); t != nil {
 					// If we're trying to use a previous backup for this table, ideally it
 					// actually contains this table.
 					if _, ok := tablesInPrev[t.ID]; ok {
@@ -974,29 +1182,25 @@ func backupPlanHook(
 			}
 
 			var err error
-			_, coveredTime, err := makeImportSpans(spans, prevBackups, keys.MinKey,
-				func(span intervalccl.Range, start, end hlc.Timestamp) error {
+			_, coveredTime, err := makeImportSpans(
+				spans,
+				prevBackups,
+				nil, /*backupLocalityInfo*/
+				keys.MinKey,
+				func(span covering.Range, start, end hlc.Timestamp) error {
 					if (start == hlc.Timestamp{}) {
 						newSpans = append(newSpans, roachpb.Span{Key: span.Start, EndKey: span.End})
 						return nil
 					}
 					return errOnMissingRange(span, start, end)
-				})
+				},
+			)
 			if err != nil {
-				return errors.Wrap(err, "invalid previous backups (a new full backup may be required if a table has been created, dropped or truncated)")
+				return errors.Wrapf(err, "invalid previous backups (a new full backup may be required if a table has been created, dropped or truncated)")
 			}
 			if coveredTime != startTime {
-				return errors.Errorf("expected previous backups to cover until time %v, got %v", startTime, coveredTime)
+				return errors.Wrapf(err, "expected previous backups to cover until time %v, got %v", startTime, coveredTime)
 			}
-		}
-
-		// older nodes don't know about many new fields, e.g. MVCCAll and may
-		// incorrectly evaluate either an export RPC, or a resumed backup job.
-		if requireVersion2 && !p.ExecCfg().Settings.Version.IsMinSupported(cluster.Version2_0) {
-			return errors.Errorf(
-				"BACKUP features introduced in 2.0 requires cluster version >= %s (",
-				cluster.VersionByKey(cluster.Version2_0).String(),
-			)
 		}
 
 		// if CompleteDbs is lost by a 1.x node, FormatDescriptorTrackingVersion
@@ -1019,30 +1223,45 @@ func backupPlanHook(
 			BuildInfo:         build.GetInfo(),
 			NodeID:            p.ExecCfg().NodeID.Get(),
 			ClusterID:         p.ExecCfg().ClusterID(),
+			Statistics:        tableStatistics,
 		}
 
 		// Sanity check: re-run the validation that RESTORE will do, but this time
 		// including this backup, to ensure that the this backup plus any previous
 		// backups does cover the interval expected.
 		if _, coveredEnd, err := makeImportSpans(
-			spans, append(prevBackups, backupDesc), keys.MinKey, errOnMissingRange,
+			spans,
+			append(prevBackups, backupDesc),
+			nil, /*backupLocalityInfo*/
+			keys.MinKey,
+			errOnMissingRange,
 		); err != nil {
 			return err
 		} else if coveredEnd != endTime {
 			return errors.Errorf("expected backup (along with any previous backups) to cover to %v, not %v", endTime, coveredEnd)
 		}
 
-		descBytes, err := protoutil.Marshal(&backupDesc)
+		// When writing a backup descriptor, make sure to downgrade any new-style FKs
+		// when we're in the 19.1/2 mixed state so that 19.1 clusters can still
+		// restore backups taken on a 19.1/2 mixed cluster.
+		// TODO(lucy, jordan): Remove in 20.1.
+		downgradedBackupDesc, err := maybeDowngradeTableDescsInBackupDescriptor(ctx, p.ExecCfg().Settings, &backupDesc)
+		if err != nil {
+			return err
+		}
+		descBytes, err := protoutil.Marshal(downgradedBackupDesc)
 		if err != nil {
 			return err
 		}
 
-		description, err := backupJobDescription(backupStmt, to, incrementalFrom)
+		description, err := backupJobDescription(p, backupStmt, to, incrementalFrom, opts)
 		if err != nil {
 			return err
 		}
 
-		if err := VerifyUsableExportTarget(ctx, exportStore, to); err != nil {
+		// TODO (lucy): For partitioned backups, also add verification for other
+		// stores we are writing to in addition to the default.
+		if err := VerifyUsableExportTarget(ctx, p.ExecCfg().Settings, defaultStore, defaultURI); err != nil {
 			return err
 		}
 
@@ -1055,50 +1274,71 @@ func backupPlanHook(
 				}
 				return sqlDescIDs
 			}(),
-			Details: jobs.BackupDetails{
+			Details: jobspb.BackupDetails{
 				StartTime:        startTime,
 				EndTime:          endTime,
-				URI:              to,
+				URI:              defaultURI,
+				URIsByLocalityKV: urisByLocalityKV,
 				BackupDescriptor: descBytes,
 			},
+			Progress: jobspb.BackupProgress{},
 		})
 		if err != nil {
 			return err
 		}
 		return <-errCh
 	}
-	return fn, header, nil, nil
+	return fn, header, nil, false, nil
 }
 
 type backupResumer struct {
-	settings *cluster.Settings
-	res      roachpb.BulkOpSummary
+	job                 *jobs.Job
+	settings            *cluster.Settings
+	res                 roachpb.BulkOpSummary
+	makeExternalStorage cloud.ExternalStorageFactory
 }
 
+// Resume is part of the jobs.Resumer interface.
 func (b *backupResumer) Resume(
-	ctx context.Context, job *jobs.Job, phs interface{}, resultsCh chan<- tree.Datums,
+	ctx context.Context, phs interface{}, resultsCh chan<- tree.Datums,
 ) error {
-	details := job.Record.Details.(jobs.BackupDetails)
+	details := b.job.Details().(jobspb.BackupDetails)
 	p := phs.(sql.PlanHookState)
+	b.makeExternalStorage = p.ExecCfg().DistSQLSrv.ExternalStorage
 
 	if len(details.BackupDescriptor) == 0 {
-		return errors.New("missing backup descriptor; cannot resume a backup from an older version")
+		return errors.Newf("missing backup descriptor; cannot resume a backup from an older version")
 	}
 
 	var backupDesc BackupDescriptor
 	if err := protoutil.Unmarshal(details.BackupDescriptor, &backupDesc); err != nil {
-		return errors.Wrap(err, "unmarshal backup descriptor")
+		return pgerror.Wrapf(err, pgcode.DataCorrupted,
+			"unmarshal backup descriptor")
 	}
-	conf, err := storageccl.ExportStorageConfFromURI(details.URI)
+	// For all backups, partitioned or not, the main BACKUP manifest is stored at
+	// details.URI.
+	defaultConf, err := cloud.ExternalStorageConfFromURI(details.URI)
 	if err != nil {
-		return err
+		return errors.Wrapf(err, "export configuration")
 	}
-	exportStore, err := storageccl.MakeExportStorage(ctx, conf, b.settings)
+	defaultStore, err := b.makeExternalStorage(ctx, defaultConf)
 	if err != nil {
-		return err
+		return errors.Wrapf(err, "make storage")
+	}
+	storageByLocalityKV := make(map[string]*roachpb.ExternalStorage)
+	for kv, uri := range details.URIsByLocalityKV {
+		conf, err := cloud.ExternalStorageConfFromURI(uri)
+		if err != nil {
+			return err
+		}
+		storageByLocalityKV[kv] = &conf
 	}
 	var checkpointDesc *BackupDescriptor
-	if desc, err := readBackupDescriptor(ctx, exportStore, BackupDescriptorCheckpointName); err == nil {
+	// We don't read the table descriptors from the backup descriptor, but
+	// they could be using either the new or the old foreign key
+	// representations. We should just preserve whatever representation the
+	// table descriptors were using and leave them alone.
+	if desc, err := readBackupDescriptor(ctx, defaultStore, BackupDescriptorCheckpointName); err == nil {
 		// If the checkpoint is from a different cluster, it's meaningless to us.
 		// More likely though are dummy/lock-out checkpoints with no ClusterID.
 		if desc.ClusterID.Equal(p.ExecCfg().ClusterID()) {
@@ -1108,39 +1348,47 @@ func (b *backupResumer) Resume(
 		// TODO(benesch): distinguish between a missing checkpoint, which simply
 		// indicates the prior backup attempt made no progress, and a corrupted
 		// checkpoint, which is more troubling. Sadly, storageccl doesn't provide a
-		// "not found" error that's consistent across all ExportStorage
+		// "not found" error that's consistent across all ExternalStorage
 		// implementations.
-		log.Warningf(ctx, "unable to load backup checkpoint while resuming job %d: %v", *job.ID(), err)
+		log.Warningf(ctx, "unable to load backup checkpoint while resuming job %d: %v", *b.job.ID(), err)
 	}
 	res, err := backup(
 		ctx,
 		p.ExecCfg().DB,
 		p.ExecCfg().Gossip,
 		p.ExecCfg().Settings,
-		exportStore,
-		job,
+		defaultStore,
+		storageByLocalityKV,
+		b.job,
 		&backupDesc,
 		checkpointDesc,
 		resultsCh,
+		b.makeExternalStorage,
 	)
 	b.res = res
 	return err
 }
 
-func (b *backupResumer) OnFailOrCancel(context.Context, *client.Txn, *jobs.Job) error { return nil }
-func (b *backupResumer) OnSuccess(context.Context, *client.Txn, *jobs.Job) error      { return nil }
+// OnFailOrCancel is part of the jobs.Resumer interface.
+func (b *backupResumer) OnFailOrCancel(context.Context, *client.Txn) error { return nil }
 
+// OnSuccess is part of the jobs.Resumer interface.
+func (b *backupResumer) OnSuccess(context.Context, *client.Txn) error { return nil }
+
+// OnTerminal is part of the jobs.Resumer interface.
 func (b *backupResumer) OnTerminal(
-	ctx context.Context, job *jobs.Job, status jobs.Status, resultsCh chan<- tree.Datums,
+	ctx context.Context, status jobs.Status, resultsCh chan<- tree.Datums,
 ) {
 	// Attempt to delete BACKUP-CHECKPOINT.
 	if err := func() error {
-		details := job.Record.Details.(jobs.BackupDetails)
-		conf, err := storageccl.ExportStorageConfFromURI(details.URI)
+		details := b.job.Details().(jobspb.BackupDetails)
+		// For all backups, partitioned or not, the main BACKUP manifest is stored at
+		// details.URI.
+		conf, err := cloud.ExternalStorageConfFromURI(details.URI)
 		if err != nil {
 			return err
 		}
-		exportStore, err := storageccl.MakeExportStorage(ctx, conf, b.settings)
+		exportStore, err := b.makeExternalStorage(ctx, conf)
 		if err != nil {
 			return err
 		}
@@ -1156,7 +1404,7 @@ func (b *backupResumer) OnTerminal(
 		// the current coordinator's counts.
 
 		resultsCh <- tree.Datums{
-			tree.NewDInt(tree.DInt(*job.ID())),
+			tree.NewDInt(tree.DInt(*b.job.ID())),
 			tree.NewDString(string(jobs.StatusSucceeded)),
 			tree.NewDFloat(tree.DFloat(1.0)),
 			tree.NewDInt(tree.DInt(b.res.Rows)),
@@ -1165,107 +1413,6 @@ func (b *backupResumer) OnTerminal(
 			tree.NewDInt(tree.DInt(b.res.DataSize)),
 		}
 	}
-}
-
-var _ jobs.Resumer = &backupResumer{}
-
-func backupResumeHook(typ jobs.Type, settings *cluster.Settings) jobs.Resumer {
-	if typ != jobs.TypeBackup {
-		return nil
-	}
-
-	return &backupResumer{
-		settings: settings,
-	}
-}
-
-// showBackupPlanHook implements PlanHookFn.
-func showBackupPlanHook(
-	ctx context.Context, stmt tree.Statement, p sql.PlanHookState,
-) (sql.PlanHookRowFn, sqlbase.ResultColumns, []sql.PlanNode, error) {
-	backup, ok := stmt.(*tree.ShowBackup)
-	if !ok {
-		return nil, nil, nil, nil
-	}
-
-	if err := utilccl.CheckEnterpriseEnabled(
-		p.ExecCfg().Settings, p.ExecCfg().ClusterID(), p.ExecCfg().Organization(), "SHOW BACKUP",
-	); err != nil {
-		return nil, nil, nil, err
-	}
-
-	if err := p.RequireSuperUser(ctx, "SHOW BACKUP"); err != nil {
-		return nil, nil, nil, err
-	}
-
-	toFn, err := p.TypeAsString(backup.Path, "SHOW BACKUP")
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	header := sqlbase.ResultColumns{
-		{Name: "database", Typ: types.String},
-		{Name: "table", Typ: types.String},
-		{Name: "start_time", Typ: types.Timestamp},
-		{Name: "end_time", Typ: types.Timestamp},
-		{Name: "size_bytes", Typ: types.Int},
-		{Name: "rows", Typ: types.Int},
-	}
-	fn := func(ctx context.Context, _ []sql.PlanNode, resultsCh chan<- tree.Datums) error {
-		// TODO(dan): Move this span into sql.
-		ctx, span := tracing.ChildSpan(ctx, stmt.StatementTag())
-		defer tracing.FinishSpan(span)
-
-		str, err := toFn()
-		if err != nil {
-			return err
-		}
-		desc, err := ReadBackupDescriptorFromURI(ctx, str, p.ExecCfg().Settings)
-		if err != nil {
-			return err
-		}
-		descs := make(map[sqlbase.ID]string)
-		for _, descriptor := range desc.Descriptors {
-			if database := descriptor.GetDatabase(); database != nil {
-				if _, ok := descs[database.ID]; !ok {
-					descs[database.ID] = database.Name
-				}
-			}
-		}
-		descSizes := make(map[sqlbase.ID]roachpb.BulkOpSummary)
-		for _, file := range desc.Files {
-			// TODO(dan): This assumes each file in the backup only contains
-			// data from a single table, which is usually but not always
-			// correct. It does not account for interleaved tables or if a
-			// BACKUP happened to catch a newly created table that hadn't yet
-			// been split into its own range.
-			_, tableID, err := encoding.DecodeUvarintAscending(file.Span.Key)
-			if err != nil {
-				continue
-			}
-			s := descSizes[sqlbase.ID(tableID)]
-			s.Add(file.EntryCounts)
-			descSizes[sqlbase.ID(tableID)] = s
-		}
-		start := tree.DNull
-		if desc.StartTime.WallTime != 0 {
-			start = tree.MakeDTimestamp(timeutil.Unix(0, desc.StartTime.WallTime), time.Nanosecond)
-		}
-		for _, descriptor := range desc.Descriptors {
-			if table := descriptor.GetTable(); table != nil {
-				dbName := descs[table.ParentID]
-				resultsCh <- tree.Datums{
-					tree.NewDString(dbName),
-					tree.NewDString(table.Name),
-					start,
-					tree.MakeDTimestamp(timeutil.Unix(0, desc.EndTime.WallTime), time.Nanosecond),
-					tree.NewDInt(tree.DInt(descSizes[table.ID].DataSize)),
-					tree.NewDInt(tree.DInt(descSizes[table.ID].Rows)),
-				}
-			}
-		}
-		return nil
-	}
-	return fn, header, nil, nil
 }
 
 type versionedValues struct {
@@ -1285,12 +1432,13 @@ func getAllRevisions(
 	// TODO(dt): version check.
 	header := roachpb.Header{Timestamp: endTime}
 	req := &roachpb.ExportRequest{
-		Span:       roachpb.Span{Key: startKey, EndKey: endKey},
-		StartTime:  startTime,
-		MVCCFilter: roachpb.MVCCFilter_All,
-		ReturnSST:  true,
+		RequestHeader: roachpb.RequestHeader{Key: startKey, EndKey: endKey},
+		StartTime:     startTime,
+		MVCCFilter:    roachpb.MVCCFilter_All,
+		ReturnSST:     true,
+		OmitChecksum:  true,
 	}
-	resp, pErr := client.SendWrappedWith(ctx, db.GetSender(), header, req)
+	resp, pErr := client.SendWrappedWith(ctx, db.NonTransactionalSender(), header, req)
 	if pErr != nil {
 		return nil, pErr.GoError()
 	}
@@ -1303,8 +1451,7 @@ func getAllRevisions(
 		if err := sst.IngestExternalFile(file.SST); err != nil {
 			return nil, err
 		}
-		start, end := engine.MVCCKey{Key: startKey}, engine.MVCCKey{Key: endKey}
-		if err := sst.Iterate(start, end, func(kv engine.MVCCKeyValue) (bool, error) {
+		if err := sst.Iterate(startKey, endKey, func(kv engine.MVCCKeyValue) (bool, error) {
 			if len(res) == 0 || !res[len(res)-1].Key.Equal(kv.Key.Key) {
 				res = append(res, versionedValues{Key: kv.Key.Key})
 			}
@@ -1317,8 +1464,149 @@ func getAllRevisions(
 	return res, nil
 }
 
+var _ jobs.Resumer = &backupResumer{}
+
 func init() {
 	sql.AddPlanHook(backupPlanHook)
-	sql.AddPlanHook(showBackupPlanHook)
-	jobs.AddResumeHook(backupResumeHook)
+	jobs.RegisterConstructor(
+		jobspb.TypeBackup,
+		func(job *jobs.Job, settings *cluster.Settings) jobs.Resumer {
+			return &backupResumer{
+				job:      job,
+				settings: settings,
+			}
+		},
+	)
+}
+
+// getURIsByLocalityKV takes a slice of URIs for a single (possibly partitioned)
+// backup, and returns the default backup destination URI and a map of all other
+// URIs by locality KV. The URIs in the result do not include the
+// COCKROACH_LOCALITY parameter.
+func getURIsByLocalityKV(to []string) (string, map[string]string, error) {
+	localityAndBaseURI := func(uri string) (string, string, error) {
+		parsedURI, err := url.Parse(uri)
+		if err != nil {
+			return "", "", err
+		}
+		q := parsedURI.Query()
+		localityKV := q.Get(localityURLParam)
+		// Remove the backup locality parameter.
+		q.Del(localityURLParam)
+		parsedURI.RawQuery = q.Encode()
+		baseURI := parsedURI.String()
+		return localityKV, baseURI, nil
+	}
+
+	urisByLocalityKV := make(map[string]string)
+	if len(to) == 1 {
+		localityKV, baseURI, err := localityAndBaseURI(to[0])
+		if err != nil {
+			return "", nil, err
+		}
+		if localityKV != "" && localityKV != defaultLocalityValue {
+			return "", nil, errors.Errorf("%s %s is invalid for a single BACKUP location",
+				localityURLParam, localityKV)
+		}
+		return baseURI, urisByLocalityKV, nil
+	}
+
+	var defaultURI string
+	for _, uri := range to {
+		localityKV, baseURI, err := localityAndBaseURI(uri)
+		if err != nil {
+			return "", nil, err
+		}
+		if localityKV == "" {
+			return "", nil, errors.Errorf(
+				"multiple URLs are provided for partitioned BACKUP, but %s is not specified",
+				localityURLParam,
+			)
+		}
+		if localityKV == defaultLocalityValue {
+			if defaultURI != "" {
+				return "", nil, errors.Errorf("multiple default URLs provided for partition backup")
+			}
+			defaultURI = baseURI
+		} else {
+			kv := roachpb.Tier{}
+			if err := kv.FromString(localityKV); err != nil {
+				return "", nil, errors.Wrap(err, "failed to parse backup locality")
+			}
+			if _, ok := urisByLocalityKV[localityKV]; ok {
+				return "", nil, errors.Errorf("duplicate URIs for locality %s", localityKV)
+			}
+			urisByLocalityKV[localityKV] = baseURI
+		}
+	}
+	if defaultURI == "" {
+		return "", nil, errors.Errorf("no default URL provided for partitioned backup")
+	}
+	return defaultURI, urisByLocalityKV, nil
+}
+
+// maybeDowngradeTableDescsInBackupDescriptor returns the backup descriptor
+// with its table descriptors downgraded to the older 19.1-style foreign key
+// representation, if they are not already downgraded, and if the cluster is not
+// fully upgraded to 19.2. It returns a *shallow* copy to avoid mutating the
+// original backup descriptor. This function facilitates writing 19.1-compatible
+// backups when the cluster hasn't been fully upgraded.
+// TODO(lucy, jordan): Remove in 20.1.
+func maybeDowngradeTableDescsInBackupDescriptor(
+	ctx context.Context, settings *cluster.Settings, backupDesc *BackupDescriptor,
+) (*BackupDescriptor, error) {
+	backupDescCopy := &(*backupDesc)
+	// Copy Descriptors so we can return a shallow copy without mutating the slice.
+	copy(backupDescCopy.Descriptors, backupDesc.Descriptors)
+	for i := range backupDesc.Descriptors {
+		if tableDesc := backupDesc.Descriptors[i].Table(hlc.Timestamp{}); tableDesc != nil {
+			downgraded, newDesc, err := tableDesc.MaybeDowngradeForeignKeyRepresentation(ctx, settings)
+			if err != nil {
+				return nil, err
+			}
+			if downgraded {
+				backupDescCopy.Descriptors[i] = *sqlbase.WrapDescriptor(newDesc)
+			}
+		}
+	}
+	return backupDescCopy, nil
+}
+
+// maybeUpgradeTableDescsInBackupDescriptors updates the backup descriptors'
+// table descriptors to use the newer 19.2-style foreign key representation,
+// if they are not already upgraded. This requires resolving cross-table FK
+// references, which is done by looking up all table descriptors across all
+// backup descriptors provided. if skipFKsWithNoMatchingTable is set, FKs whose
+// "other" table is missing from the set provided are omitted during the
+// upgrade, instead of causing an error to be returned.
+func maybeUpgradeTableDescsInBackupDescriptors(
+	ctx context.Context, backupDescs []BackupDescriptor, skipFKsWithNoMatchingTable bool,
+) error {
+	protoGetter := sqlbase.MapProtoGetter{
+		Protos: make(map[interface{}]protoutil.Message),
+	}
+	// Populate the protoGetter with all table descriptors in all backup
+	// descriptors so that they can be looked up.
+	for _, backupDesc := range backupDescs {
+		for _, desc := range backupDesc.Descriptors {
+			if table := desc.Table(hlc.Timestamp{}); table != nil {
+				protoGetter.Protos[string(sqlbase.MakeDescMetadataKey(table.ID))] =
+					sqlbase.WrapDescriptor(protoutil.Clone(table).(*sqlbase.TableDescriptor))
+			}
+		}
+	}
+
+	for i := range backupDescs {
+		backupDesc := &backupDescs[i]
+		for j := range backupDesc.Descriptors {
+			if table := backupDesc.Descriptors[j].Table(hlc.Timestamp{}); table != nil {
+				if _, err := table.MaybeUpgradeForeignKeyRepresentation(ctx, protoGetter, skipFKsWithNoMatchingTable); err != nil {
+					return err
+				}
+				// TODO(lucy): Is this necessary?
+				backupDesc.Descriptors[j] = *sqlbase.WrapDescriptor(table)
+			}
+		}
+	}
+	return nil
 }

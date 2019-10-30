@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -59,23 +55,41 @@ const log10int64times1000 = 19 * 1000
 func MakeMemMetrics(endpoint string, histogramWindow time.Duration) MemoryMetrics {
 	prefix := "sql.mem." + endpoint
 	MetaMemMaxBytes := metric.Metadata{
-		Name: prefix + ".max",
-		Help: "Memory usage per sql statement for " + endpoint}
+		Name:        prefix + ".max",
+		Help:        "Memory usage per sql statement for " + endpoint,
+		Measurement: "Memory",
+		Unit:        metric.Unit_BYTES,
+	}
 	MetaMemCurBytes := metric.Metadata{
-		Name: prefix + ".current",
-		Help: "Current sql statement memory usage for " + endpoint}
+		Name:        prefix + ".current",
+		Help:        "Current sql statement memory usage for " + endpoint,
+		Measurement: "Memory",
+		Unit:        metric.Unit_BYTES,
+	}
 	MetaMemMaxTxnBytes := metric.Metadata{
-		Name: prefix + ".txn.max",
-		Help: "Memory usage per sql transaction for " + endpoint}
+		Name:        prefix + ".txn.max",
+		Help:        "Memory usage per sql transaction for " + endpoint,
+		Measurement: "Memory",
+		Unit:        metric.Unit_BYTES,
+	}
 	MetaMemTxnCurBytes := metric.Metadata{
-		Name: prefix + ".txn.current",
-		Help: "Current sql transaction memory usage for " + endpoint}
+		Name:        prefix + ".txn.current",
+		Help:        "Current sql transaction memory usage for " + endpoint,
+		Measurement: "Memory",
+		Unit:        metric.Unit_BYTES,
+	}
 	MetaMemMaxSessionBytes := metric.Metadata{
-		Name: prefix + ".session.max",
-		Help: "Memory usage per sql session for " + endpoint}
+		Name:        prefix + ".session.max",
+		Help:        "Memory usage per sql session for " + endpoint,
+		Measurement: "Memory",
+		Unit:        metric.Unit_BYTES,
+	}
 	MetaMemSessionCurBytes := metric.Metadata{
-		Name: prefix + ".session.current",
-		Help: "Current sql session memory usage for " + endpoint}
+		Name:        prefix + ".session.current",
+		Help:        "Current sql session memory usage for " + endpoint,
+		Measurement: "Memory",
+		Unit:        metric.Unit_BYTES,
+	}
 	return MemoryMetrics{
 		MaxBytesHist:         metric.NewHistogram(MetaMemMaxBytes, histogramWindow, log10int64times1000, 3),
 		CurBytesCount:        metric.NewGauge(MetaMemCurBytes),

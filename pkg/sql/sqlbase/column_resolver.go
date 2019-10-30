@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sqlbase
 
@@ -19,9 +15,55 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
+
+// ProcessTargetColumns returns the column descriptors identified by the
+// given name list. It also checks that a given column name is only
+// listed once. If no column names are given (special case for INSERT)
+// and ensureColumns is set, the descriptors for all visible columns
+// are returned. If allowMutations is set, even columns undergoing
+// mutations are added.
+func ProcessTargetColumns(
+	tableDesc *ImmutableTableDescriptor, nameList tree.NameList, ensureColumns, allowMutations bool,
+) ([]ColumnDescriptor, error) {
+	if len(nameList) == 0 {
+		if ensureColumns {
+			// VisibleColumns is used here to prevent INSERT INTO <table> VALUES (...)
+			// (as opposed to INSERT INTO <table> (...) VALUES (...)) from writing
+			// hidden columns. At present, the only hidden column is the implicit rowid
+			// primary key column.
+			return tableDesc.VisibleColumns(), nil
+		}
+		return nil, nil
+	}
+
+	cols := make([]ColumnDescriptor, len(nameList))
+	colIDSet := make(map[ColumnID]struct{}, len(nameList))
+	for i, colName := range nameList {
+		var col *ColumnDescriptor
+		var err error
+		if allowMutations {
+			col, _, err = tableDesc.FindColumnByName(colName)
+		} else {
+			col, err = tableDesc.FindActiveColumnByName(string(colName))
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		if _, ok := colIDSet[col.ID]; ok {
+			return nil, pgerror.Newf(pgcode.Syntax,
+				"multiple assignments to the same column %q", &nameList[i])
+		}
+		colIDSet[col.ID] = struct{}{}
+		cols[i] = *col
+	}
+
+	return cols, nil
+}
 
 // sourceNameMatches checks whether a request for table name toFind
 // can be satisfied by the FROM source name srcName.
@@ -71,19 +113,16 @@ func (r *ColumnResolver) FindSourceMatchingName(
 	srcMeta tree.ColumnSourceMeta,
 	err error,
 ) {
-	// log.VEventf(ctx, 2, "FindSourceMatchingName(%s) w/\n%s", tn, r.Sources.String())
-	// defer func() {
-	// 	log.VEventf(ctx, 2, "FindSourceMachingName(%s) -> %v %v %v %v",
-	// 		&tn, res, prefix, srcMeta, err)
-	// }()
 	found := false
 	for srcIdx, src := range r.Sources {
-		for colSetIdx, alias := range src.SourceAliases {
+		for colSetIdx := range src.SourceAliases {
+			alias := &src.SourceAliases[colSetIdx]
 			if !sourceNameMatches(&alias.Name, tn) {
 				continue
 			}
 			if found {
-				return tree.MoreThanOne, nil, nil, newAmbiguousSourceError(&tn)
+				tnAlloc := tn
+				return tree.MoreThanOne, nil, nil, newAmbiguousSourceError(&tnAlloc)
 			}
 			found = true
 			prefix = &alias.Name
@@ -104,11 +143,6 @@ const invalidSrcIdx = -1
 func (r *ColumnResolver) FindSourceProvidingColumn(
 	ctx context.Context, col tree.Name,
 ) (prefix *tree.TableName, srcMeta tree.ColumnSourceMeta, colHint int, err error) {
-	// log.VEventf(ctx, 2, "FindSourceProvidingColumn(%s) w/\n%s", col, r.Sources.String())
-	// defer func() {
-	// 	log.VEventf(ctx, 2, "FindSourceProvidingColumn(%s) -> %q %v %v %v",
-	// 		col, prefix, srcMeta, colHint, err)
-	// }()
 	colIdx := invalidColIdx
 	srcIdx := 0
 	colName := string(col)
@@ -150,9 +184,8 @@ func (r *ColumnResolver) FindSourceProvidingColumn(
 		}
 	}
 	if colIdx == invalidColIdx {
-		return nil, nil, -1,
-			pgerror.NewErrorf(pgerror.CodeUndefinedColumnError,
-				"column name %q not found", tree.ErrString(&col))
+		colAlloc := col
+		return nil, nil, -1, NewUndefinedColumnError(tree.ErrString(&colAlloc))
 	}
 	r.ResolverState.SrcIdx = srcIdx
 	r.ResolverState.ColIdx = colIdx
@@ -198,8 +231,7 @@ func (r *ColumnResolver) Resolve(
 	if colIdx == invalidColIdx {
 		r.ResolverState.SrcIdx = invalidSrcIdx
 		r.ResolverState.ColIdx = invalidColIdx
-		return nil, pgerror.NewErrorf(pgerror.CodeUndefinedColumnError,
-			"column name %q not found",
+		return nil, NewUndefinedColumnError(
 			tree.ErrString(tree.NewColumnItem(&src.SourceAliases[colSetIdx].Name, tree.Name(colName))))
 	}
 	r.ResolverState.SrcIdx = srcIdx
@@ -221,7 +253,7 @@ func (r *ColumnResolver) findColHelper(
 		// column expression from an UPDATE/DELETE.
 		if backfillThreshold := len(src.SourceColumns) - src.NumBackfillColumns; idx >= backfillThreshold && !r.ResolverState.ForUpdateOrDelete {
 			return invalidSrcIdx, invalidColIdx,
-				pgerror.NewErrorf(pgerror.CodeInvalidColumnReferenceError,
+				pgerror.Newf(pgcode.InvalidColumnReference,
 					"column %q is being backfilled", tree.ErrString(src.NodeFormatter(idx)))
 		}
 		if colIdx != invalidColIdx {
@@ -245,7 +277,7 @@ func (r *ColumnResolver) findColHelper(
 					sep = ", "
 				}
 			}
-			return invalidSrcIdx, invalidColIdx, pgerror.NewErrorf(pgerror.CodeAmbiguousColumnError,
+			return invalidSrcIdx, invalidColIdx, pgerror.Newf(pgcode.AmbiguousColumn,
 				"column reference %q is ambiguous (candidates: %s)", colString, msgBuf.String())
 		}
 		srcIdx = iSrc
@@ -256,11 +288,11 @@ func (r *ColumnResolver) findColHelper(
 
 func newAmbiguousSourceError(tn *tree.TableName) error {
 	if tn.Catalog() == "" {
-		return pgerror.NewErrorf(pgerror.CodeAmbiguousAliasError,
+		return pgerror.Newf(pgcode.AmbiguousAlias,
 			"ambiguous source name: %q", tree.ErrString(tn))
 
 	}
-	return pgerror.NewErrorf(pgerror.CodeAmbiguousAliasError,
+	return pgerror.Newf(pgcode.AmbiguousAlias,
 		"ambiguous source name: %q (within database %q)",
 		tree.ErrString(&tn.TableName), tree.ErrString(&tn.CatalogName))
 }

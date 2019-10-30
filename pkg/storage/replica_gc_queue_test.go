@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -29,12 +25,12 @@ func TestReplicaGCShouldQueue(t *testing.T) {
 		return hlc.Timestamp{WallTime: t.Nanoseconds()}
 	}
 
-	base := 2 * (ReplicaGCQueueCandidateTimeout + ReplicaGCQueueInactivityThreshold)
+	base := 2 * (ReplicaGCQueueSuspectTimeout + ReplicaGCQueueInactivityThreshold)
 	var (
 		z       = ts(0)
 		bTS     = ts(base)
-		cTS     = ts(base + ReplicaGCQueueCandidateTimeout)
-		cTSnext = ts(base + ReplicaGCQueueCandidateTimeout + 1)
+		cTS     = ts(base + ReplicaGCQueueSuspectTimeout)
+		cTSnext = ts(base + ReplicaGCQueueSuspectTimeout + 1)
 		iTSprev = ts(base + ReplicaGCQueueInactivityThreshold - 1)
 		iTS     = ts(base + ReplicaGCQueueInactivityThreshold)
 	)

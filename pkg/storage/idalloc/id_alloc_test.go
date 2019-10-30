@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package idalloc_test
 
@@ -20,40 +16,39 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
-
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	// Import to set ZoneConfigHook.
+	_ "github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/storage/idalloc"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/localtestcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-
-	// Import to set ZoneConfigHook.
-	_ "github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/pkg/errors"
 )
 
 // newTestAllocator creates and returns a new idalloc.Allocator, backed by a
 // LocalTestCluster. The test cluster is returned as well, and should be stopped
 // by calling Stop.
 func newTestAllocator(t testing.TB) (*localtestcluster.LocalTestCluster, *idalloc.Allocator) {
-	s := &localtestcluster.LocalTestCluster{}
+	s := &localtestcluster.LocalTestCluster{
+		DisableLivenessHeartbeat: true,
+		DontCreateSystemRanges:   true,
+	}
 	s.Start(t, testutils.NewNodeTestBaseContext(), kv.InitFactoryForLocalTestCluster)
 	idAlloc, err := idalloc.NewAllocator(
 		s.Cfg.AmbientCtx,
 		keys.RangeIDGenerator,
 		s.DB,
-		2,  /* minID */
 		10, /* blockSize */
 		s.Stopper,
 	)
 	if err != nil {
 		s.Stop()
-		t.Errorf("failed to create idAllocator: %v", err)
+		t.Errorf("failed to create idAllocator: %+v", err)
 	}
 	return s, idAlloc
 }
@@ -107,46 +102,15 @@ func TestIDAllocator(t *testing.T) {
 	}
 }
 
-// TestIDAllocatorNegativeValue creates an ID allocator against an
-// increment key which is preset to a negative value. We verify that
-// the id allocator makes a double-alloc to make up the difference
-// and push the id allocation into positive integers.
-func TestIDAllocatorNegativeValue(t *testing.T) {
+func TestNewAllocatorInvalidBlockSize(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s, idAlloc := newTestAllocator(t)
-	defer s.Stop()
-
-	// Increment our key to a negative value.
-	newValue, err := engine.MVCCIncrement(context.Background(), s.Eng, nil, keys.RangeIDGenerator, s.Clock.Now(), nil, -1024)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if newValue != -1024 {
-		t.Errorf("expected new value to be -1024; got %d", newValue)
-	}
-
-	value, err := idAlloc.Allocate(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if value != 2 {
-		t.Errorf("expected id allocation to have value 2; got %d", value)
-	}
-}
-
-// TestNewAllocatorInvalidArgs checks validation logic of NewAllocator.
-func TestNewAllocatorInvalidArgs(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	args := [][]uint32{
-		{0, 10}, // minID <= 0
-		{2, 0},  // blockSize < 1
-	}
-	for i := range args {
-		if _, err := idalloc.NewAllocator(
-			log.AmbientContext{Tracer: tracing.NewTracer()}, nil, nil, args[i][0], args[i][1], nil,
-		); err == nil {
-			t.Errorf("expect to have error return, but got nil")
-		}
+	expErr := "blockSize must be a positive integer"
+	if _, err := idalloc.NewAllocator(
+		log.AmbientContext{Tracer: tracing.NewTracer()},
+		nil /* idKey */, nil, /* db */
+		0 /* blockSize */, nil, /* stopper */
+	); !testutils.IsError(err, expErr) {
+		t.Errorf("expected err: %s, got: %+v", expErr, err)
 	}
 }
 
@@ -160,30 +124,31 @@ func TestAllocateErrorAndRecovery(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, idAlloc := newTestAllocator(t)
 	defer s.Stop()
+	ctx := context.Background()
 
 	const routines = 10
 	allocd := make(chan uint32, routines)
 
-	firstID, err := idAlloc.Allocate(context.Background())
+	firstID, err := idAlloc.Allocate(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if firstID != 2 {
-		t.Errorf("expected ID is 2, but got: %d", firstID)
+		t.Fatalf("expected ID is 2, but got: %d", firstID)
 	}
 
 	// Make Allocator invalid.
 	idAlloc.SetIDKey(roachpb.KeyMin)
 
 	// Should be able to get the allocated IDs, and there will be one
-	// background allocateBlock to get ID continuously.
-	for i := 0; i < 8; i++ {
-		id, err := idAlloc.Allocate(context.Background())
+	// background Allocate to get ID continuously.
+	for i := 0; i < 9; i++ {
+		id, err := idAlloc.Allocate(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if int(id) != i+3 {
-			t.Errorf("expected ID is %d, but got: %d", i+3, id)
+			t.Fatalf("expected ID is %d, but got: %d", i+3, id)
 		}
 	}
 
@@ -215,12 +180,12 @@ func TestAllocateErrorAndRecovery(t *testing.T) {
 
 	// Attempt a few allocations with a context timeout while allocations are
 	// blocked. All attempts should hit a context deadline exceeded error.
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
 	defer cancel()
 	for i := 0; i < routines; i++ {
 		id, err := idAlloc.Allocate(ctx)
 		if id != 0 || err != context.DeadlineExceeded {
-			t.Errorf("expected context cancellation, found id=%d, err=%v", id, err)
+			t.Fatalf("expected context cancellation, found id=%d, err=%v", id, err)
 		}
 	}
 
@@ -236,8 +201,8 @@ func TestAllocateErrorAndRecovery(t *testing.T) {
 	}
 	sort.Ints(ids)
 	for i := range ids {
-		if ids[i] != i+11 {
-			t.Errorf("expected \"%d\"th ID to be %d; got %d", i, i+11, ids[i])
+		if ids[i] != i+12 {
+			t.Errorf("expected \"%d\"th ID to be %d; got %d", i, i+12, ids[i])
 		}
 	}
 
@@ -247,8 +212,8 @@ func TestAllocateErrorAndRecovery(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if int(id) != i+21 {
-			t.Errorf("expected ID is %d, but got: %d", i+21, id)
+		if int(id) != i+22 {
+			t.Errorf("expected ID is %d, but got: %d", i+22, id)
 		}
 	}
 }
@@ -260,6 +225,6 @@ func TestAllocateWithStopper(t *testing.T) {
 	s.Stop() // not deferred.
 
 	if _, err := idAlloc.Allocate(context.Background()); !testutils.IsError(err, "system is draining") {
-		t.Errorf("unexpected error: %v", err)
+		t.Errorf("unexpected error: %+v", err)
 	}
 }

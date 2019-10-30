@@ -1,24 +1,21 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -47,9 +44,17 @@ type AuthorizationAccessor interface {
 	// CheckAnyPrivilege returns nil if user has any privileges at all.
 	CheckAnyPrivilege(ctx context.Context, descriptor sqlbase.DescriptorProto) error
 
-	// RequiresSuperUser errors if the session user isn't a super-user (i.e. root
-	// or node). Includes the named action in the error message.
-	RequireSuperUser(ctx context.Context, action string) error
+	// HasAdminRole returns tuple of bool and error:
+	// (true, nil) means that the user has an admin role (i.e. root or node)
+	// (false, nil) means that the user has NO admin role
+	// (false, err) means that there was an error running the query on
+	// the `system.users` table
+	HasAdminRole(ctx context.Context) (bool, error)
+
+	// RequireAdminRole is a wrapper on top of HasAdminRole.
+	// It errors if HasAdminRole errors or if the user isn't a super-user.
+	// Includes the named action in the error message.
+	RequireAdminRole(ctx context.Context, action string) error
 
 	// MemberOfWithAdminOption looks up all the roles (direct and indirect) that 'member' is a member
 	// of and returns a map of role -> isAdmin.
@@ -66,7 +71,8 @@ func CheckPrivilegeForUser(
 	if descriptor.GetPrivileges().CheckPrivilege(user, privilege) {
 		return nil
 	}
-	return fmt.Errorf("user %s does not have %s privilege on %s %s",
+	return pgerror.Newf(pgcode.InsufficientPrivilege,
+		"user %s does not have %s privilege on %s %s",
 		user, privilege, descriptor.TypeName(), descriptor.GetName())
 }
 
@@ -107,7 +113,8 @@ func (p *planner) CheckPrivilege(
 		}
 	}
 
-	return fmt.Errorf("user %s does not have %s privilege on %s %s",
+	return pgerror.Newf(pgcode.InsufficientPrivilege,
+		"user %s does not have %s privilege on %s %s",
 		user, privilege, descriptor.TypeName(), descriptor.GetName())
 }
 
@@ -139,31 +146,47 @@ func (p *planner) CheckAnyPrivilege(ctx context.Context, descriptor sqlbase.Desc
 		}
 	}
 
-	return fmt.Errorf("user %s has no privileges on %s %s",
+	return pgerror.Newf(pgcode.InsufficientPrivilege,
+		"user %s has no privileges on %s %s",
 		p.SessionData().User, descriptor.TypeName(), descriptor.GetName())
 }
 
-// RequireSuperUser implements the AuthorizationAccessor interface.
-func (p *planner) RequireSuperUser(ctx context.Context, action string) error {
+// HasAdminRole implements the AuthorizationAccessor interface.
+func (p *planner) HasAdminRole(ctx context.Context) (bool, error) {
 	user := p.SessionData().User
 
 	// Check if user is 'root' or 'node'.
 	if user == security.RootUser || user == security.NodeUser {
-		return nil
+		return true, nil
 	}
 
 	// Expand role memberships.
 	memberOf, err := p.MemberOfWithAdminOption(ctx, user)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	// Check is 'user' is a member of role 'admin'.
 	if _, ok := memberOf[sqlbase.AdminRole]; ok {
-		return nil
+		return true, nil
 	}
 
-	return fmt.Errorf("only superusers are allowed to %s", action)
+	return false, nil
+}
+
+// RequireAdminRole implements the AuthorizationAccessor interface.
+func (p *planner) RequireAdminRole(ctx context.Context, action string) error {
+	ok, err := p.HasAdminRole(ctx)
+
+	if err != nil {
+		return err
+	}
+	if !ok {
+		//raise error if user is not a super-user
+		return pgerror.Newf(pgcode.InsufficientPrivilege,
+			"only users with the admin role are allowed to %s", action)
+	}
+	return nil
 }
 
 // MemberOfWithAdminOption looks up all the roles 'member' belongs to (direct and indirect) and
@@ -173,11 +196,12 @@ func (p *planner) MemberOfWithAdminOption(
 	ctx context.Context, member string,
 ) (map[string]bool, error) {
 	// Lookup table version.
-	tableDesc, _, err := p.PhysicalSchemaAccessor().GetObjectDesc(&roleMembersTableName,
-		p.ObjectLookupFlags(ctx, true /*required*/))
+	objDesc, err := p.PhysicalSchemaAccessor().GetObjectDesc(ctx, p.txn, &roleMembersTableName,
+		p.ObjectLookupFlags(true /*required*/, false /*requireMutable*/))
 	if err != nil {
 		return nil, err
 	}
+	tableDesc := objDesc.TableDesc()
 	tableVersion := tableDesc.Version
 
 	// We loop in case the table version changes while we're looking up memberships.
@@ -246,7 +270,7 @@ func (p *planner) resolveMemberOfWithAdminOption(
 		}
 		visited[m] = struct{}{}
 
-		rows, _ /* cols */, err := p.ExecCfg().InternalExecutor.Query(
+		rows, err := p.ExecCfg().InternalExecutor.Query(
 			ctx, "expand-roles", nil /* txn */, lookupRolesStmt, m,
 		)
 		if err != nil {

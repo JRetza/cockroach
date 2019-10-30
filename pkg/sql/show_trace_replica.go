@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -28,6 +24,15 @@ import (
 // tracing (via SHOW TRACE) to report the replicas of all kv events that occur
 // during its execution. It is used as the top-level node for SHOW
 // EXPERIMENTAL_REPLICA TRACE FOR statements.
+//
+// TODO(dan): This works by selecting trace lines matching certain event
+// logs in command execution, which is possibly brittle. A much better
+// system would be to set the `ReturnRangeInfo` flag on all kv requests and
+// use the `RangeInfo`s that come back. Unfortunately, we wanted to get
+// _some_ version of this into 2.0 for partitioning users, but the RangeInfo
+// plumbing would have sunk the project. It's also possible that the
+// sovereignty work may require the RangeInfo plumbing and we should revisit
+// this then.
 type showTraceReplicaNode struct {
 	optColumnsSlot
 
@@ -37,18 +42,6 @@ type showTraceReplicaNode struct {
 	run struct {
 		values tree.Datums
 	}
-}
-
-func (p *planner) makeShowTraceReplicaNode(plan *showTraceNode) planNode {
-	// TODO(dan): This works by selecting trace lines matching certain event
-	// logs in command execution, which is possibly brittle. A much better
-	// system would be to set the `ReturnRangeInfo` flag on all kv requests and
-	// use the `RangeInfo`s that come back. Unfortunately, we wanted to get
-	// _some_ version of this into 2.0 for partitioning users, but the RangeInfo
-	// plumbing would have sunk the project. It's also possible that the
-	// sovereignty work may require the RangeInfo plumbing and we should revisit
-	// this then.
-	return &showTraceReplicaNode{plan: plan}
 }
 
 func (n *showTraceReplicaNode) startExec(params runParams) error {
